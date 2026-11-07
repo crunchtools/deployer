@@ -56,16 +56,22 @@ def window(entry_id: int, service: str | None = None, author: str = "deployer") 
     }
 
 
-def recorder(downtimes: dict[str, object] | None = None) -> tuple[list[dict[str, str]], Handler]:
+def recorder(
+    downtimes: dict[str, object] | None = None, gets: list[httpx.URL] | None = None
+) -> tuple[list[dict[str, str]], Handler]:
     """Records every cmd.cgi POST, and answers the downtime list GET.
 
     The list matters: cancelling needs a `down_id`, so a transport that only
-    answers the POST cannot exercise the cancel path at all.
+    answers the POST cannot exercise the cancel path at all. Pass ``gets`` to
+    record the URLs it was asked for, which is how the statusjson URL and its
+    query are pinned.
     """
     seen: list[dict[str, str]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET":
+            if gets is not None:
+                gets.append(request.url)
             return httpx.Response(200, json=downtimes if downtimes is not None else listing())
         seen.append(dict(httpx.QueryParams(request.content.decode())))
         return httpx.Response(200, text=OK_BODY)
@@ -305,3 +311,28 @@ def test_my_windows_ignores_an_entry_with_no_usable_id() -> None:
         window(9),
     ]
     assert my_windows(entries, "deployer", HOST, None) == [(9, False)]
+
+
+async def test_the_downtime_list_is_asked_for_by_host_at_the_right_url() -> None:
+    # statusjson.cgi sits beside cmd.cgi and is derived from it, so a wrong
+    # derivation would mean cancelling never finds an id -- which is exactly
+    # the bug this whole path replaces, and a mock that accepts any GET would
+    # not notice.
+    gets: list[httpx.URL] = []
+    _seen, handler = recorder(listing(), gets)
+    async with commands(handler) as nagios:
+        await nagios.cancel_downtime(HOST)
+    assert len(gets) == 1
+    assert str(gets[0]).startswith("http://nagios/cgi-bin/statusjson.cgi?")
+    params = dict(gets[0].params)
+    assert params == {"query": "downtimelist", "details": "true", "hostname": HOST}
+
+
+async def test_an_http_error_on_the_downtime_list_is_reported() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        code = httpx.codes.SERVICE_UNAVAILABLE if request.method == "GET" else httpx.codes.OK
+        return httpx.Response(code, text="down" if request.method == "GET" else OK_BODY)
+
+    async with commands(handler) as nagios:
+        with pytest.raises(NagiosError, match="503"):
+            await nagios.cancel_downtime(HOST)

@@ -38,3 +38,22 @@ file = "src/deployer/stage.py"
 evidence = "latest not in words"
 status = "not-a-bug"
 reason = "podman's option grammar makes the image operand undecidable without a table of which options take values; the gate proves what it can from ImageName and verification catches the rest, rolling back and -- now -- not blaming the revision for a unit that was edited behind this program's back"
+
+# One cancel per window, awaited in turn, on purpose. cmd.cgi is a CGI: each
+# request is a process that reads Nagios's whole status file, and mcp-nagios
+# documents the 500s that come of leaning on it (its models.py says a comment
+# with a character outside ASCII crashes statusjson.cgi outright). It cancels
+# them serially for the same reason, and following the fleet's one working
+# precedent beats parallelising a path that runs twice per deploy.
+#
+# The count is also small: this program opens one host window and one
+# host-services window, so the host's own services are the only multiplier, and
+# a handful of 200ms CGI calls at the end of a deploy that just held a settle
+# window for sixty seconds is not where the time goes.
+[[findings]]
+agent = "performance"
+category = "performance"
+file = "src/deployer/nagios.py"
+evidence = "for entry_id, is_service in wanted:"
+status = "not-a-bug"
+reason = "cmd.cgi is a CGI process per request reading the whole status file; mcp-nagios cancels serially for that reason and documents the failures that come of leaning on it, and the count here is a handful at the end of a deploy that just spent a minute settling"
