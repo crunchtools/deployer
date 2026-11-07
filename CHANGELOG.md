@@ -6,6 +6,28 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- `NAGIOS_TIMEZONE`, required: the Nagios server's own zone, as an IANA name
+  such as `America/New_York`. An unrecognised one is refused at start-up.
+
+### Fixed
+- **The maintenance window now starts when the deploy does.** `cmd.cgi` takes
+  `start_time` as naive wall clock and reads it in the Nagios server's zone.
+  This container has no local-zone file and no `TZ`, so `time.localtime`
+  formatted UTC, Nagios read that string as Eastern, and every window this
+  program ever opened began **five hours in the future** — then was deleted
+  before it started. Measured against the real Nagios on ticket 1572:
+  `SCHEDULE_HOST_DOWNTIME` submitted at 21:05:07 for a window starting
+  02:05:07. The suppression the design promises had never once existed, so
+  every deploy was free to alert while its unit restarted.
+
+  Exactly the bug `RT_TIMEZONE` exists to prevent, in the function next door —
+  and the README row for `RT_TIMEZONE` already said "a container's clock is
+  UTC … reading `America/New_York` as UTC is five hours out". Knowing it in one
+  place did not stop it in the other. `NAGIOS_TIMEZONE` is required rather than
+  defaulted: this is the one setting where a wrong guess is silent, because the
+  window opens, Nagios accepts it, and it suppresses nothing.
+
 ## [0.1.3] - 2026-11-07
 
 ### Added

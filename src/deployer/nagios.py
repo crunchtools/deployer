@@ -10,6 +10,17 @@ verifies. The one case where it is **cancelled early and deliberately** is a
 rollback that did not come back: at that point a human has to see the service,
 and the downtime is the only thing stopping Nagios from saying so.
 
+A window is also opened in the Nagios server's **own time zone**, which is
+not this container's. ``cmd.cgi`` takes ``start_time`` as naive wall clock and
+reads it in its own zone, so formatting the epoch with ``time.localtime`` in a
+container that carries no local-zone file and no ``TZ`` produced a UTC string
+that Nagios read as Eastern: every window this program opened began five hours
+in the future and was deleted before it started. Measured against the real
+Nagios on ticket 1572 -- `SCHEDULE_HOST_DOWNTIME` at 21:05:07 for a window
+starting 02:05:07. The suppression the design promises had never once
+existed. So the zone is configuration (``NAGIOS_TIMEZONE``), required rather
+than defaulted, because a default here is a guess and a wrong guess is silent.
+
 Closing one needs its **id**. ``DEL_HOST_DOWNTIME`` takes ``down_id`` and
 nothing else; sent a host name it answers "not authorized", which reads like a
 credentials problem and is not one. Measured against the real Nagios: opening
@@ -37,8 +48,10 @@ import re
 import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Final, Self
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
@@ -77,6 +90,9 @@ class NagiosCredentials:
     cmd_cgi_url: str
     username: str
     password: str
+    #: The Nagios server's own zone, because that is how it reads the naive
+    #: wall-clock times cmd.cgi takes. Not this container's zone, which is UTC.
+    timezone: ZoneInfo
     comment_author: str = "deployer"
 
     @classmethod
@@ -86,20 +102,34 @@ class NagiosCredentials:
         A half-configured unit is a "could not run": deploying with no way to
         open a maintenance window means every deploy pages somebody.
         """
-        missing = [n for n in ("NAGIOS_CMD_URL", "NAGIOS_USER", "NAGIOS_PASSWORD") if not env.get(n)]
+        names = ("NAGIOS_CMD_URL", "NAGIOS_USER", "NAGIOS_PASSWORD", "NAGIOS_TIMEZONE")
+        missing = [n for n in names if not env.get(n)]
         if missing:
             raise NagiosError(f"Nagios is not configured: {', '.join(missing)} not set")
+        name = env["NAGIOS_TIMEZONE"]
+        try:
+            zone = ZoneInfo(name)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise NagiosError(f"NAGIOS_TIMEZONE {name!r} is not a zone this container knows: {exc}") from None
         return cls(
             cmd_cgi_url=env["NAGIOS_CMD_URL"],
             username=env["NAGIOS_USER"],
             password=env["NAGIOS_PASSWORD"],
+            timezone=zone,
             comment_author=env.get("NAGIOS_COMMENT_AUTHOR", "deployer"),
         )
 
 
-def _wall_clock(epoch: float) -> str:
-    """cmd.cgi reads times as naive wall-clock in the Nagios server's own zone."""
-    return time.strftime("%m-%d-%Y %H:%M:%S", time.localtime(epoch))
+def _wall_clock(epoch: float, zone: ZoneInfo) -> str:
+    """``epoch`` as cmd.cgi wants it: naive wall clock in the Nagios server's zone.
+
+    ``time.localtime`` was wrong here and wrong silently. This container
+    carries no local-zone file and no ``TZ``, so it formatted UTC, and Nagios
+    read that string as Eastern -- a window five hours in the future, deleted
+    before it began. The zone has to be the server's and the server cannot be
+    asked, so it is configuration.
+    """
+    return datetime.fromtimestamp(epoch, zone).strftime("%m-%d-%Y %H:%M:%S")
 
 
 class NagiosCommands:
@@ -153,8 +183,8 @@ class NagiosCommands:
             "com_author": self._creds.comment_author,
             "com_data": comment,
             "trigger": "0",
-            "start_time": _wall_clock(now),
-            "end_time": _wall_clock(now + minutes * 60),
+            "start_time": _wall_clock(now, self._creds.timezone),
+            "end_time": _wall_clock(now + minutes * 60, self._creds.timezone),
             "fixed": "1",
             "hours": str(minutes // 60),
             "minutes": str(minutes % 60),
