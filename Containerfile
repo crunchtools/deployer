@@ -16,7 +16,7 @@ RUN pip install --no-cache-dir .
 FROM quay.io/hummingbird/python:3.14-fips
 
 LABEL name="deployer" \
-      version="0.1.0" \
+      version="0.1.1" \
       summary="Deterministic deploy robot for the crunchtools fleet" \
       maintainer="fatherlinux <scott.mccarty@crunchtools.com>" \
       description="Drains the RT Deploy queue, deploys by commit, verifies, and rolls back once. No model runs in the deploy path." \
