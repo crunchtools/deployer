@@ -1,15 +1,19 @@
 """Nagios tests.
 
-Two things worth pinning: `cmd.cgi` answers 200 with its errors inside the
-page, so a status code is not evidence the command took; and the status file
+Three things worth pinning: `cmd.cgi` answers 200 with its errors inside the
+page, so a status code is not evidence the command took; the status file
 carries `end=1`, without which a reader cannot tell a complete file from a
-truncated one.
+truncated one; and the window is stamped in the NAGIOS SERVER's zone, not this
+container's. The last one is pinned with a fixed epoch and a zone this
+container is not in, because `time.localtime` passed every test while opening
+every real window five hours in the future.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -30,8 +34,23 @@ from deployer.nagios import (
 )
 
 Handler = Callable[[httpx.Request], httpx.Response]
-CREDS = NagiosCredentials(cmd_cgi_url="http://nagios/cgi-bin/cmd.cgi", username="u", password="p")
+# Eastern, like the real Nagios server, and NOT this container's zone -- the
+# test process runs wherever CI runs it, so a test that used the local zone
+# would be asserting that the code agrees with itself.
+NAGIOS_ZONE = ZoneInfo("America/New_York")
+CREDS = NagiosCredentials(
+    cmd_cgi_url="http://nagios/cgi-bin/cmd.cgi",
+    username="u",
+    password="p",
+    timezone=NAGIOS_ZONE,
+)
 HOST = "ctr-acquacotta.crunchtools.com"
+GOOD_ENV: Mapping[str, str] = {
+    "NAGIOS_CMD_URL": "http://n/cmd.cgi",
+    "NAGIOS_USER": "u",
+    "NAGIOS_PASSWORD": "p",
+    "NAGIOS_TIMEZONE": "America/New_York",
+}
 OK_BODY = "<div class='infoMessage'>Your command request was successfully submitted to Nagios</div>"
 MINUTES = 90
 
@@ -83,17 +102,25 @@ def recorder(
 
 
 def test_credentials_come_from_the_environment() -> None:
-    creds = NagiosCredentials.from_env(
-        {"NAGIOS_CMD_URL": "http://n/cmd.cgi", "NAGIOS_USER": "u", "NAGIOS_PASSWORD": "p"}
-    )
+    creds = NagiosCredentials.from_env(dict(GOOD_ENV))
     assert creds.comment_author == "deployer"
+    assert creds.timezone == NAGIOS_ZONE
 
 
-@pytest.mark.parametrize("absent", ["NAGIOS_CMD_URL", "NAGIOS_USER", "NAGIOS_PASSWORD"])
+@pytest.mark.parametrize("absent", list(GOOD_ENV))
 def test_a_missing_credential_is_refused(absent: str) -> None:
-    env = {"NAGIOS_CMD_URL": "http://n/cmd.cgi", "NAGIOS_USER": "u", "NAGIOS_PASSWORD": "p"}
+    env = dict(GOOD_ENV)
     del env[absent]
     with pytest.raises(NagiosError, match=absent):
+        NagiosCredentials.from_env(env)
+
+
+def test_an_unknown_timezone_is_refused_rather_than_guessed() -> None:
+    # A default would be a guess, and this is the one setting where a wrong
+    # guess is silent: the window opens, Nagios accepts it, and it suppresses
+    # nothing.
+    env = {**GOOD_ENV, "NAGIOS_TIMEZONE": "Middle/Earth"}
+    with pytest.raises(NagiosError, match="not a zone this container knows"):
         NagiosCredentials.from_env(env)
 
 
@@ -115,6 +142,28 @@ async def test_host_downtime_covers_the_host_and_its_services() -> None:
     assert seen[0]["hours"] == "1"
     assert seen[0]["minutes"] == "30"
     assert seen[0]["com_data"] == "deploying"
+
+
+async def test_the_window_is_stamped_in_the_nagios_servers_zone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The epoch from ticket 1572, and the string Nagios should have been sent.
+
+    1794085507 is 16:05:07 Eastern and 21:05:07 UTC. `time.localtime` in a
+    container carrying no local-zone file and no TZ produced the UTC one, Nagios
+    read it as Eastern, and the window opened five hours after the restart it
+    was supposed to cover -- then was deleted before it began. Every window
+    this program had ever opened was a no-op and nothing said so.
+
+    The epoch is fixed rather than `time.time()` so this asserts a conversion
+    and not merely that two calls agree.
+    """
+    monkeypatch.setattr("deployer.nagios.time.time", lambda: 1794085507.0)
+    seen, handler = recorder()
+    async with commands(handler) as nagios:
+        await nagios.open_downtime(HOST, 6, "deployer ticket 1572")
+    assert seen[0]["start_time"] == "11-07-2026 16:05:07"
+    assert seen[0]["end_time"] == "11-07-2026 16:11:07"
 
 
 async def test_service_downtime_sends_one_command_with_the_service() -> None:
