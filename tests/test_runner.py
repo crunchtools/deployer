@@ -159,6 +159,13 @@ class FakePodman:
         #: something other than the ticket's commit to mean "CI has not built
         #: it yet".
         self.candidate_revision = WANTED
+        #: What the candidate image's OCI labels and digest carry. Both go on
+        #: the ticket, and both are optional on a real image, so a test can set
+        #: either to None to exercise the fallback wording.
+        self.candidate_version: str | None = "2.34.0"
+        self.candidate_digest: str | None = (
+            "sha256:0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0"
+        )
         self.revisions = {OUTGOING_ID: OTHER}
         self.tagged: list[tuple[str, str]] = []
         self.untagged: list[tuple[str, str]] = []
@@ -185,18 +192,31 @@ class FakePodman:
     async def inspect_image(self, name: str) -> ImageRef:
         key = self.by_ref.get(name, name)
         if key == CANDIDATE_ID:
-            return self._ref(CANDIDATE_ID, self.candidate_revision)
+            return self._ref(
+                CANDIDATE_ID,
+                self.candidate_revision,
+                version=self.candidate_version,
+                digest=self.candidate_digest,
+            )
         if key in self.revisions:
             return self._ref(key, self.revisions[key])
         raise PodmanError(f"no such image {name}")
 
     @staticmethod
-    def _ref(image_id: str, revision: str) -> ImageRef:
+    def _ref(
+        image_id: str,
+        revision: str,
+        version: str | None = None,
+        digest: str | None = None,
+    ) -> ImageRef:
+        labels = {"org.opencontainers.image.revision": revision}
+        if version is not None:
+            labels["org.opencontainers.image.version"] = version
         return ImageRef(
             id=image_id,
-            digest=None,
+            digest=digest,
             tags=(f"{IMAGE}:latest",),
-            labels={"org.opencontainers.image.revision": revision},
+            labels=labels,
         )
 
     async def pull(self, reference: str) -> str:
@@ -1153,3 +1173,37 @@ async def test_a_deploy_opens_a_window_of_that_length(tmp_path: Path) -> None:
     assert world.nagios.opened, "no window was opened"
     _host, minutes, _comment = world.nagios.opened[0]
     assert minutes == _window_minutes(SERVICE)
+
+
+# --- what the ticket records about the image that went out ---
+
+
+async def test_a_deployed_ticket_records_the_version_and_the_digest(tmp_path: Path) -> None:
+    """Three identifiers, because they answer three different questions.
+
+    The commit says WHICH CODE, the version says WHICH RELEASE, and the digest
+    is the only one of the three that means the same thing in a registry, in a
+    signature and on another host. The comment carried the commit and a local
+    image id, which is the one identifier that means nothing anywhere else --
+    and `ImageRef.version` had existed for this from the start, with a
+    docstring saying so, unused.
+    """
+    world = World(tmp_path, ticket())
+    await world.drain()
+    published = "\n".join(text for _, text in world.rt.comments)
+    assert "2.34.0" in published
+    assert "sha256:0f1e2d3c4b5a6978" in published
+
+
+async def test_an_unlabelled_image_says_so_rather_than_printing_none(tmp_path: Path) -> None:
+    # Both are optional on a real image: a build outside the pipeline sets no
+    # version, and a locally built image has no registry digest. "None" on a
+    # ticket reads as a bug in the robot rather than a fact about the image.
+    world = World(tmp_path, ticket())
+    world.podman.candidate_version = None
+    world.podman.candidate_digest = None
+    await world.drain()
+    published = "\n".join(text for _, text in world.rt.comments)
+    assert "version unlabelled" in published
+    assert "digest none reported" in published
+    assert "None" not in published

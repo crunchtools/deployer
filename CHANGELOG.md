@@ -39,7 +39,11 @@ All notable changes to this project are documented here. The format follows
   revision and a local image id. `ImageRef.version` existed for this and its
   docstring said so; nothing used it. A commit answers "which code", a version
   answers "which release", and a digest is the only one of the three that means
-  the same thing in a registry, in a signature and on another host.
+  the same thing in a registry, in a signature and on another host. Both are
+  optional on a real image, and an unlabelled one now reads "version
+  unlabelled, digest none reported" rather than putting `None` on a ticket,
+  where it would look like a bug in the robot instead of a fact about the
+  image.
 
 ## [0.1.4] - 2026-11-07
 
