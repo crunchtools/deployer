@@ -1,0 +1,77 @@
+name: Security Scan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  security-events: write
+
+jobs:
+  dependency-audit:
+    name: Dependency CVE Scan
+    permissions:
+      contents: read
+      issues: write
+    uses: crunchtools/constitution/.github/workflows/dependency-audit.yml@v1.31.0
+
+  container-scan:
+    name: Container Security Scan
+    runs-on: ubuntu-latest
+    # Narrowed from the workflow-level set: this job reads code and uploads a
+    # SARIF, and has no business with issues or pull requests.
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      # The next step hands the whole directory to a container build, so a
+      # persisted token would live in .git/config inside the context.
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Build container image
+        run: docker build -f Containerfile -t deployer:scan .
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: "deployer:scan"
+          format: "sarif"
+          output: "trivy-results.sarif"
+          severity: "CRITICAL,HIGH"
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: "trivy-results.sarif"
+
+  codeql:
+    name: CodeQL Analysis
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: python
+          queries: security-extended
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:python"

@@ -1,0 +1,7 @@
+[checks]
+
+[severity]
+
+[output]
+format = "text"
+color = true

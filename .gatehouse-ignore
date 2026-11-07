@@ -1,0 +1,9 @@
+# Paths Gatehouse never reviews (gitignore syntax). Read from the base branch in CI.
+
+# Generated. Reviewing it spends the whole budget on resolver output: the first
+# push of this repo timed out at 983s with the lockfile and the licence in the
+# diff, which is the same reason trentina ignores it.
+uv.lock
+
+# Verbatim AGPL-3.0 text. Not ours and not under review.
+LICENSE
