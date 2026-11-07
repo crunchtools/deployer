@@ -666,14 +666,19 @@ class Runner:
 
         raw = await self.clients.podman.logs(service.container)
         if not raw.strip():
-            # Measured on acquacotta: a container that runs systemd or httpd
-            # inside itself writes nothing to the container's own stdout, and
-            # podman has nothing to hand over. Saying so beats "(nothing)",
-            # which reads as "the service failed silently".
+            # Two different things look identical here and this says so rather
+            # than picking one. Measured on acquacotta: a container that runs
+            # systemd or httpd inside itself writes nothing to the container's
+            # own stdout at all. Measured on mcp-pcloud: a container a few
+            # seconds old has not got round to printing yet. The earlier
+            # wording asserted the first reason for whichever service failed,
+            # and put "mcp-pcloud runs its own init" on a ticket, which is
+            # false. An empty tail is worth reporting; a guess at why is not.
             return (
-                f"[the container wrote nothing to stdout or stderr. {service.container} runs its "
-                "own init, so its logs are inside it: `podman exec "
-                f"{service.container} journalctl -n 50` on the host.]"
+                "[the container had written nothing to stdout or stderr when this was read. "
+                f"Either it logs inside itself or it had only just started: `podman logs "
+                f"{service.container}` and `podman exec {service.container} journalctl -n 50` "
+                "on the host.]"
             )
         kept = self._keep_failure_log(service, raw)
         too_short = unsubstitutable(secrets)

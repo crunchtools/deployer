@@ -112,8 +112,11 @@ probe = { kind = "http", url = "http://127.0.0.1:8080/health" }
 # One second, not the 60 these services really use, so these tests do not each
 # wait a minute of real time. The registry refuses 0 -- a settle window of no
 # time is not a settle window -- and the loop's own timing is pinned in
-# tests/test_verify.py, which is where it lives.
+# tests/test_verify.py, which is where it lives. `ready` is here for the same
+# reason and matters more, because that window RETRIES a failing probe: left at
+# its default, every test with a failing probe would wait a real minute.
 settle = 1
+ready = 1
 """,
         encoding="utf-8",
     )
@@ -387,6 +390,7 @@ nagios_host = "ctr-acquacotta.crunchtools.com"
 requestors = ["scott"]
 probe = { kind = "http", url = "http://127.0.0.1:8080/health" }
 settle = 1
+ready = 1
 # The thing under test: a service whose schema changes are not safely
 # reversible by a robot.
 rollback = "manual"

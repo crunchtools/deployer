@@ -69,6 +69,10 @@ SERVICE = Service(
     # Zero so a verification is one sample and no test waits a minute. The
     # settle loop's own timing is pinned in test_verify.py.
     settle=0,
+    # Zero for the same reason, and it matters more: a readiness window retries
+    # a failing probe, so a non-zero one here would make every test that
+    # deliberately fails a probe wait the whole window out.
+    ready=0,
     build_deadline=1800,
 )
 REGISTRY = Registry({"acquacotta": SERVICE})
@@ -1076,13 +1080,21 @@ async def test_a_unit_that_starts_the_wrong_image_does_not_blame_the_revision(
 
 
 async def test_an_empty_log_says_where_to_look_instead(tmp_path: Path) -> None:
-    # Measured on acquacotta: a container running its own init writes nothing
-    # to the container's stdout, so podman has nothing to hand over. "(nothing)"
-    # reads as "the service failed silently", which is the wrong conclusion.
+    # Two different things produce an empty tail and the comment must not pick
+    # one. Measured on acquacotta: a container running its own init writes
+    # nothing to the container's stdout ever. Measured on mcp-pcloud: a
+    # container a few seconds old has not printed yet. The first wording
+    # asserted the init reason for whichever service failed and so told ticket
+    # 1571 that mcp-pcloud "runs its own init", which is false. "(nothing)"
+    # is also wrong -- it reads as "the service failed silently".
     world = World(tmp_path, ticket())
     world.broken = {CANDIDATE_ID}
     world.podman.log_text = ""
     await world.drain()
     published = "\n".join(text for _, text in world.rt.comments)
-    assert "runs its own init" in published
+    assert "had written nothing" in published
+    assert "podman logs acquacotta" in published
+    assert "journalctl -n 50" in published
+    # And no invented reason for which of the two it was.
+    assert "runs its own init" not in published
     assert "journalctl" in published

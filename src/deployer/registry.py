@@ -30,6 +30,7 @@ RollbackMode = Literal["auto", "manual"]
 
 DEFAULT_SETTLE_SECONDS: Final = 60
 DEFAULT_BUILD_DEADLINE_SECONDS: Final = 30 * 60
+DEFAULT_READY_SECONDS: Final = 60
 
 _SERVICE_KEYS: Final = frozenset(
     {
@@ -37,6 +38,7 @@ _SERVICE_KEYS: Final = frozenset(
         "image",
         "unit",
         "probe",
+        "ready",
         "settle",
         "build_deadline",
         "rollback",
@@ -88,6 +90,12 @@ class Service:
     probe: Probe
     nagios_host: str
     requestors: tuple[str, ...]
+    #: How long the probe may go on failing after the unit comes active
+    #: before the deploy is called broken. A container service is "active" as
+    #: soon as conmon says the process started, which is seconds before the
+    #: process inside it is listening, so this window is the gap between those
+    #: two facts -- not a tolerance for a service that keeps falling over.
+    ready: int = DEFAULT_READY_SECONDS
     settle: int = DEFAULT_SETTLE_SECONDS
     build_deadline: int = DEFAULT_BUILD_DEADLINE_SECONDS
     rollback: RollbackMode = "auto"
@@ -174,6 +182,7 @@ def _parse_service(name: str, raw: Any) -> Service:
         probe=_parse_probe(table["probe"], where),
         nagios_host=validate.non_empty_str(table["nagios_host"], f"{where}.nagios_host"),
         requestors=validate.str_list(table.get("requestors"), f"{where}.requestors"),
+        ready=validate.positive_int(table.get("ready", DEFAULT_READY_SECONDS), f"{where}.ready"),
         settle=validate.positive_int(table.get("settle", DEFAULT_SETTLE_SECONDS), f"{where}.settle"),
         build_deadline=validate.positive_int(
             table.get("build_deadline", DEFAULT_BUILD_DEADLINE_SECONDS), f"{where}.build_deadline"
