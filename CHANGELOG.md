@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-11-07
+
 ### Added
 - `NAGIOS_TIMEZONE`, required: the Nagios server's own zone, as an IANA name
   such as `America/New_York`. An unrecognised one is refused at start-up.
