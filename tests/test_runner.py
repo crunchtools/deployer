@@ -46,6 +46,7 @@ from deployer.runner import (
     OUTCOME_ROLLED_BACK,
     Clients,
     Runner,
+    _window_minutes,
     container_environment,
     redact,
 )
@@ -76,6 +77,11 @@ SERVICE = Service(
     build_deadline=1800,
 )
 REGISTRY = Registry({"acquacotta": SERVICE})
+
+
+def _fields(service: Service) -> dict[str, Any]:
+    """The service's own values, so a test can clone it with one changed."""
+    return {name: getattr(service, name) for name in service.__slots__}
 
 
 def body(service: str = "acquacotta", repo: str = "crunchtools/acquacotta", commit: str = WANTED) -> str:
@@ -153,6 +159,13 @@ class FakePodman:
         #: something other than the ticket's commit to mean "CI has not built
         #: it yet".
         self.candidate_revision = WANTED
+        #: What the candidate image's OCI labels and digest carry. Both go on
+        #: the ticket, and both are optional on a real image, so a test can set
+        #: either to None to exercise the fallback wording.
+        self.candidate_version: str | None = "2.34.0"
+        self.candidate_digest: str | None = (
+            "sha256:0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0"
+        )
         self.revisions = {OUTGOING_ID: OTHER}
         self.tagged: list[tuple[str, str]] = []
         self.untagged: list[tuple[str, str]] = []
@@ -179,18 +192,31 @@ class FakePodman:
     async def inspect_image(self, name: str) -> ImageRef:
         key = self.by_ref.get(name, name)
         if key == CANDIDATE_ID:
-            return self._ref(CANDIDATE_ID, self.candidate_revision)
+            return self._ref(
+                CANDIDATE_ID,
+                self.candidate_revision,
+                version=self.candidate_version,
+                digest=self.candidate_digest,
+            )
         if key in self.revisions:
             return self._ref(key, self.revisions[key])
         raise PodmanError(f"no such image {name}")
 
     @staticmethod
-    def _ref(image_id: str, revision: str) -> ImageRef:
+    def _ref(
+        image_id: str,
+        revision: str,
+        version: str | None = None,
+        digest: str | None = None,
+    ) -> ImageRef:
+        labels = {"org.opencontainers.image.revision": revision}
+        if version is not None:
+            labels["org.opencontainers.image.version"] = version
         return ImageRef(
             id=image_id,
-            digest=None,
+            digest=digest,
             tags=(f"{IMAGE}:latest",),
-            labels={"org.opencontainers.image.revision": revision},
+            labels=labels,
         )
 
     async def pull(self, reference: str) -> str:
@@ -1098,3 +1124,104 @@ async def test_an_empty_log_says_where_to_look_instead(tmp_path: Path) -> None:
     # And no invented reason for which of the two it was.
     assert "runs its own init" not in published
     assert "journalctl" in published
+
+
+# --- the maintenance window's length ---
+
+
+@pytest.mark.parametrize(
+    ("ready", "settle", "least"),
+    [
+        # acquacotta's real numbers: the rollback path is 2 x (120 restart +
+        # 180 ready + 60 settle) = 720s, and the window must outlast it.
+        (180, 60, 12),
+        # mcp-pcloud's and mcp-nagios's: 2 x (120 + 60 + 30) = 420s.
+        (60, 30, 7),
+    ],
+)
+def test_the_window_outlasts_a_rollback(ready: int, settle: int, least: int) -> None:
+    """The window has to cover the FAILING path, not the succeeding one.
+
+    The first version was `settle + margin`, which predated both the restart
+    wait and the `ready` window: acquacotta got six minutes against a good
+    path of up to 360 seconds and a rollback path near 720, so a rollback that
+    was WORKING would have paged somebody in the middle of it -- and the one
+    page this design raises deliberately, a rollback that did not come back,
+    would have been indistinguishable from that noise.
+
+    Asserted as a floor rather than an exact figure, because the margin on top
+    is a judgement call and this is the part that is not.
+    """
+    service = SERVICE.__class__(**{**_fields(SERVICE), "ready": ready, "settle": settle})
+    assert _window_minutes(service) >= least
+
+
+def test_the_window_is_sized_per_service_not_from_a_constant() -> None:
+    # The whole point of `ready` and `settle` being per service is that
+    # acquacotta is not an MCP server. A window that ignored them would be
+    # wrong for one of the two.
+    slow = SERVICE.__class__(**{**_fields(SERVICE), "ready": 180, "settle": 60})
+    quick = SERVICE.__class__(**{**_fields(SERVICE), "ready": 60, "settle": 30})
+    assert _window_minutes(slow) > _window_minutes(quick)
+
+
+async def test_a_deploy_opens_a_window_of_that_length(tmp_path: Path) -> None:
+    # And the number actually reaches Nagios, rather than being computed and
+    # then not used.
+    world = World(tmp_path, ticket())
+    await world.drain()
+    assert world.nagios.opened, "no window was opened"
+    _host, minutes, _comment = world.nagios.opened[0]
+    assert minutes == _window_minutes(SERVICE)
+
+
+# --- what the ticket records about the image that went out ---
+
+
+async def test_a_deployed_ticket_records_the_version_and_the_digest(tmp_path: Path) -> None:
+    """Three identifiers, because they answer three different questions.
+
+    The commit says WHICH CODE, the version says WHICH RELEASE, and the digest
+    is the only one of the three that means the same thing in a registry, in a
+    signature and on another host. The comment carried the commit and a local
+    image id, which is the one identifier that means nothing anywhere else --
+    and `ImageRef.version` had existed for this from the start, with a
+    docstring saying so, unused.
+    """
+    world = World(tmp_path, ticket())
+    await world.drain()
+    published = "\n".join(text for _, text in world.rt.comments)
+    assert "2.34.0" in published
+    assert "sha256:0f1e2d3c4b5a6978" in published
+
+
+@pytest.mark.parametrize(
+    ("version", "digest"),
+    [
+        (None, None),
+        (None, "sha256:0f1e2d3c4b5a6978"),
+        ("2.34.0", None),
+    ],
+)
+async def test_a_missing_label_says_so_rather_than_printing_none(
+    tmp_path: Path, version: str | None, digest: str | None
+) -> None:
+    """Each field independently, including the two mixed cases.
+
+    Both are optional on a real image and for different reasons: a build
+    outside the pipeline sets no version, and a locally built image has no
+    registry digest. Testing only the all-or-none cases would hide a
+    regression that fell back to one field's value for both -- Gatehouse's
+    point, and the fields are independent, so the test has to be too.
+
+    `None` on a ticket reads as a bug in the robot rather than a fact about
+    the image, which is why the absence is spelled out in words.
+    """
+    world = World(tmp_path, ticket())
+    world.podman.candidate_version = version
+    world.podman.candidate_digest = digest
+    await world.drain()
+    published = "\n".join(text for _, text in world.rt.comments)
+    assert f"version {version or 'unlabelled'}" in published
+    assert f"digest {digest or 'none reported'}" in published
+    assert "None" not in published

@@ -46,6 +46,8 @@ def staged() -> Staged:
         rollback_tag="localhost/acquacotta:rollback-f0effff",
         candidate_image_id=NEW,
         candidate_revision="635cdda",
+        candidate_version="2.34.0",
+        candidate_digest="sha256:feed",
         candidate_tag="localhost/acquacotta:candidate-635cdda",
         latest_tag=LATEST,
     )
