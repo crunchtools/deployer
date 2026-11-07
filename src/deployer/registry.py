@@ -94,11 +94,15 @@ class Service:
 
     @property
     def container(self) -> str:
-        """The podman container's name.
+        """The podman container's name, which is the registry key.
 
-        On this fleet a unit ``x.service`` runs a container named ``x``, which
-        is the registry key. Named here rather than derived at each call site so
-        the assumption is in one place if a service ever breaks it.
+        Deliberately not derived from the unit name. On this fleet the two
+        often match -- ``acquacotta.crunchtools.com.service`` runs
+        ``acquacotta.crunchtools.com`` -- and often do not:
+        ``mcp-pcloud.crunchtools.com.service`` runs a container called
+        ``mcp-pcloud``. So the key *is* the container and the unit is a
+        separate field, and seeding a row means reading
+        ``podman inspect --format '{{.Name}}'`` rather than assuming.
         """
         return self.name
 
