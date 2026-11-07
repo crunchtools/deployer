@@ -22,16 +22,25 @@ deployment, not of this program, so both come from the environment
 is no built-in path: a missing one exits 2 -- "could not run" -- rather than
 guessing at a location and reporting on whatever happens to be there.
 
-**Exit codes**, as the CLI Tool profile sets them. ``0`` is success: nothing to
-do, a verified deploy, or a ticket waiting for its build. ``1`` is a failure
-with something actionable behind it -- a refused ticket, a deploy that was
-rolled back, or a rollback that did not come back. A clean rollback is exit 1
-on purpose: it leaves a held service and a stalled ticket, and a unit that
-exited 0 with a service held would be reporting success for a state nobody has
-dealt with. The cost of the resulting wake-up is per failure, not per minute,
-which is the shape the whole design is built around. ``2`` is "could not run":
-a missing path, an unloadable registry, an unreachable RT, or the auto-update
-hold guard being absent.
+**Exit codes**, as the CLI Tool profile sets them:
+
+``0``
+    The verb did what it was asked. For ``run`` that includes an empty queue
+    and a ticket waiting for its build; for ``rollback`` it includes a rollback
+    that verified, which is a task completed even though it leaves a hold.
+``1``
+    ``run`` drained the queue, and something is now waiting for a person: a
+    refused ticket, a deploy that was rolled back, or a rollback that did not
+    come back. A *deploy* that was rolled back is a task that failed, which is
+    why it is 1 even when the rollback itself went perfectly -- it leaves a
+    held service and a stalled ticket, and a oneshot unit exiting 0 with a
+    service held would be reporting success for a state nobody has dealt with.
+    The wake-up that costs is one per failure, not one per idle minute, which
+    is the shape the whole design is built around.
+``2``
+    Could not run: a missing path, an unloadable registry, an unreachable RT,
+    the auto-update hold guard being absent, or a verb asked to do something
+    this service's registry row forbids.
 """
 
 from __future__ import annotations
@@ -40,6 +49,7 @@ import argparse
 import asyncio
 import os
 import sys
+from dataclasses import dataclass
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Final
@@ -65,7 +75,6 @@ from .runner import (
     RunReport,
     Runner,
 )
-from .stage import Staged
 from .systemd import SystemdError, SystemdUnits
 from .verify import Host
 
@@ -366,27 +375,33 @@ def _units(registry: Registry) -> frozenset[str]:
     return frozenset(registry.get(name).unit for name in registry.names)
 
 
-async def _newest_rollback(podman: PodmanImages, service: Service) -> Staged:
-    """The newest ``rollback-*`` image for a service, shaped as a rollback target.
+@dataclass(frozen=True, slots=True)
+class _ByHand:
+    """A rollback target with no deploy behind it.
 
-    ``roll_back`` takes a :class:`Staged` because that is what a deploy
-    produces. Here there was no deploy, so only the outgoing half is filled in;
-    the candidate fields are empty and nothing reads them on this path.
+    Satisfies :class:`deployer.rollback.Target`, which is the two fields a
+    rollback actually needs. The rest is for the message printed afterwards.
     """
+
+    outgoing_image_id: str
+    latest_tag: str
+    rollback_tag: str
+    outgoing_revision: str | None
+
+
+async def _newest_rollback(podman: PodmanImages, service: Service) -> _ByHand:
+    """The newest ``rollback-*`` image for a service."""
     basename = service.image.rsplit("/", maxsplit=1)[-1]
     pattern = f"localhost/{basename}:rollback-"
     images = await podman.list_images(f"{pattern}*")
     for image in images:
         for tag in image.tags:
             if tag.startswith(pattern):
-                return Staged(
+                return _ByHand(
                     outgoing_image_id=image.id,
-                    outgoing_revision=image.revision,
-                    rollback_tag=tag,
-                    candidate_image_id="",
-                    candidate_revision=None,
-                    candidate_tag="",
                     latest_tag=f"{service.image}:latest",
+                    rollback_tag=tag,
+                    outgoing_revision=image.revision,
                 )
     raise PodmanError(
         f"no {pattern}* image for {service.name}: there is nothing to roll back to. "

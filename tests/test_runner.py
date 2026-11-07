@@ -43,6 +43,8 @@ from deployer.runner import (
     OUTCOME_ROLLED_BACK,
     Clients,
     Runner,
+    container_environment,
+    redact,
 )
 
 IMAGE = "quay.io/crunchtools/acquacotta"
@@ -148,9 +150,13 @@ class FakePodman:
         self.rollback_images: tuple[ImageRef, ...] = ()
         self.log_text = "ValueError: no database\n"
         self.fail_tag_on: str | None = None
+        self.fail_inspect = False
+        self.env: tuple[str, ...] = ()
 
     async def inspect_container(self, name: str) -> dict[str, Any]:
-        return {"Image": self.running}
+        if self.fail_inspect:
+            raise PodmanError("no such container")
+        return {"Image": self.running, "Config": {"Env": list(self.env)}}
 
     async def inspect_image(self, name: str) -> ImageRef:
         key = self.by_ref.get(name, name)
@@ -759,3 +765,83 @@ async def test_a_verified_deploy_exits_zero(tmp_path: Path) -> None:
     world = World(tmp_path, ticket())
     report = await world.drain()
     assert EXIT_FOR_OUTCOME[report.outcome] == EXIT_OK
+
+
+# ------------------------------------------- what goes on a public ticket
+
+
+async def test_a_secret_from_the_environment_is_not_published(tmp_path: Path) -> None:
+    # The comment goes on an RT ticket. A failing service usually prints the
+    # thing that failed, and the thing that failed is often a credential it was
+    # handed in its environment.
+    world = World(tmp_path, ticket())
+    world.broken = {CANDIDATE_ID}
+    world.podman.env = ("FLASK_SECRET_KEY=hunter2-and-then-some", "PORT=8080")
+    world.podman.log_text = (
+        "sqlalchemy.exc.OperationalError: auth failed for key hunter2-and-then-some\nlistening on 8080\n"
+    )
+    await world.drain()
+    published = "\n".join(text for _, text in world.rt.comments)
+    assert "hunter2-and-then-some" not in published
+    assert "<redacted $FLASK_SECRET_KEY>" in published
+    # A port is not a credential, and replacing every 8080 in a traceback
+    # would make the traceback useless.
+    assert "listening on 8080" in published
+
+
+async def test_the_longest_secret_wins_when_one_contains_another(tmp_path: Path) -> None:
+    world = World(tmp_path, ticket())
+    world.broken = {CANDIDATE_ID}
+    world.podman.env = ("SHORT=abcdefgh", "LONG=abcdefghijklmnop")
+    world.podman.log_text = "token=abcdefghijklmnop\n"
+    await world.drain()
+    published = "\n".join(text for _, text in world.rt.comments)
+    assert "<redacted $LONG>" in published
+    assert "abcdefgh" not in published
+
+
+async def test_an_unreadable_environment_means_no_logs_rather_than_raw_logs(tmp_path: Path) -> None:
+    # Fails closed. If the output cannot be checked for secrets, publishing it
+    # anyway would turn a failed read into a leak. Called directly: through a
+    # whole drain this would depend on how many times staging and verification
+    # happen to inspect the container.
+    world = World(tmp_path)
+    world.podman.log_text = "secret-looking thing\n"
+    world.podman.fail_inspect = True
+    tail = await world.runner._log_tail(SERVICE)
+    assert "secret-looking thing" not in tail
+    assert "could not be checked for secrets" in tail
+
+
+@pytest.mark.parametrize(
+    ("env", "text", "expected"),
+    [
+        # The case this exists for.
+        (["TOKEN=super-secret-value"], "auth failed: super-secret-value", "auth failed: <redacted $TOKEN>"),
+        # Too short to be a credential, and replacing it would wreck the line.
+        (["PORT=8080"], "listening on 8080", "listening on 8080"),
+        # An entry with no value has nothing to redact.
+        (["EMPTY="], "nothing here", "nothing here"),
+        # Several occurrences, not just the first.
+        (
+            ["KEY=abcdefghij"],
+            "abcdefghij then abcdefghij",
+            "<redacted $KEY> then <redacted $KEY>",
+        ),
+    ],
+)
+def test_redaction_replaces_what_it_should_and_leaves_the_rest(
+    env: list[str], text: str, expected: str
+) -> None:
+    secrets = container_environment({"Config": {"Env": env}})
+    assert redact(text, secrets) == expected
+
+
+@pytest.mark.parametrize(
+    "inspected",
+    [{}, {"Config": None}, {"Config": {}}, {"Config": {"Env": None}}, {"Config": {"Env": "x"}}],
+)
+def test_an_environment_shape_this_cannot_read_yields_nothing(inspected: dict[str, Any]) -> None:
+    # Nothing to redact is reported as nothing to redact. Whether publishing is
+    # safe at all is _log_tail's decision, and it fails closed on the read.
+    assert container_environment(inspected) == {}

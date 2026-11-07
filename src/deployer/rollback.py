@@ -23,10 +23,16 @@ from typing import Protocol
 
 from .podman import ImageRef, PodmanError
 from .registry import Service
-from .stage import Staged
 from .verify import Host, Outcome, verify
 
-__all__ = ["ROLLBACK_TAGS_KEPT", "Restored", "RollbackError", "roll_back", "rotate_rollback_tags"]
+__all__ = [
+    "ROLLBACK_TAGS_KEPT",
+    "Restored",
+    "RollbackError",
+    "Target",
+    "roll_back",
+    "rotate_rollback_tags",
+]
 
 #: How many ``rollback-*`` tags to keep per image. The rest are removed.
 ROLLBACK_TAGS_KEPT: int = 2
@@ -51,6 +57,23 @@ class UnitRestarter(Protocol):
     async def restart(self, unit: str) -> None: ...
 
 
+class Target(Protocol):
+    """Where a rollback is going: an image, and the tag to move onto it.
+
+    Two fields rather than the whole of ``Staged``, because the other path into
+    here has no deploy behind it. ``deployer rollback <service>`` finds the
+    newest ``rollback-*`` image and comes in with nothing else -- and filling a
+    ``Staged`` with empty candidate fields to satisfy a signature would leave
+    the next reader working out which of them this path never reads.
+    """
+
+    @property
+    def outgoing_image_id(self) -> str: ...
+
+    @property
+    def latest_tag(self) -> str: ...
+
+
 @dataclass(frozen=True, slots=True)
 class Restored:
     """What a rollback did, and whether the service came back."""
@@ -71,7 +94,7 @@ async def roll_back(
     restarter: UnitRestarter,
     host: Host,
     service: Service,
-    staged: Staged,
+    staged: Target,
 ) -> Restored:
     """Move ``:latest`` back, restart, and verify. Once.
 

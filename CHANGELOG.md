@@ -71,7 +71,14 @@ All notable changes to this project are documented here. The format follows
   "the previous run is still going" is the most ordinary thing that can happen.
 - Failure reports on the ticket carry the service's own last output, not just
   the probe's verdict. "The health probe returned 503" does not tell a developer
-  what broke; a traceback does.
+  what broke; a traceback does. The output is **redacted first**: a failing
+  service usually prints the thing that failed, and the thing that failed is
+  often a credential it was handed in its environment. Every environment value
+  long enough to be a secret is replaced by the name it was set under, which
+  covers that case precisely. It does not cover a secret the service did not
+  get from its environment, which is part of why the tail is short. If the
+  environment cannot be read, nothing is attached — a failed read must not
+  become a leak.
 - `deployer unhold` clears the rollback count as well as the hold. They are one
   decision: the three-rollbacks-in-a-day refusal comes from the gate rather
   than from the hold, so clearing only the hold would leave the service refused

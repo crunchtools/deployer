@@ -12,6 +12,7 @@ ordinary thing that can happen here.
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import os
 from collections.abc import Iterator
@@ -21,6 +22,9 @@ from pathlib import Path
 __all__ = ["AlreadyRunning", "LOCK_NAME", "only_one"]
 
 LOCK_NAME = "run.lock"
+#: What a non-blocking flock returns when somebody else holds it. EACCES is
+#: here because some filesystems use it in place of EWOULDBLOCK.
+_CONTENDED = frozenset({errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES})
 
 
 class AlreadyRunning(Exception):
@@ -46,6 +50,12 @@ def only_one(state_dir: str | Path) -> Iterator[None]:
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
+            # Only contention means another run. Anything else -- a filesystem
+            # that does not support locking, say -- is a real failure, and
+            # reporting it as "the previous run is still going" would hide it
+            # behind an exit code that means everything is fine.
+            if exc.errno not in _CONTENDED:
+                raise
             raise AlreadyRunning(f"another deployer run holds {path}") from exc
         yield
     finally:

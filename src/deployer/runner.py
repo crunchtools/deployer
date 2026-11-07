@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from math import ceil
 from pathlib import Path
@@ -65,6 +65,8 @@ __all__ = [
     "TicketResult",
     "TicketSource",
     "UnitHost",
+    "container_environment",
+    "redact",
 ]
 
 DEFAULT_QUEUE: Final = "Deploy"
@@ -74,6 +76,11 @@ DOWNTIME_MARGIN_SECONDS: Final = 300
 #: How much of a refusal goes in the "already said this" record. Long enough
 #: that two different refusals are different, short enough to stay one line.
 SAID_DETAIL_LIMIT: Final = 120
+#: An environment value at least this long is treated as possibly a secret and
+#: taken out of anything published. Short values are left alone: a port number
+#: or a log level is not a credential, and replacing every "80" in a traceback
+#: would make the traceback useless.
+MIN_SECRET_LENGTH: Final = 8
 
 #: What the run as a whole is reported as, worst-first when ranked. These are
 #: the strings ``check_deployer.sh`` reads out of the status file, so they are
@@ -121,10 +128,23 @@ class RunReport:
 class TicketSource(Protocol):
     """The four RT operations the runner needs."""
 
-    async def open_tickets(self, queue: str) -> tuple[int, ...]: ...
-    async def ticket(self, ticket_id: int) -> Ticket: ...
-    async def comment(self, ticket_id: int, text: str) -> None: ...
-    async def set_fields(self, ticket_id: int, **fields: str) -> None: ...
+    async def open_tickets(self, queue: str) -> tuple[int, ...]:
+        """Ticket ids in ``queue`` that are new or open, oldest first."""
+        ...
+
+    async def ticket(self, ticket_id: int) -> Ticket:
+        """One ticket, with its first comment as the body. Raises on a ticket
+        whose fields cannot be read, including an unreadable ``Created``."""
+        ...
+
+    async def comment(self, ticket_id: int, text: str) -> None:
+        """Add an internal comment. Not correspondence: this is not mail."""
+        ...
+
+    async def set_fields(self, ticket_id: int, **fields: str) -> None:
+        """Set ticket fields, e.g. ``status="resolved"`` or ``owner="scott"``.
+        Raises if RT refuses any of them, so the caller can retry with fewer."""
+        ...
 
 
 class ImageHost(Protocol):
@@ -237,10 +257,12 @@ class Runner:
     async def _ticket(self, ticket_id: int) -> TicketResult:
         try:
             ticket = await self.clients.rt.ticket(ticket_id)
-        except RtError:
+        except RtError as exc:
             # Nothing can be said on a ticket that could not be read, so this
-            # is reported to the run rather than to the ticket.
-            return TicketResult(OUTCOME_COULD_NOT_RUN, f"t{ticket_id} unreadable")
+            # is reported to the run rather than to the ticket -- which makes
+            # the reason the only diagnostic there is. It goes in the detail,
+            # short, because the status file's fields are truncated.
+            return TicketResult(OUTCOME_COULD_NOT_RUN, f"t{ticket_id} unreadable: {exc}")
 
         try:
             request = parse_ticket(ticket.body)
@@ -503,7 +525,7 @@ class Runner:
                     staged=staged,
                     outcome=outcome,
                     restored=restored,
-                    logs=await self.clients.podman.logs(service.container),
+                    logs=await self._log_tail(service),
                 )
             ),
         )
@@ -514,6 +536,39 @@ class Runner:
         return TicketResult(OUTCOME_ROLLED_BACK, f"{service.name} {request.short_commit} rolled back")
 
     # ------------------------------------------------------------- small acts
+
+    async def _log_tail(self, service: Service) -> str:
+        """The container's last lines, with its own secrets taken out.
+
+        A failing service usually prints the thing that failed, and the thing
+        that failed is often a credential -- a connection string, a token, a
+        key read from the environment. This text goes on an RT ticket, so
+        whatever the service printed is published to everyone who can read the
+        queue.
+
+        What can be removed precisely is removed precisely. This program can
+        read the container's own environment, so every value in it long enough
+        to be a secret is replaced by the name it was set under. That covers
+        the case this guards against: a credential the service was handed and
+        then echoed back.
+
+        It does not cover a secret the service did not get from its
+        environment -- one fetched at startup, or baked into its image. The
+        tail is short partly for that reason. A service that prints secrets of
+        its own making is a bug in that service, and this cannot know about it.
+
+        Fails closed. If the environment cannot be read then the output cannot
+        be checked, and publishing it anyway would turn a failed read into a
+        leak.
+        """
+        try:
+            inspected = await self.clients.podman.inspect_container(service.container)
+        except PodmanError as exc:
+            return (
+                "[no logs: the container's environment could not be read, so its output could "
+                f"not be checked for secrets first: {exc}]"
+            )
+        return redact(await self.clients.podman.logs(service.container), container_environment(inspected))
 
     async def _close_window(self, service: Service) -> None:
         """Cancel the maintenance window, never failing the run over it.
@@ -580,6 +635,37 @@ class Runner:
         # Recorded after the comment lands, so a comment RT refused is tried
         # again on the next run rather than silently skipped for ever.
         self.said.record(ticket.id, state)
+
+
+def container_environment(inspected: Mapping[str, Any]) -> dict[str, str]:
+    """The container's environment, as ``name -> value``, secrets-long only.
+
+    podman gives it as ``["NAME=value", ...]``. A name with no value, and a
+    value too short to be a credential, are both dropped: there is nothing to
+    redact in either, and a shorter threshold would start replacing port
+    numbers inside tracebacks.
+    """
+    config = inspected.get("Config")
+    raw = config.get("Env") if isinstance(config, dict) else None
+    if not isinstance(raw, list):
+        return {}
+    found: dict[str, str] = {}
+    for entry in raw:
+        name, sep, value = str(entry).partition("=")
+        if sep and len(value) >= MIN_SECRET_LENGTH:
+            found[name] = value
+    return found
+
+
+def redact(text: str, secrets: Mapping[str, str]) -> str:
+    """Replace each secret with the name it was set under.
+
+    Longest first, so a value that contains another is replaced as a whole
+    rather than being left half-substituted by the shorter one.
+    """
+    for name, value in sorted(secrets.items(), key=lambda item: len(item[1]), reverse=True):
+        text = text.replace(value, f"<redacted ${name}>")
+    return text
 
 
 def _said_key(stage_name: str, detail: str) -> str:

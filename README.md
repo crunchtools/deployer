@@ -57,7 +57,10 @@ For each ticket:
   on the old image would look like a success.
 - On failure: roll back, re-verify, write a hold, and hand the ticket back to
   whoever filed it with the service's own last output and the probe result on
-  it. If the rollback itself does not verify, cancel the maintenance downtime so
+  it. That output is published to everyone who can read the queue, so every
+  value in the container's environment long enough to be a credential is
+  replaced by the name it was set under first. If the environment cannot be
+  read, no logs are attached at all — a failed read must not become a leak. If the rollback itself does not verify, cancel the maintenance downtime so
   Nagios pages a human — a robot with nobody awake has no other move.
 
 RT and Nagios are told before the restart, not after. If either cannot be
@@ -143,14 +146,19 @@ whatever happened to be there. A missing variable is exit 2, "could not run".
 
 | Code | Meaning |
 |---|---|
-| 0 | success: nothing to do, a verified deploy, a ticket waiting for its build, or a second run standing down because one is already going |
-| 1 | drained, but something is waiting for a person: a refused ticket, a deploy that was rolled back, or a rollback that did not come back |
-| 2 | could not run: a missing path, an unloadable registry, an unreachable RT, or the auto-update hold guard being absent |
+| 0 | the verb did what it was asked. For `run`: an empty queue, a verified deploy, a ticket waiting for its build, or a second run standing down because one is already going. For `rollback`: a rollback that verified |
+| 1 | `run` drained the queue and something is waiting for a person: a refused ticket, a deploy that was rolled back, or a rollback that did not come back |
+| 2 | could not run: a missing path, an unloadable registry, an unreachable RT, the auto-update hold guard being absent, or a verb asked to do something the registry row forbids |
 
-A clean rollback is exit 1 on purpose. It leaves a held service and a stalled
-ticket, and a unit that exited 0 with a service held would be reporting success
-for a state nobody has dealt with. The wake-up that costs is per failure, not
-per minute, which is the shape the whole design is built around.
+A *deploy* that was rolled back is exit 1 even when the rollback itself went
+perfectly. It is a task that failed: it leaves a held service and a stalled
+ticket, and a oneshot unit exiting 0 with a service held would be reporting
+success for a state nobody has dealt with. The wake-up that costs is one per
+failure, not one per idle minute, which is the shape the whole design is built
+around.
+
+A *rollback a person asked for* is exit 0 when it verifies — that task
+completed. It leaves a hold too, and says so in its output.
 
 ## Deploying twice is not deploying twice
 
