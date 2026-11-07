@@ -19,6 +19,18 @@ All notable changes to this project are documented here. The format follows
   image, inspect container, tag, untag, remove image, list images. Two tests
   hold the line: one compares the class against the declared surface, the other
   refuses any method name that hints at a container lifecycle.
+- Unit-shape gate: a unit whose `ExecStart` does not end in `<image>:latest`, or
+  whose `ExecStartPre` pulls on start, is refused rather than handled. So is one
+  whose `ExecStart` cannot be read.
+- Candidate staging: tag the running container's image as `rollback-<revision>`,
+  pull, tag the arrival as `candidate-<revision>`, then put `:latest` back on the
+  outgoing image. The local `:latest` therefore never moves until a deploy moves
+  it, so a refused or waiting ticket cannot turn an unrelated crash-restart into
+  a deploy. A missing revision label falls back to the image id with its
+  algorithm prefix stripped, because a tag cannot contain a colon.
+- `classify_revision`: a candidate that does not match the ticket is *waiting*
+  until the service's `build_deadline` and *stale* after it, since a seat files
+  its ticket when it merges and CI builds afterwards.
 - Systemd client over D-Bus with restart, start, state and one property read,
   refusing any unit the registry does not name. No `daemon-reload` and no
   unit-file writes, so the static hold guard cannot be rewritten by this
