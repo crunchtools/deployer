@@ -11,3 +11,13 @@ path = ".pre-commit-config.yaml"
 pattern = "ruff-check"
 justification = "ruff runs inside the sdlc-commit hook from python-sdlc (constitution XII v1.30.0), configured by [tool.ruff] in pyproject.toml; Gourmand looks for a literal ruff hook id"
 classification = "by_design"
+
+# "2025-06-18" is the MCP protocol version string sent in an `initialize`
+# handshake, not a date this file is stale about. It is fixed by the protocol:
+# changing it to the current year would make the probe send a version no server
+# implements.
+[[exceptions]]
+check = "hardcoded_years"
+path = "src/deployer/verify.py"
+justification = "2025-06-18 is the MCP protocol version string sent in the initialize handshake, fixed by the protocol; it is not a date this file is stale about, and bumping it would make the probe announce a version no server implements"
+classification = "by_design"

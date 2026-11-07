@@ -31,6 +31,20 @@ All notable changes to this project are documented here. The format follows
 - `classify_revision`: a candidate that does not match the ticket is *waiting*
   until the service's `build_deadline` and *stale* after it, since a seat files
   its ticket when it merges and CI builds afterwards.
+- Verification: a deploy counts only if the unit is active, the running
+  container *is* the candidate image, and the health probe answers as the
+  registry says — all three, continuously, for the settle window. The image
+  check is the one that catches a restart that came back cleanly on the old
+  code; the window is what catches a service that answers once and then falls
+  over.
+- Rollback, attempted once: move `:latest` back, restart, verify again. If the
+  rollback itself does not verify, the maintenance downtime is cancelled so
+  Nagios pages — a robot that has broken a service and cannot restore it has no
+  remaining move. A `rollback = "manual"` service is never rolled back
+  automatically, because old code against a new schema is worse than a failed
+  deploy with the downtime still open.
+- Rollback tag rotation: two kept per image, the rest removed. Rollback images
+  are application-sized and unrotated ones have filled a fleet host's disk before now.
 - Systemd client over D-Bus with restart, start, state and one property read,
   refusing any unit the registry does not name. No `daemon-reload` and no
   unit-file writes, so the static hold guard cannot be rewritten by this
