@@ -14,6 +14,11 @@ is available in RT 6, but it needs a token this deployment does not have
 capability this program needs: it reads a queue, reads a ticket, comments, and
 sets status and owner.
 
+A ticket's **body is its first attachment**, not a field of ``ticket/show``,
+which carries none. Reading it costs two more calls per ticket and is worth it:
+the alternative is parsing the ticket's whole history, which means reading
+everything anyone has ever written on it.
+
 Comments are written **only when something changed**. A ticket waiting for a
 build is looked at every two minutes, and a robot that said "still waiting" 720
 times a day would make the ticket useless to the person who eventually reads it.
@@ -49,6 +54,9 @@ _OPEN_STATES: Final = ("new", "open", "stalled")
 #: reading the string as local time would be five hours out -- enough to call a
 #: fresh ticket stale, or to wait forever on an old one.
 _CREATED_FORMAT: Final = "%a %b %d %H:%M:%S %Y"
+#: The first id in RT's ``Attachments: 13583: (Unnamed) (text/plain / 113b),``
+#: listing. First, because that one is the body.
+_ATTACHMENT_ID: Final = re.compile(r"(\d+):")
 
 
 @dataclass(frozen=True, slots=True)
@@ -262,8 +270,9 @@ class RtClient:
         return tuple(ids)
 
     async def ticket(self, ticket_id: int) -> Ticket:
-        """One ticket, with the first comment's text as its body."""
+        """One ticket, with its body."""
         fields = _parse_fields(await self._post(f"ticket/{ticket_id}/show"))
+        body = await self._body(ticket_id)
         return Ticket(
             id=ticket_id,
             queue=fields.get("Queue", ""),
@@ -271,9 +280,36 @@ class RtClient:
             subject=fields.get("Subject", ""),
             creator=fields.get("Creator", ""),
             owner=fields.get("Owner", ""),
-            body=fields.get("Text", ""),
+            body=body,
             created=_parse_created(fields.get("Created", ""), self._zone, ticket_id),
         )
+
+    async def _body(self, ticket_id: int) -> str:
+        """The ticket's body, which is its FIRST attachment.
+
+        ``ticket/<id>/show`` carries **no body at all** in REST 1.0. That was
+        worth finding out the hard way: a test fixture that invented a ``Text:``
+        field made every test pass while every real ticket was refused as
+        "missing required field(s): service, repo, commit" -- the body was
+        always the empty string.
+
+        The first attachment is the Create transaction's content. Later ones are
+        comments, including this program's own, and reading those would let a
+        later comment change what the ticket asks for. One ticket is one
+        revision, read once.
+
+        Two extra round trips per ticket, to a loopback RT, on a queue whose
+        depth is a handful. The alternative is parsing a ticket's whole history,
+        which means reading everything anyone has ever written on it.
+        """
+        listed = _parse_fields(await self._post(f"ticket/{ticket_id}/attachments"))
+        first = _ATTACHMENT_ID.search(listed.get("Attachments", ""))
+        if not first:
+            # RT makes an attachment for every Create transaction, even an empty
+            # one, so none at all is RT being wrong rather than the ticket.
+            raise RtError(f"ticket {ticket_id}: RT lists no attachments, so its body cannot be read")
+        shown = _parse_fields(await self._post(f"ticket/{ticket_id}/attachments/{first.group(1)}"))
+        return shown.get("Content", "")
 
     async def comment(self, ticket_id: int, text: str) -> None:
         """Add a comment. Internal, not correspondence: this is not mail."""

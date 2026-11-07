@@ -41,6 +41,30 @@ def answering(text: str) -> Handler:
     return handler
 
 
+ATTACHMENTS = OK + "id: ticket/1234/attachments\n\nAttachments: 13583: (Unnamed) (text/plain / 9b)\n"
+
+
+def with_body(show: str, body: str = "service: acquacotta\n") -> Handler:
+    """A transport that answers the three calls reading one ticket makes.
+
+    `ticket/<id>/show` carries no body in REST 1.0 -- the body is the first
+    attachment's `Content:`. A fixture that invented a `Text:` field let every
+    test pass while every real ticket was refused for having no body at all.
+    """
+    indented = "\n".join([body.splitlines()[0], *(f"         {line}" for line in body.splitlines()[1:])])
+    attachment = OK + f"id: 13583\nContentType: text/plain\n\nContent: {indented}\n\n"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = str(request.url.path)
+        if path.endswith("/attachments"):
+            return httpx.Response(200, text=ATTACHMENTS)
+        if "/attachments/" in path:
+            return httpx.Response(200, text=attachment)
+        return httpx.Response(200, text=show)
+
+    return handler
+
+
 # --- credentials ---
 
 
@@ -139,20 +163,20 @@ async def test_the_query_excludes_stalled_tickets() -> None:
 
 
 async def test_a_ticket_is_read_into_its_fields() -> None:
-    body = (
+    show = (
         OK + "id: ticket/1234\nQueue: Deploy\nStatus: new\n"
         "Subject: deploy acquacotta 635cdda\nCreator: developer1\nOwner: Nobody\n"
         "Created: Fri Nov 06 04:00:46 2026\n"
-        "Text: service: acquacotta.crunchtools.com\n"
-        "      repo: crunchtools/acquacotta\n"
     )
-    async with client(answering(body)) as rt:
+    handler = with_body(show, "service: acquacotta.crunchtools.com\nrepo: crunchtools/acquacotta\n")
+    async with client(handler) as rt:
         ticket = await rt.ticket(TICKET_ID)
     assert ticket.queue == "Deploy"
     assert ticket.creator == "developer1"
     assert ticket.is_open
-    # Indented continuation lines are the ticket body arriving over several lines.
-    assert "repo: crunchtools/acquacotta" in ticket.body
+    # The body comes from the first attachment, with RT's indentation on the
+    # continuation lines undone.
+    assert ticket.body == "service: acquacotta.crunchtools.com\nrepo: crunchtools/acquacotta"
 
 
 @pytest.mark.parametrize(
@@ -238,7 +262,7 @@ def test_a_ticket_id_unfit_for_a_filename_is_refused(tmp_path: Path) -> None:
 def _show(created: str) -> str:
     return (
         OK + "id: ticket/1234\nQueue: Deploy\nStatus: new\nSubject: s\n"
-        f"Creator: developer1\nOwner: Nobody\nCreated: {created}\nText: service: acquacotta\n"
+        f"Creator: developer1\nOwner: Nobody\nCreated: {created}\n"
     )
 
 
@@ -248,7 +272,7 @@ CREATED = "Fri Nov 06 04:00:46 2026"
 async def test_created_is_read_in_rts_own_timezone() -> None:
     # RT renders dates with no zone in the string at all. This RT is on
     # America/New_York, so that wall clock is 09:00:46 UTC.
-    async with client(answering(_show(CREATED))) as rt:
+    async with client(with_body(_show(CREATED))) as rt:
         ticket = await rt.ticket(TICKET_ID)
     assert ticket.created == datetime(2026, 11, 6, 9, 0, 46, tzinfo=UTC).timestamp()
 
@@ -258,10 +282,10 @@ async def test_the_configured_zone_is_the_one_used() -> None:
     # because reading it as the container's own clock -- which IS UTC -- would
     # be enough to call a fresh ticket stale or wait for ever on an old one.
     utc = RtCredentials(base_url="http://rt.example/", username="u", password="p", timezone="UTC")
-    transport = httpx.MockTransport(answering(_show(CREATED)))
+    transport = httpx.MockTransport(with_body(_show(CREATED)))
     async with RtClient(utc, client=httpx.AsyncClient(transport=transport)) as rt:
         as_utc = await rt.ticket(TICKET_ID)
-    async with client(answering(_show(CREATED))) as rt:
+    async with client(with_body(_show(CREATED))) as rt:
         as_new_york = await rt.ticket(TICKET_ID)
     assert as_new_york.created - as_utc.created == 5 * 3600
 
@@ -269,13 +293,77 @@ async def test_the_configured_zone_is_the_one_used() -> None:
 async def test_an_unreadable_created_is_an_error_not_a_guess() -> None:
     # Treating it as "now" would hand the ticket a fresh build deadline on
     # every single run, so it would wait for ever instead of stalling.
-    async with client(answering(_show("yesterday afternoon"))) as rt:
+    async with client(with_body(_show("yesterday afternoon"))) as rt:
         with pytest.raises(RtError, match="cannot read Created"):
             await rt.ticket(TICKET_ID)
 
 
 async def test_a_missing_created_is_an_error() -> None:
-    body = OK + "id: ticket/1234\nQueue: Deploy\nStatus: new\nCreator: d\nOwner: Nobody\n"
-    async with client(answering(body)) as rt:
+    show = OK + "id: ticket/1234\nQueue: Deploy\nStatus: new\nCreator: d\nOwner: Nobody\n"
+    async with client(with_body(show)) as rt:
         with pytest.raises(RtError, match="cannot read Created"):
+            await rt.ticket(TICKET_ID)
+
+
+# --- the body, which is the first attachment and not a field of `show` ---
+
+
+async def test_the_body_comes_from_the_first_attachment() -> None:
+    # The one that matters. `ticket/<id>/show` has no body field at all, and a
+    # fixture that invented one let every test pass while every real ticket was
+    # refused for having no body.
+    seen: list[str] = []
+    body = "service: acquacotta\nrepo: crunchtools/acquacotta\ncommit: " + "a" * 40 + "\n"
+    handler = with_body(_show(CREATED), body)
+
+    def recording(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url.path))
+        return handler(request)
+
+    async with client(recording) as rt:
+        ticket = await rt.ticket(TICKET_ID)
+    assert ticket.body == body.rstrip("\n")
+    # Three calls: the fields, the attachment list, and the first attachment.
+    assert [path.rsplit("/REST/1.0/", 1)[-1] for path in seen] == [
+        "ticket/1234/show",
+        "ticket/1234/attachments",
+        "ticket/1234/attachments/13583",
+    ]
+
+
+async def test_the_first_attachment_is_taken_not_the_newest() -> None:
+    # Later attachments are comments, including this program's own. Reading one
+    # would let a comment change what the ticket asks for.
+    listing = (
+        OK
+        + "id: x\n\nAttachments: 13583: (Unnamed) (text/plain / 9b),\n"
+        + "             13584: (Unnamed) (text/plain / 4b)\n"
+    )
+    asked: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = str(request.url.path)
+        asked.append(path)
+        if path.endswith("/attachments"):
+            return httpx.Response(200, text=listing)
+        if "/attachments/" in path:
+            return httpx.Response(200, text=OK + "id: 13583\n\nContent: service: acquacotta\n")
+        return httpx.Response(200, text=_show(CREATED))
+
+    async with client(handler) as rt:
+        await rt.ticket(TICKET_ID)
+    assert any(path.endswith("/attachments/13583") for path in asked)
+    assert not any(path.endswith("/attachments/13584") for path in asked)
+
+
+async def test_a_ticket_rt_lists_no_attachments_for_is_an_error() -> None:
+    # RT makes an attachment for every Create transaction, even an empty one,
+    # so none at all is RT being wrong rather than the ticket being empty.
+    def handler(request: httpx.Request) -> httpx.Response:
+        listed = str(request.url.path).endswith("/attachments")
+        text = OK + "id: x\n\nAttachments:\n" if listed else _show(CREATED)
+        return httpx.Response(200, text=text)
+
+    async with client(handler) as rt:
+        with pytest.raises(RtError, match="lists no attachments"):
             await rt.ticket(TICKET_ID)
