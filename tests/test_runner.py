@@ -1073,3 +1073,16 @@ async def test_a_unit_that_starts_the_wrong_image_does_not_blame_the_revision(
     assert world.attempts.recent_rollbacks("acquacotta") == 1
     assert world.holds.held(UNIT)
     assert world.rt.said("not the candidate")
+
+
+async def test_an_empty_log_says_where_to_look_instead(tmp_path: Path) -> None:
+    # Measured on acquacotta: a container running its own init writes nothing
+    # to the container's stdout, so podman has nothing to hand over. "(nothing)"
+    # reads as "the service failed silently", which is the wrong conclusion.
+    world = World(tmp_path, ticket())
+    world.broken = {CANDIDATE_ID}
+    world.podman.log_text = ""
+    await world.drain()
+    published = "\n".join(text for _, text in world.rt.comments)
+    assert "runs its own init" in published
+    assert "journalctl" in published

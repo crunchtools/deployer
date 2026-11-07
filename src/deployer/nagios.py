@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import re
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Self
@@ -252,7 +252,7 @@ def _listed_downtimes(answer: object) -> list[Mapping[str, object]]:
 
 
 def my_windows(
-    entries: list[Mapping[str, object]], author: str, host: str, service: str | None
+    entries: Sequence[Mapping[str, object]], author: str, host: str, service: str | None
 ) -> list[tuple[int, bool]]:
     """``(id, is_a_service_window)`` for this program's windows on ``host``.
 

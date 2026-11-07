@@ -8,7 +8,7 @@ truncated one.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import httpx
@@ -294,10 +294,14 @@ def test_writing_the_status_creates_its_directory(tmp_path: Path) -> None:
 def test_my_windows_takes_the_host_window_and_its_services() -> None:
     # What open_downtime opens without a service: a container restart turns
     # the host check and every service check red together.
-    entries = [window(1), window(2, service="Gunicorn")]
+    entries: list[Mapping[str, object]] = [window(1), window(2, service="Gunicorn")]
     assert my_windows(entries, "deployer", HOST, None) == [(1, False), (2, True)]
 
 
 def test_my_windows_ignores_an_entry_with_no_usable_id() -> None:
-    entries = [{"downtime_id": "7", "host_name": HOST, "author": "deployer"}, window(9)]
+    # A string id is not an id this can send as down_id.
+    entries: list[Mapping[str, object]] = [
+        {"downtime_id": "7", "host_name": HOST, "author": "deployer"},
+        window(9),
+    ]
     assert my_windows(entries, "deployer", HOST, None) == [(9, False)]
