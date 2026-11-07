@@ -140,9 +140,14 @@ async def verify(host: Host, service: Service, candidate_image_id: str) -> Outco
     retried until something passed would be measuring patience rather than
     health.
     """
-    deadline_samples = max(1, int(service.settle // SAMPLE_INTERVAL_SECONDS))
+    # Sample at t=0 and then every interval through the settle duration, so the
+    # END of the window is covered: with settle=60 and a 5s interval that is 13
+    # samples and 12 waits, which is 60 seconds, not 55. A settle shorter than
+    # one interval gets a single sample at the start and no wait -- stated here
+    # rather than left to integer division.
+    samples = int(service.settle // SAMPLE_INTERVAL_SECONDS) + 1
 
-    for sample in range(deadline_samples):
+    for sample in range(samples):
         state = await host.systemd.state(service.unit)
         if not state.is_active:
             return Outcome(ok=False, reason=f"{service.unit} is {state.active_state}, not active")
@@ -165,7 +170,7 @@ async def verify(host: Host, service: Service, candidate_image_id: str) -> Outco
         if not result.ok:
             return Outcome(ok=False, reason="health probe failed", probe_detail=result.detail)
 
-        if sample + 1 < deadline_samples:
+        if sample + 1 < samples:
             await host.sleep(SAMPLE_INTERVAL_SECONDS)
 
     return Outcome(ok=True, probe_detail=f"held for {service.settle}s")

@@ -42,6 +42,11 @@ STATE_ENV = "DEPLOYER_STATE"
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build the deployer's command-line parser.
+
+    Separate from :func:`main` so the tests can check the grammar -- which verbs
+    exist, which take a service -- without running anything.
+    """
     parser = argparse.ArgumentParser(
         prog="deployer",
         description="Drain the RT Deploy queue: deploy by commit, verify, roll back once.",

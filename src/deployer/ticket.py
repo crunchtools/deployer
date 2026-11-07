@@ -39,6 +39,8 @@ _ALLOWED: Final = frozenset(_REQUIRED + _OPTIONAL)
 # pathological ticket cannot make this loop interesting.
 MAX_BODY_BYTES: Final = 8192
 MAX_LINES: Final = 64
+#: No forge has issue numbers this long; beyond it the value is not a PR.
+MAX_PR_DIGITS: Final = 9
 
 
 class TicketError(Exception):
@@ -129,7 +131,11 @@ def _parse(body: str) -> Request:
     pr: int | None = None
     if "pr" in fields:
         raw = fields["pr"].lstrip("#")
-        if not raw.isdigit():
+        # isascii() as well as isdigit(): isdigit() is true for non-ASCII digit
+        # characters, and int() accepts them, so a body could carry a PR number
+        # nobody reading the ticket would recognise. The length bound keeps a
+        # pathological value out of int().
+        if not raw.isascii() or not raw.isdigit() or len(raw) > MAX_PR_DIGITS:
             raise ValidationError(f"pr {fields['pr']!r} must be a positive number")
         pr = validate.positive_int(int(raw), f"pr {fields['pr']!r}")
 

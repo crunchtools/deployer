@@ -114,13 +114,40 @@ async def test_staging_leaves_latest_where_it_started() -> None:
     assert staged.outgoing_revision == OLD_REV
 
 
-async def test_staging_does_not_move_latest_when_the_pull_changed_nothing() -> None:
-    # Same image in and out: re-tagging :latest onto it would be a no-op, and
-    # doing it anyway would make the recorded tag order lie.
+async def test_latest_is_restored_even_when_the_pull_changed_nothing() -> None:
+    # Unconditionally, not as an optimisation: the invariant is "when staging
+    # returns, :latest is where it was", and making it conditional is how an
+    # invariant stops being one.
     podman = FakePodman(running_image=OLD, pulled=OLD)
     staged = await stage(podman, FakeSystemd(f"run -d {IMAGE}:latest"), service(), OLD_REV)
-    assert (OLD, f"{IMAGE}:latest") not in podman.tags
+    assert podman.tags[-1] == (OLD, f"{IMAGE}:latest")
     assert staged.candidate_image_id == OLD
+
+
+async def test_latest_is_restored_when_candidate_tagging_fails() -> None:
+    # The hazard the finally exists for: the pull has already moved the local
+    # tag, so a failure after it must not leave :latest on an unverified image.
+    class FailsAfterPull(FakePodman):
+        async def tag(self, name: str, reference: str) -> None:
+            if "candidate-" in reference:
+                raise PodmanError("no space left on device")
+            await super().tag(name, reference)
+
+    podman = FailsAfterPull()
+    with pytest.raises(PodmanError, match="no space left"):
+        await stage(podman, FakeSystemd(f"run -d {IMAGE}:latest"), service(), NEW_REV)
+    assert podman.tags[-1] == (OLD, f"{IMAGE}:latest")
+
+
+async def test_a_failure_to_restore_latest_says_so_loudly() -> None:
+    class CannotRestore(FakePodman):
+        async def tag(self, name: str, reference: str) -> None:
+            if reference == f"{IMAGE}:latest":
+                raise PodmanError("read-only image store")
+            await super().tag(name, reference)
+
+    with pytest.raises(StageError, match="may point at an unverified image"):
+        await stage(CannotRestore(), FakeSystemd(f"run -d {IMAGE}:latest"), service(), NEW_REV)
 
 
 async def test_a_container_with_no_image_id_is_refused() -> None:

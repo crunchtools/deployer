@@ -84,6 +84,11 @@ class ImageRef:
 
     @property
     def version(self) -> str | None:
+        """The image's OCI version label, or ``None`` when it carries none.
+
+        Recorded on the ticket so a person reading it later can see which
+        release went out, not only which commit.
+        """
         return self.labels.get(VERSION_LABEL)
 
 
@@ -148,6 +153,7 @@ class PodmanImages:
         await self.close()
 
     async def close(self) -> None:
+        """Close the HTTP client and its unix-socket transport."""
         await self._client.aclose()
 
     async def _request(

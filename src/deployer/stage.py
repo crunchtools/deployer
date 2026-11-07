@@ -181,6 +181,23 @@ def classify_revision(
     return Verdict.STALE
 
 
+async def _restore_latest(podman: ImageOps, outgoing_id: str, latest: str) -> None:
+    """Put ``:latest`` back on the outgoing image, swallowing nothing silently.
+
+    Called from a ``finally``, so it must not mask the exception that is already
+    on its way out. A failure here is re-raised only when there is no other
+    exception in flight; otherwise the original one is the more useful of the
+    two and this one is attached to it.
+    """
+    try:
+        await podman.tag(outgoing_id, latest)
+    except PodmanError as exc:
+        raise StageError(
+            f"could not put {latest} back on the outgoing image {outgoing_id}: {exc}. "
+            "The local tag may point at an unverified image; check before restarting anything."
+        ) from exc
+
+
 async def stage(podman: ImageOps, systemd: UnitOps, service: Service, wanted: str) -> Staged:
     """Tag the outgoing image, pull, tag the candidate, and restore ``:latest``.
 
@@ -207,15 +224,17 @@ async def stage(podman: ImageOps, systemd: UnitOps, service: Service, wanted: st
     rollback_tag = f"localhost/{basename}:rollback-{tag_suffix(outgoing_revision, outgoing_id)}"
     await podman.tag(outgoing_id, rollback_tag)
 
-    candidate_id = await podman.pull(latest)
-    candidate = await podman.inspect_image(candidate_id)
-    candidate_tag = f"localhost/{basename}:candidate-{tag_suffix(candidate.revision, candidate_id)}"
-    await podman.tag(candidate_id, candidate_tag)
-
-    # Step 4, and the reason the order is written down: until a deploy decides
-    # to move it, :latest must point where it pointed before this ran.
-    if candidate_id != outgoing_id:
-        await podman.tag(outgoing_id, latest)
+    # The pull moves the local :latest the moment it lands, so from here on
+    # restoring it has to happen on every path out -- including a failure
+    # between the pull and the candidate tag. Leaving :latest on an unverified
+    # image is the exact hazard this sequence exists to prevent.
+    try:
+        candidate_id = await podman.pull(latest)
+        candidate = await podman.inspect_image(candidate_id)
+        candidate_tag = f"localhost/{basename}:candidate-{tag_suffix(candidate.revision, candidate_id)}"
+        await podman.tag(candidate_id, candidate_tag)
+    finally:
+        await _restore_latest(podman, outgoing_id, latest)
 
     return Staged(
         outgoing_image_id=outgoing_id,

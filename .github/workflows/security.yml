@@ -26,9 +26,18 @@ jobs:
   container-scan:
     name: Container Security Scan
     runs-on: ubuntu-latest
+    # Narrowed from the workflow-level set: this job reads code and uploads a
+    # SARIF, and has no business with issues or pull requests.
+    permissions:
+      contents: read
+      security-events: write
 
     steps:
+      # The next step hands the whole directory to a container build, so a
+      # persisted token would live in .git/config inside the context.
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Build container image
         run: docker build -f Containerfile -t deployer:scan .
@@ -53,6 +62,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4

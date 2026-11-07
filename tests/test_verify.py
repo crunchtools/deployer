@@ -19,7 +19,8 @@ from deployer.verify import SAMPLE_INTERVAL_SECONDS, Host, probe_once, verify
 CANDIDATE = "sha256:candidate"
 OLD = "sha256:old"
 SETTLE = 60
-SAMPLES = int(SETTLE // SAMPLE_INTERVAL_SECONDS)
+# One at t=0 plus one per interval, so the end of the window is covered too.
+SAMPLES = int(SETTLE // SAMPLE_INTERVAL_SECONDS) + 1
 
 
 def service(**over: Any) -> Service:
@@ -122,6 +123,16 @@ async def test_a_probe_that_passes_then_fails_inside_the_window_fails() -> None:
     assert outcome.failed
     assert outcome.reason == "health probe failed"
     assert "502" in outcome.probe_detail
+
+
+async def test_a_settle_shorter_than_the_interval_samples_once() -> None:
+    # The explicit policy: one sample at the start and no wait, rather than
+    # whatever integer division happens to produce.
+    systemd = FakeSystemd()
+    async with responder(200) as client:
+        outcome = await verify(Host(systemd, FakePodman(), nosleep, client), service(settle=1), CANDIDATE)
+    assert outcome.ok
+    assert systemd.calls == 1
 
 
 async def test_a_short_settle_still_checks_once() -> None:

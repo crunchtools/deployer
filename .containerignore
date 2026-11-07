@@ -1,0 +1,12 @@
+# The build context. .git is the one that matters: a checkout that persisted
+# credentials would put a token in .git/config, and the context is handed
+# wholesale to the build.
+.git
+.github
+.venv
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.gourmand-cache
+tests
+uv.lock

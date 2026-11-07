@@ -27,12 +27,12 @@ from __future__ import annotations
 from collections.abc import Container
 from dataclasses import dataclass
 from types import TracebackType
-from typing import Any, Final, Self
+from typing import Any, Final, Protocol, Self
 
 from dbus_fast import Message, MessageType
 from dbus_fast.aio import MessageBus
 
-__all__ = ["AUTO_UPDATE_UNIT", "SystemdError", "SystemdUnits", "UnitState"]
+__all__ = ["AUTO_UPDATE_UNIT", "Bus", "SystemdError", "SystemdUnits", "UnitState"]
 
 SYSTEMD_BUS: Final = "org.freedesktop.systemd1"
 SYSTEMD_PATH: Final = "/org/freedesktop/systemd1"
@@ -48,6 +48,18 @@ AUTO_UPDATE_UNIT: Final = "podman-auto-update.service"
 ALLOWED_OPERATIONS: Final = frozenset(
     {"restart", "start", "state", "property", "hold_guard_installed", "close", "connect"}
 )
+
+
+class Bus(Protocol):
+    """The bus operations this client uses.
+
+    A protocol rather than ``MessageBus`` itself, so a test can pass a
+    recording stub through the constructor instead of replacing a private
+    attribute. ``MessageBus`` satisfies it structurally.
+    """
+
+    async def call(self, msg: Any) -> Any: ...
+    def disconnect(self) -> None: ...
 
 
 class SystemdError(Exception):
@@ -75,9 +87,19 @@ class UnitState:
 class SystemdUnits:
     """Restart, start and read units named in the registry, over D-Bus."""
 
-    def __init__(self, allowed_units: Container[str]) -> None:
+    def __init__(self, allowed_units: Container[str], bus: Bus | None = None) -> None:
+        """``allowed_units`` is the set ``restart`` and ``start`` will act on.
+
+        Anything outside it is refused. The registry supplies this, so the
+        client cannot widen its own scope; reads are not restricted, because
+        reading tells this program nothing it should not know and the
+        auto-update unit has to be readable for the hold guard check.
+
+        ``bus`` is for tests. In production it is left out and the system bus is
+        connected on first use.
+        """
         self._allowed = allowed_units
-        self._bus: MessageBus | None = None
+        self._bus: Bus | None = bus
 
     async def __aenter__(self) -> Self:
         await self.connect()
@@ -116,12 +138,12 @@ class SystemdUnits:
                 f"refusing to {operation} {unit!r}: it is not a unit this deployer's registry names"
             )
 
-    def _connected_bus(self) -> MessageBus:
+    def _connected_bus(self) -> Bus:
         if self._bus is None:
             raise SystemdError("not connected to the system bus")
         return self._bus
 
-    async def _call(self, member: str, signature: str = "", body: list[Any] | None = None) -> Message:
+    async def _call(self, member: str, signature: str = "", body: list[Any] | None = None) -> Any:
         await self.connect()
         reply = await self._connected_bus().call(
             Message(
@@ -156,11 +178,14 @@ class SystemdUnits:
         check.
         """
         path = await self._unit_path(unit)
+        # ActiveState and SubState are Unit properties; Result is a Service
+        # one. Reading Result off the Unit interface fails, and since a failed
+        # read raises, that would have made every state() call an error.
         return UnitState(
             name=unit,
             active_state=str(await self._property(path, UNIT_IFACE, "ActiveState") or ""),
             sub_state=str(await self._property(path, UNIT_IFACE, "SubState") or ""),
-            result=str(await self._property(path, UNIT_IFACE, "Result") or ""),
+            result=str(await self._property(path, SERVICE_IFACE, "Result") or ""),
         )
 
     async def hold_guard_installed(self) -> bool:

@@ -191,3 +191,26 @@ def test_the_socket_env_is_used_when_no_path_is_passed(monkeypatch: pytest.Monke
     monkeypatch.setenv(SOCKET_ENV, "/run/from-env.sock")
     images = PodmanImages()
     assert images.socket_path == "/run/from-env.sock"
+
+
+@pytest.mark.parametrize(("force", "expected"), [(False, "false"), (True, "true")])
+async def test_remove_image_hits_delete_and_passes_force(force: bool, expected: str) -> None:
+    seen: list[tuple[str, str, dict[str, str]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path, dict(request.url.params)))
+        return httpx.Response(200, json={})
+
+    async with client(handler) as images:
+        await images.remove_image("localhost/acquacotta:rollback-old", force=force)
+
+    method, path, params = seen[0]
+    assert method == "DELETE"
+    assert path.endswith("/images/localhost/acquacotta:rollback-old")
+    assert params["force"] == expected
+
+
+async def test_remove_image_surfaces_an_http_error() -> None:
+    async with client(lambda _r: httpx.Response(409, text="image is in use")) as images:
+        with pytest.raises(PodmanError, match="409"):
+            await images.remove_image("localhost/x:rollback-1")
