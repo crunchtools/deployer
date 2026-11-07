@@ -14,13 +14,29 @@ from __future__ import annotations
 import importlib
 import pkgutil
 from pathlib import Path
+from typing import Any
 
+import httpx
 import pytest
 
 import deployer
 from deployer.attempts import ROLLBACK_LIMIT, AttemptLog
 from deployer.hold import Hold, HoldStore
-from deployer.cli import CONFIG_ENV, EXIT_COULD_NOT_RUN, EXIT_OK, STATE_ENV, build_parser, main
+from deployer.cli import (
+    CONFIG_ENV,
+    EXIT_COULD_NOT_RUN,
+    EXIT_ERROR,
+    EXIT_OK,
+    STATE_ENV,
+    Hands,
+    _rollback,
+    build_parser,
+    main,
+)
+from deployer.lock import only_one
+from deployer.podman import ImageRef
+from deployer.registry import load_registry
+from deployer.systemd import UnitState
 
 FORBIDDEN = ("container_create", "container_start", "container_run", "container_exec")
 
@@ -93,6 +109,11 @@ unit = "acquacotta.crunchtools.com.service"
 nagios_host = "ctr-acquacotta.crunchtools.com"
 requestors = ["developer1"]
 probe = { kind = "http", url = "http://127.0.0.1:8080/health" }
+# One second, not the 60 these services really use, so these tests do not each
+# wait a minute of real time. The registry refuses 0 -- a settle window of no
+# time is not a settle window -- and the loop's own timing is pinned in
+# tests/test_verify.py, which is where it lives.
+settle = 1
 """,
         encoding="utf-8",
     )
@@ -189,3 +210,166 @@ def test_package_exposes_no_container_lifecycle_verb() -> None:
         mod = importlib.import_module(f"deployer.{module}")
         for forbidden in FORBIDDEN:
             assert not hasattr(mod, forbidden), f"deployer.{module} exposes {forbidden}"
+
+
+# --- rollback by hand: the guard, the lock, and the hold it leaves ---
+#
+# This path moves `:latest` and restarts a production unit, so it is tested
+# rather than only read. The clients go in through `Hands`; everything else is
+# the real code path, lock included.
+
+
+class RollbackPodman:
+    """Just enough podman for a by-hand rollback."""
+
+    def __init__(self, rollback_tag: str = "localhost/acquacotta:rollback-abc123") -> None:
+        self.rollback_tag = rollback_tag
+        self.running = "sha256:aaa"
+        self.tagged: list[tuple[str, str]] = []
+        self.healthy = True
+
+    async def inspect_container(self, name: str) -> dict[str, Any]:
+        return {"Image": self.running, "Config": {"Env": []}}
+
+    async def inspect_image(self, name: str) -> ImageRef:
+        return ImageRef(id=self.running, digest=None, tags=(), labels={})
+
+    async def pull(self, reference: str) -> str:
+        raise AssertionError("a by-hand rollback must not pull")
+
+    async def tag(self, name: str, reference: str) -> None:
+        self.tagged.append((name, reference))
+
+    async def untag(self, name: str, reference: str) -> None:
+        return None
+
+    async def remove_image(self, name: str, force: bool = False) -> None:
+        return None
+
+    async def list_images(self, reference: str | None = None) -> tuple[ImageRef, ...]:
+        if self.rollback_tag:
+            return (ImageRef(id="sha256:old", digest=None, tags=(self.rollback_tag,), labels={}),)
+        return ()
+
+    async def logs(self, name: str, tail: int = 40) -> str:
+        return ""
+
+
+class RollbackSystemd:
+    def __init__(self, podman: RollbackPodman, guard: bool = True) -> None:
+        self.podman = podman
+        self.guard = guard
+        self.restarts: list[str] = []
+
+    async def restart(self, unit: str) -> None:
+        self.restarts.append(unit)
+        self.podman.running = "sha256:old"
+
+    async def state(self, unit: str) -> UnitState:
+        return UnitState(name=unit, active_state="active", sub_state="running", result="success")
+
+    async def property(self, unit: str, name: str, interface: str = "") -> Any:
+        return ""
+
+    async def hold_guard_installed(self) -> bool:
+        return self.guard
+
+
+def hands(podman: RollbackPodman, systemd: RollbackSystemd) -> Hands:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200 if podman.healthy else 503, text="ok")
+
+    return Hands(
+        podman=podman,
+        systemd=systemd,
+        probes=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+
+async def roll_back_by_hand(tmp_path: Path, **kwargs: Any) -> tuple[int, RollbackPodman, RollbackSystemd]:
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    podman = RollbackPodman(rollback_tag=kwargs.pop("rollback_tag", "localhost/acquacotta:rollback-abc"))
+    podman.healthy = kwargs.pop("healthy", True)
+    systemd = RollbackSystemd(podman, guard=kwargs.pop("guard", True))
+    registry = load_registry(registry_file(tmp_path))
+    code = await _rollback(
+        registry,
+        "acquacotta",
+        state,
+        dry_run=kwargs.pop("dry_run", False),
+        hands=hands(podman, systemd),
+    )
+    assert not kwargs, f"unused: {kwargs}"
+    return code, podman, systemd
+
+
+async def test_rolling_back_by_hand_restores_verifies_and_holds(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, podman, systemd = await roll_back_by_hand(tmp_path)
+    assert code == EXIT_OK
+    assert systemd.restarts == ["acquacotta.crunchtools.com.service"]
+    # Ticket 0 means "no ticket -- a person did this by hand".
+    hold = HoldStore(tmp_path / "state").get("acquacotta.crunchtools.com.service")
+    assert hold is not None
+    assert hold.ticket == 0
+    assert "is now held" in capsys.readouterr().out
+
+
+async def test_a_by_hand_rollback_is_refused_without_the_guard(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Without the guard the hold would not be honoured, so the broken image
+    # comes back at the next auto-update and the rollback was for nothing.
+    code, _podman, systemd = await roll_back_by_hand(tmp_path, guard=False)
+    assert code == EXIT_COULD_NOT_RUN
+    assert systemd.restarts == []
+    assert "hold guard is not installed" in capsys.readouterr().err
+    assert not HoldStore(tmp_path / "state").held("acquacotta.crunchtools.com.service")
+
+
+async def test_a_by_hand_rollback_stands_down_while_a_deploy_holds_the_lock(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The important one. This moves `:latest`, and a run that is mid-staging has
+    # already read it and will put it back where it found it. Interleaved, the
+    # tag ends up pointing at whichever wrote last.
+    state = tmp_path / "state"
+    state.mkdir()
+    registry = load_registry(registry_file(tmp_path))
+    podman = RollbackPodman()
+    systemd = RollbackSystemd(podman)
+    with only_one(state):
+        code = await _rollback(registry, "acquacotta", state, dry_run=False, hands=hands(podman, systemd))
+    assert code == EXIT_COULD_NOT_RUN
+    assert systemd.restarts == []
+    assert "A deploy is in flight" in capsys.readouterr().err
+
+
+async def test_a_by_hand_rollback_with_nothing_to_roll_back_to_says_so(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, _podman, systemd = await roll_back_by_hand(tmp_path, rollback_tag="")
+    assert code == EXIT_COULD_NOT_RUN
+    assert systemd.restarts == []
+    assert "nothing to roll back to" in capsys.readouterr().err
+
+
+async def test_a_by_hand_rollback_that_does_not_come_back_exits_one(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, _podman, _systemd = await roll_back_by_hand(tmp_path, healthy=False)
+    assert code == EXIT_ERROR
+    assert "did not come back" in capsys.readouterr().err
+    # Held anyway: the service is on the old image and nothing should overwrite
+    # that from the registry tonight.
+    assert HoldStore(tmp_path / "state").held("acquacotta.crunchtools.com.service")
+
+
+async def test_a_dry_run_rollback_changes_nothing(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    code, podman, systemd = await roll_back_by_hand(tmp_path, dry_run=True)
+    assert code == EXIT_OK
+    assert (systemd.restarts, podman.tagged) == ([], [])
+    assert "would put" in capsys.readouterr().out
+    assert not HoldStore(tmp_path / "state").held("acquacotta.crunchtools.com.service")

@@ -21,3 +21,26 @@ check = "hardcoded_years"
 path = "src/deployer/verify.py"
 justification = "2025-06-18 is the MCP protocol version string sent in the initialize handshake, fixed by the protocol; it is not a date this file is stale about, and bumping it would make the probe announce a version no server implements"
 classification = "by_design"
+
+# `_units` has two call sites, both inside an `async with` body: once in
+# `_restore` (the by-hand rollback) and once in `_drain` (the queue run). The
+# check appears not to count calls nested in a with-statement. Inlining the
+# comprehension at both would duplicate the one place that decides which units
+# this process may touch, which is a worse answer than this note.
+[[exceptions]]
+check = "single_use_helpers"
+path = "src/deployer/cli.py"
+pattern = "_units"
+justification = "called from both _restore and _drain, each inside an `async with` body; the check does not appear to count calls nested in a with-statement, and inlining would duplicate the single definition of this process's unit scope"
+classification = "gourmand_bug"
+
+# `Hands` is constructed in production, in `_restore`, when nothing was passed
+# in -- also inside an `async with` body. It exists so the by-hand rollback can
+# be tested at all: that path moves `:latest` and restarts a production unit,
+# and before it had a seam it had no tests.
+[[exceptions]]
+check = "dead_structs"
+path = "src/deployer/cli.py"
+pattern = "Hands"
+justification = "instantiated in _restore when no clients are injected, inside an `async with` body which the check does not appear to see; the seam exists so the by-hand rollback path -- which moves :latest and restarts a unit -- can be tested"
+classification = "gourmand_bug"

@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from math import ceil
 from pathlib import Path
@@ -65,6 +65,7 @@ __all__ = [
     "TicketResult",
     "TicketSource",
     "UnitHost",
+    "UnreadableEnvironment",
     "container_environment",
     "redact",
 ]
@@ -76,11 +77,33 @@ DOWNTIME_MARGIN_SECONDS: Final = 300
 #: How much of a refusal goes in the "already said this" record. Long enough
 #: that two different refusals are different, short enough to stay one line.
 SAID_DETAIL_LIMIT: Final = 120
-#: An environment value at least this long is treated as possibly a secret and
-#: taken out of anything published. Short values are left alone: a port number
-#: or a log level is not a credential, and replacing every "80" in a traceback
-#: would make the traceback useless.
+#: A value at least this long is taken out of anything published whatever it is
+#: called, because a long opaque string is far more likely to be a credential
+#: than a thing worth reading. Shorter values are only removed when their NAME
+#: says they are secret -- replacing every "80" in a traceback because some
+#: variable happens to be set to 80 would make the traceback useless.
 MIN_SECRET_LENGTH: Final = 8
+#: Names that mean "this is a credential, however short it is". A seven
+#: character password is still a password, and length is not what makes a
+#: secret safe to publish.
+SECRET_NAME_PARTS: Final = (
+    "PASSWORD",
+    "PASSWD",
+    "PASS",
+    "SECRET",
+    "TOKEN",
+    "KEY",
+    "CREDENTIAL",
+    "AUTH",
+    "SIGNATURE",
+    "COOKIE",
+    "SESSION",
+)
+
+
+class UnreadableEnvironment(Exception):
+    """The container's environment could not be read, so output cannot be published."""
+
 
 #: What the run as a whole is reported as, worst-first when ranked. These are
 #: the strings ``check_deployer.sh`` reads out of the status file, so they are
@@ -122,7 +145,6 @@ class RunReport:
     outcome: str
     detail: str
     tickets: int
-    results: tuple[TicketResult, ...] = ()
 
 
 class TicketSource(Protocol):
@@ -250,7 +272,7 @@ class Runner:
         # reported as the break: the status file has room for one verdict, and
         # it should be the one that needs somebody.
         worst = max(results, key=lambda result: OUTCOMES.index(result.outcome))
-        return RunReport(worst.outcome, worst.detail, len(results), tuple(results))
+        return RunReport(worst.outcome, worst.detail, len(results))
 
     # ------------------------------------------------------------- one ticket
 
@@ -375,7 +397,7 @@ class Runner:
         that restarts a healthy service on the next run.
         """
         outcome = await verify(self.host, service, staged.candidate_image_id)
-        await self._untag_candidate(staged)
+        untagged = await self._untag_candidate(staged)
         if outcome.failed:
             # Running the right revision and unhealthy is not something to fix
             # by restarting. A person decides that.
@@ -395,7 +417,8 @@ class Runner:
             f"{service.probe.url} answered for {service.settle}s. Nothing was restarted.\n"
             "If you expected a deploy here, the likeliest explanation is that an earlier run "
             "deployed it and could not reach RT to say so."
-            + ("\nThe hold on this service is cleared." if cleared else ""),
+            + ("\nThe hold on this service is cleared." if cleared else "")
+            + _as_notes((untagged,)),
         )
         await self.clients.rt.set_fields(ticket.id, status="resolved")
         return TicketResult(OUTCOME_OK, f"{service.name} {request.short_commit} already live")
@@ -453,9 +476,9 @@ class Runner:
         self, ticket: Ticket, request: Request, service: Service, staged: Staged
     ) -> TicketResult:
         """It held. Close the window, tidy the tags, clear any hold, resolve."""
-        await self._close_window(service)
-        await self._untag_candidate(staged)
-        rotated = await self._rotate(service)
+        window = await self._close_window(service)
+        untagged = await self._untag_candidate(staged)
+        rotated, rotation = await self._rotate(service)
 
         cleared = self.holds.clear(service.unit)
         version = staged.candidate_revision or "no revision label"
@@ -467,7 +490,8 @@ class Runner:
             f"throughout.\n"
             f"Rollback image kept as {staged.rollback_tag}."
             + (f"\nRemoved {len(rotated)} older rollback tag(s)." if rotated else "")
-            + ("\nThe hold on this service is cleared; auto-update is no longer skipped." if cleared else ""),
+            + ("\nThe hold on this service is cleared; auto-update is no longer skipped." if cleared else "")
+            + _as_notes((window, untagged, rotation)),
         )
         await self.clients.rt.set_fields(ticket.id, status="resolved")
         self.said.record(ticket.id, f"deployed:{request.commit}")
@@ -512,8 +536,8 @@ class Runner:
         # Closed either way. On a rollback that came back the window has served
         # its purpose; on one that did not, closing it is the point -- Nagios
         # saying the service is down is the only fix path left.
-        await self._close_window(service)
-        await self._untag_candidate(staged)
+        window = await self._close_window(service)
+        untagged = await self._untag_candidate(staged)
 
         await self.clients.rt.comment(
             ticket.id,
@@ -527,7 +551,8 @@ class Runner:
                     restored=restored,
                     logs=await self._log_tail(service),
                 )
-            ),
+            )
+            + _as_notes((window, untagged)),
         )
         await self._hand_back(ticket)
 
@@ -563,45 +588,63 @@ class Runner:
         """
         try:
             inspected = await self.clients.podman.inspect_container(service.container)
-        except PodmanError as exc:
+            secrets = container_environment(inspected)
+        except (PodmanError, UnreadableEnvironment) as exc:
             return (
                 "[no logs: the container's environment could not be read, so its output could "
                 f"not be checked for secrets first: {exc}]"
             )
-        return redact(await self.clients.podman.logs(service.container), container_environment(inspected))
+        return redact(await self.clients.podman.logs(service.container), secrets)
 
-    async def _close_window(self, service: Service) -> None:
-        """Cancel the maintenance window, never failing the run over it.
+    async def _close_window(self, service: Service) -> str:
+        """Cancel the maintenance window. Returns a note if it could not be.
 
-        A window left open is a monitoring problem for a person to notice; it
-        is not worth turning a good deploy, or a completed rollback, into an
-        error. The reason goes in the status file either way.
+        Never fails the run: a window left open is a monitoring problem for a
+        person to notice, and it is not worth turning a good deploy -- or a
+        completed rollback -- into an error. But it is not nothing either, and
+        the reason has to go somewhere a person will see it. It goes on the
+        ticket, which is the one place somebody is already going to read.
         """
         try:
             await self.clients.nagios.cancel_downtime(service.nagios_host)
-        except NagiosError:
-            return
+        except NagiosError as exc:
+            return (
+                f"The maintenance window on {service.nagios_host} could not be cancelled: {exc}. "
+                "It expires on its own, but until then Nagios will not report on this service."
+            )
+        return ""
 
-    async def _untag_candidate(self, staged: Staged) -> None:
+    async def _untag_candidate(self, staged: Staged) -> str:
         """Drop the candidate tag once it has served its purpose.
 
         After a good deploy the image is what ``:latest`` points at; after a
         failed one it is known-bad. Either way nothing should keep a name on
         it, or candidate tags pile up exactly like the rollback tags that
-        rotation exists to control.
+        rotation exists to control -- which is why a failure to drop one is
+        reported rather than swallowed, even though it is harmless today.
         """
         if not staged.candidate_tag:
-            return
+            return ""
         try:
             await self.clients.podman.untag(staged.candidate_image_id, staged.candidate_tag)
-        except PodmanError:
-            return
+        except PodmanError as exc:
+            return f"The candidate tag {staged.candidate_tag} could not be removed: {exc}."
+        return ""
 
-    async def _rotate(self, service: Service) -> tuple[str, ...]:
+    async def _rotate(self, service: Service) -> tuple[tuple[str, ...], str]:
+        """Remove all but the newest rollback tags. Returns what went, and a note.
+
+        Rollback images are the size of the application and unrotated ones have
+        filled a fleet host's disk before now, so a rotation that fails is
+        worth saying out loud rather than discovering later as a full disk.
+        """
         try:
-            return await rotate_rollback_tags(self.clients.podman, service)
-        except PodmanError:
-            return ()
+            return await rotate_rollback_tags(self.clients.podman, service), ""
+        except PodmanError as exc:
+            return (), (
+                f"Older rollback images for {service.name} could not be rotated: {exc}. "
+                "They are application-sized; check the host's disk."
+            )
 
     async def _refuse(self, ticket: Ticket, why: str) -> TicketResult:
         """Say why, hand the ticket back, and leave the host alone.
@@ -638,23 +681,38 @@ class Runner:
 
 
 def container_environment(inspected: Mapping[str, Any]) -> dict[str, str]:
-    """The container's environment, as ``name -> value``, secrets-long only.
+    """The container's secrets, as ``name -> value``.
 
-    podman gives it as ``["NAME=value", ...]``. A name with no value, and a
-    value too short to be a credential, are both dropped: there is nothing to
-    redact in either, and a shorter threshold would start replacing port
-    numbers inside tracebacks.
+    podman gives the environment as ``["NAME=value", ...]``. Two rules decide
+    what comes back: a value long enough to be an opaque credential, whatever
+    it is called, and a value of any length whose NAME says it is one.
+
+    **Raises** :class:`UnreadableEnvironment` on a shape it cannot read, and
+    this is the important part. Returning an empty mapping for a malformed
+    inspect would read as "this container has no secrets" and the caller would
+    publish the logs unredacted -- failing open, on the one path where failing
+    open means leaking. A container with a genuinely empty environment gives an
+    empty *list*, which is read fine and returns ``{}``.
     """
     config = inspected.get("Config")
-    raw = config.get("Env") if isinstance(config, dict) else None
+    if not isinstance(config, dict):
+        raise UnreadableEnvironment(f"no Config in the inspect output: keys were {sorted(inspected)}")
+    raw = config.get("Env")
     if not isinstance(raw, list):
-        return {}
+        raise UnreadableEnvironment(f"Config.Env is {type(raw).__name__}, not a list")
     found: dict[str, str] = {}
     for entry in raw:
         name, sep, value = str(entry).partition("=")
-        if sep and len(value) >= MIN_SECRET_LENGTH:
+        if not sep or not value:
+            continue
+        if len(value) >= MIN_SECRET_LENGTH or _named_like_a_secret(name):
             found[name] = value
     return found
+
+
+def _named_like_a_secret(name: str) -> bool:
+    upper = name.upper()
+    return any(part in upper for part in SECRET_NAME_PARTS)
 
 
 def redact(text: str, secrets: Mapping[str, str]) -> str:
@@ -666,6 +724,20 @@ def redact(text: str, secrets: Mapping[str, str]) -> str:
     for name, value in sorted(secrets.items(), key=lambda item: len(item[1]), reverse=True):
         text = text.replace(value, f"<redacted ${name}>")
     return text
+
+
+def _as_notes(reasons: Iterable[str]) -> str:
+    """Render whatever could not be cleaned up, for the end of a ticket comment.
+
+    Empty when nothing went wrong, which is the usual case, so the ordinary
+    comment stays the length it was.
+    """
+    said = [reason for reason in reasons if reason]
+    if not said:
+        return ""
+    return "\n\nAlso, and none of these changed the outcome above:\n" + "\n".join(
+        f"  - {reason}" for reason in said
+    )
 
 
 def _said_key(stage_name: str, detail: str) -> str:

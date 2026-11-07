@@ -49,6 +49,7 @@ import argparse
 import asyncio
 import os
 import sys
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -67,6 +68,8 @@ from .rollback import RollbackError, roll_back
 from .rt import RtClient, RtCredentials, RtError
 from .runner import (
     OUTCOME_COULD_NOT_RUN,
+    ImageHost,
+    UnitHost,
     OUTCOME_OK,
     OUTCOME_REFUSED,
     OUTCOME_ROLLBACK_FAILED,
@@ -182,7 +185,7 @@ async def _dispatch(args: argparse.Namespace, registry: Registry, env: Mapping[s
     if args.verb == "holds":
         return _show_holds(Path(args.state))
     if args.verb == "unhold":
-        return _unhold(registry, Path(args.state), args.service, dry_run=args.dry_run)
+        return _unhold(registry, args.service, Path(args.state), dry_run=args.dry_run)
     if args.verb == "rollback":
         return await _rollback(registry, args.service, Path(args.state), dry_run=args.dry_run)
     return await _run(args, registry, env)
@@ -211,7 +214,7 @@ def _show_holds(state: Path) -> int:
     return EXIT_OK
 
 
-def _unhold(registry: Registry, state: Path, name: str, dry_run: bool) -> int:
+def _unhold(registry: Registry, name: str, state: Path, dry_run: bool) -> int:
     """Clear a hold, and the rollback count that goes with it.
 
     Both, because they are one decision. A service that hit the
@@ -248,13 +251,35 @@ def _unhold(registry: Registry, state: Path, name: str, dry_run: bool) -> int:
     return EXIT_OK
 
 
-async def _rollback(registry: Registry, name: str, state: Path, dry_run: bool) -> int:
+@dataclass(frozen=True, slots=True)
+class Hands:
+    """The clients a by-hand rollback needs, so the verb can be tested.
+
+    Built from the real thing by :func:`_rollback` when nothing is passed in.
+    This path mutates a production service, so it deserves tests rather than
+    only a careful reading.
+    """
+
+    podman: ImageHost
+    systemd: UnitHost
+    probes: httpx.AsyncClient | None = None
+
+
+async def _rollback(
+    registry: Registry, name: str, state: Path, dry_run: bool, hands: Hands | None = None
+) -> int:
     """Put a service back on its newest rollback image, by hand.
 
     No ticket and no Nagios window -- a person doing this on purpose will open
-    their own window if they want one. A hold, though, yes: `:latest` still
+    their own window if they want one. A hold, though, yes: ``:latest`` still
     carries the image being rolled away from, so without one the next
     auto-update puts it straight back.
+
+    **Under the same lock as a run.** This moves ``:latest`` and restarts a
+    unit, and a run that is mid-staging has already read ``:latest`` and will
+    put it back where it found it. The two interleaved would leave the tag
+    pointing at whichever of them wrote last, which is not necessarily what is
+    running. One at a time, and this one says so and stops rather than waiting.
     """
     try:
         service = registry.get(name)
@@ -276,22 +301,41 @@ async def _rollback(registry: Registry, name: str, state: Path, dry_run: bool) -
         return EXIT_COULD_NOT_RUN
 
     try:
-        async with PodmanImages() as podman, SystemdUnits(_units(registry)) as systemd:
-            # The guard matters here for the same reason it matters on a run.
-            # This rollback puts an older image live while `:latest` still
-            # carries the newer, broken one, so unless a hold is honoured the
-            # broken image comes back at the next podman auto-update.
-            await require_guard(systemd)
-            staged = await _newest_rollback(podman, service)
-            if dry_run:
-                print(f"would put {service.unit} back on {staged.rollback_tag} and hold it")
-                return EXIT_OK
-            async with httpx.AsyncClient() as probes:
-                host = Host(systemd=systemd, podman=podman, client=probes)
-                restored = await roll_back(podman, systemd, host, service, staged)
+        with only_one(state):
+            return await _restore(registry, service, state, dry_run, hands)
+    except AlreadyRunning as exc:
+        print(
+            f"deployer: {exc}. A deploy is in flight and it is moving the same tag; "
+            "wait for it to finish and try again.",
+            file=sys.stderr,
+        )
+        return EXIT_COULD_NOT_RUN
     except (*COULD_NOT_RUN, RollbackError) as exc:
         print(f"deployer: {exc}", file=sys.stderr)
         return EXIT_COULD_NOT_RUN
+
+
+async def _restore(
+    registry: Registry, service: Service, state: Path, dry_run: bool, hands: Hands | None
+) -> int:
+    """The rollback itself, with the lock already held."""
+    async with AsyncExitStack() as stack:
+        if hands is None:
+            podman = await stack.enter_async_context(PodmanImages())
+            systemd = await stack.enter_async_context(SystemdUnits(_units(registry)))
+            probes = await stack.enter_async_context(httpx.AsyncClient())
+            hands = Hands(podman=podman, systemd=systemd, probes=probes)
+        # The guard matters here for the same reason it matters on a run. This
+        # rollback puts an older image live while `:latest` still carries the
+        # newer, broken one, so unless a hold is honoured the broken image
+        # comes back at the next podman auto-update.
+        await require_guard(hands.systemd)
+        staged = await _newest_rollback(hands.podman, service)
+        if dry_run:
+            print(f"would put {service.unit} back on {staged.rollback_tag} and hold it")
+            return EXIT_OK
+        host = Host(systemd=hands.systemd, podman=hands.podman, client=hands.probes)
+        restored = await roll_back(hands.podman, hands.systemd, host, service, staged)
 
     # Ticket 0 means "no ticket -- a person did this by hand".
     HoldStore(state).place(
@@ -389,7 +433,7 @@ class _ByHand:
     outgoing_revision: str | None
 
 
-async def _newest_rollback(podman: PodmanImages, service: Service) -> _ByHand:
+async def _newest_rollback(podman: ImageHost, service: Service) -> _ByHand:
     """The newest ``rollback-*`` image for a service."""
     basename = service.image.rsplit("/", maxsplit=1)[-1]
     pattern = f"localhost/{basename}:rollback-"

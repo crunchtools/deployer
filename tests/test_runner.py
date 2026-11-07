@@ -36,6 +36,7 @@ from deployer.rollback import ROLLBACK_TAGS_KEPT
 from deployer.rt import RtError, Ticket
 from deployer.runner import (
     OUTCOMES,
+    UnreadableEnvironment,
     OUTCOME_COULD_NOT_RUN,
     OUTCOME_OK,
     OUTCOME_REFUSED,
@@ -107,6 +108,9 @@ class FakeRt:
         self.comments: list[tuple[int, str]] = []
         self.fields: list[tuple[int, dict[str, str]]] = []
         self.fail_set_fields = False
+        #: Fail only the call that sets this status, so a failure *after* a
+        #: verified deploy can be told from one before it.
+        self.fail_status = ""
 
     async def open_tickets(self, queue: str) -> tuple[int, ...]:
         return tuple(sorted(self.tickets)) + self.unreadable
@@ -120,7 +124,7 @@ class FakeRt:
         self.comments.append((ticket_id, text))
 
     async def set_fields(self, ticket_id: int, **fields: str) -> None:
-        if self.fail_set_fields:
+        if self.fail_set_fields or fields.get("status") == self.fail_status:
             raise RtError("RT returned HTTP 503")
         if self.refuse_owner and "owner" in fields:
             raise RtError("RT refused the owner")
@@ -820,6 +824,14 @@ async def test_an_unreadable_environment_means_no_logs_rather_than_raw_logs(tmp_
         (["TOKEN=super-secret-value"], "auth failed: super-secret-value", "auth failed: <redacted $TOKEN>"),
         # Too short to be a credential, and replacing it would wreck the line.
         (["PORT=8080"], "listening on 8080", "listening on 8080"),
+        # Short, but its NAME says it is a secret. Length is not what makes a
+        # secret safe to publish: a seven-character password is a password.
+        (["DB_PASSWORD=hunter7"], "auth failed for hunter7", "auth failed for <redacted $DB_PASSWORD>"),
+        # A short named secret is removed wherever it appears, including inside
+        # an unrelated word. That is the cost of not publishing short
+        # credentials, and it is the right way round: a mangled log line is
+        # recoverable, a published key is not.
+        (["API_KEY=rej"], "key abc rejected", "key abc <redacted $API_KEY>ected"),
         # An entry with no value has nothing to redact.
         (["EMPTY="], "nothing here", "nothing here"),
         # Several occurrences, not just the first.
@@ -841,7 +853,39 @@ def test_redaction_replaces_what_it_should_and_leaves_the_rest(
     "inspected",
     [{}, {"Config": None}, {"Config": {}}, {"Config": {"Env": None}}, {"Config": {"Env": "x"}}],
 )
-def test_an_environment_shape_this_cannot_read_yields_nothing(inspected: dict[str, Any]) -> None:
-    # Nothing to redact is reported as nothing to redact. Whether publishing is
-    # safe at all is _log_tail's decision, and it fails closed on the read.
-    assert container_environment(inspected) == {}
+def test_an_environment_shape_this_cannot_read_is_an_error_not_an_empty_set(
+    inspected: dict[str, Any],
+) -> None:
+    # Returning {} here would read as "this container has no secrets" and the
+    # caller would publish the logs unredacted. Failing open on the one path
+    # where failing open means leaking.
+    with pytest.raises(UnreadableEnvironment):
+        container_environment(inspected)
+
+
+def test_a_genuinely_empty_environment_is_not_an_error() -> None:
+    # An empty list is a shape this can read. Only an unreadable one raises.
+    assert container_environment({"Config": {"Env": []}}) == {}
+
+
+async def test_an_rt_failure_after_a_verified_deploy_is_recovered_on_the_next_run(
+    tmp_path: Path,
+) -> None:
+    # The failure the already-live path exists for, end to end. The first run
+    # deploys and verifies, then cannot resolve the ticket. The second run must
+    # finish the ticket WITHOUT restarting a healthy service.
+    world = World(tmp_path, ticket())
+    world.rt.fail_status = "resolved"
+    with pytest.raises(RtError):
+        await world.drain()
+    assert world.systemd.restarts == [UNIT]
+    assert world.podman.latest_points_at() == CANDIDATE_ID
+
+    # Second run: RT is back, the ticket is still open.
+    world.rt.fail_status = ""
+    report = await world.drain()
+    assert report.outcome == OUTCOME_OK
+    assert "already live" in report.detail
+    # The one thing that must not happen.
+    assert world.systemd.restarts == [UNIT]
+    assert world.rt.status()[-1] == "resolved"

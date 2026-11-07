@@ -7,6 +7,8 @@ run is still going" is the most ordinary thing that can happen.
 
 from __future__ import annotations
 
+import errno
+import fcntl
 import os
 from pathlib import Path
 
@@ -59,6 +61,21 @@ def test_the_lock_file_is_private(tmp_path: Path) -> None:
     with only_one(tmp_path):
         mode = (tmp_path / LOCK_NAME).stat().st_mode
     assert not mode & 0o077
+
+
+def test_an_error_that_is_not_contention_is_not_hidden(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A filesystem that cannot lock at all was being reported as "the previous
+    # run is still going", which exits 0. The whole point of standing down
+    # quietly is that it means one specific, expected thing.
+    def no_locking(_handle: int, _operation: int) -> None:
+        raise OSError(errno.ENOLCK, "No locks available")
+
+    monkeypatch.setattr(fcntl, "flock", no_locking)
+    with pytest.raises(OSError, match="No locks available"):
+        with only_one(tmp_path):
+            pass  # pragma: no cover
 
 
 def test_a_stale_lock_file_does_not_block_a_run(tmp_path: Path) -> None:
