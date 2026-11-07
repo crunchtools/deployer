@@ -118,3 +118,44 @@ def test_a_name_unfit_for_a_path_is_refused(tmp_path: Path, value: str) -> None:
         log.was_rolled_back(value, GOOD)
     with pytest.raises(ValueError, match="not a usable"):
         log.was_rolled_back(SERVICE, value)
+
+
+# --- forgetting, which is what `deployer unhold` does ---
+
+
+def test_forgetting_drops_only_that_service(tmp_path: Path) -> None:
+    log = AttemptLog(tmp_path)
+    acquacotta = ["acquacotta", "acquacotta"]
+    for name in [*acquacotta, "mcp-pcloud"]:
+        log.record_rollback(name)
+
+    assert log.forget_rollbacks("acquacotta") == len(acquacotta)
+    assert log.recent_rollbacks("acquacotta") == 0
+    # Unholding one service must not reset the count for another.
+    assert log.recent_rollbacks("mcp-pcloud") == 1
+
+
+def test_forgetting_clears_the_refusal(tmp_path: Path) -> None:
+    # The point of the method: a service that hit the limit would otherwise
+    # stay refused for a whole day after the fix shipped.
+    log = AttemptLog(tmp_path)
+    for _ in range(ROLLBACK_LIMIT):
+        log.record_rollback("acquacotta")
+    assert log.too_many_rollbacks("acquacotta")
+
+    log.forget_rollbacks("acquacotta")
+    assert not log.too_many_rollbacks("acquacotta")
+
+
+def test_forgetting_with_no_log_is_nothing_to_do(tmp_path: Path) -> None:
+    assert AttemptLog(tmp_path).forget_rollbacks("acquacotta") == 0
+
+
+def test_forgetting_does_not_forgive_the_revision(tmp_path: Path) -> None:
+    # Two different records. A revision that broke a service is never deployed
+    # to it again, and unholding the service does not change that.
+    log = AttemptLog(tmp_path)
+    log.mark_rolled_back("acquacotta", "f" * 40)
+    log.record_rollback("acquacotta")
+    log.forget_rollbacks("acquacotta")
+    assert log.was_rolled_back("acquacotta", "f" * 40)
