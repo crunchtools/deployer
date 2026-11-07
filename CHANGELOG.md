@@ -7,7 +7,8 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
-- `NAGIOS_TIMEZONE`, required: the Nagios server's own zone.
+- `NAGIOS_TIMEZONE`, required: the Nagios server's own zone, as an IANA name
+  such as `America/New_York`. An unrecognised one is refused at start-up.
 
 ### Fixed
 - **The maintenance window now starts when the deploy does.** `cmd.cgi` takes

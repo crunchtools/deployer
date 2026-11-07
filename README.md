@@ -168,7 +168,7 @@ whatever happened to be there. A missing variable is exit 2, "could not run".
 | `RT_TIMEZONE` | the zone RT renders its dates in. Required, because RT's `Created` string carries no zone and a container's clock is UTC — reading `America/New_York` as UTC is five hours out, enough to call a fresh ticket stale |
 | `RT_HTTP_USER`, `RT_HTTP_PASSWORD` | the auth proxy in front of RT, if there is one |
 | `NAGIOS_CMD_URL`, `NAGIOS_USER`, `NAGIOS_PASSWORD` | `cmd.cgi`, for the maintenance window |
-| `NAGIOS_TIMEZONE` | the Nagios server's own zone. Required, for the reason directly above and in the same direction: `cmd.cgi` takes `start_time` as naive wall clock and reads it in its zone, so a UTC string opened every window five hours late |
+| `NAGIOS_TIMEZONE` | the Nagios server's own zone, as an IANA name (`America/New_York`, not `EST` or `-05:00`); an unrecognised one is refused by name at start-up rather than fallen back from. Required, for the reason directly above and in the same direction: `cmd.cgi` takes `start_time` as naive wall clock and reads it in its zone, so a UTC string opened every window five hours late |
 
 ## Exit codes
 
