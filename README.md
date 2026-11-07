@@ -39,8 +39,8 @@ remembering.
 For each ticket:
 
 - Refuse anything outside the registry, any ticket whose RT `Creator` is not a
-  listed requestor, and any unit that pulls on start or is pinned to something
-  other than `:latest`. A refusal is not an attempt.
+  listed requestor, and any unit that pulls on start or does not run
+  `<image>:latest`. A refusal is not an attempt.
 - Tag the image the service is *running now* as `rollback-<revision>` — read
   from the running container, not from the local `:latest`, because those two
   can differ and that gap is how a surprise gets deployed.

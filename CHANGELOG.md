@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- The unit-shape gate looked for `<image>:latest` at the END of `ExecStart` and
+  now looks for it as a word anywhere in it. `podman run ... IMAGE CMD ARGS` is
+  the ordinary shape for anything that takes arguments of its own:
+  mcp-pcloud's unit ends `--port 8028`, so two of the three services in the
+  seeded registry would have been refused as "pinned to another tag". Found by
+  running the gate against the real units rather than against the tests.
+
 ## [0.1.0] - 2026-11-07
 
 ### Added

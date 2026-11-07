@@ -3,7 +3,7 @@
 Two jobs, both before anything is deployed.
 
 **The shape gate.** This deployer only understands one kind of unit: one whose
-``ExecStart`` ends in ``<image>:latest`` and which does not pull on start.
+``ExecStart`` runs ``<image>:latest`` and which does not pull on start.
 Seven units on gloval pull on start and one is pinned to a semver tag, and for
 those the sequence below would either be undone by the unit's own pull or would
 deploy a tag the unit does not use. Those are refused, not handled -- a
@@ -146,9 +146,14 @@ async def unit_shape_ok(systemd: UnitOps, service: Service) -> None:
     if not exec_start:
         raise StageError(f"{service.unit}: cannot read ExecStart, so its shape is unknown")
 
-    if not any(line.rstrip().endswith(latest) for line in exec_start):
+    # The image is a WORD in the command line, not necessarily the last one.
+    # `podman run ... IMAGE CMD ARGS` is the ordinary shape for anything that
+    # takes arguments of its own: mcp-pcloud's unit ends `--port 8028`, and an
+    # ends-with check refused it. Whole-word, so a longer token that merely
+    # contains the reference does not pass.
+    if not any(latest in line.split() for line in exec_start):
         raise StageError(
-            f"{service.unit}: ExecStart does not end in {latest!r}. "
+            f"{service.unit}: ExecStart does not run {latest!r}. "
             "A unit pinned to another tag is out of scope: moving :latest would not change what it runs."
         )
 

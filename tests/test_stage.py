@@ -85,8 +85,26 @@ async def test_a_well_shaped_unit_passes_the_gate() -> None:
 
 
 async def test_a_unit_pinned_to_a_version_is_refused() -> None:
-    with pytest.raises(StageError, match="does not end"):
+    with pytest.raises(StageError, match="does not run"):
         await unit_shape_ok(FakeSystemd(f"run -d {IMAGE}:6.8.0"), service())
+
+
+async def test_the_image_need_not_be_the_last_argument() -> None:
+    # `podman run ... IMAGE CMD ARGS` is the ordinary shape for anything that
+    # takes arguments of its own. mcp-pcloud's real unit ends `--port 8028`,
+    # and an ends-with check refused it -- which is how this was found, on the
+    # real units rather than here.
+    await unit_shape_ok(
+        FakeSystemd(f"run -d --name x {IMAGE}:latest --transport streamable-http --port 8028"),
+        service(),
+    )
+
+
+async def test_a_token_that_merely_contains_the_reference_does_not_pass() -> None:
+    # Whole words only: a longer argument that happens to end with the
+    # reference is not the image this unit runs.
+    with pytest.raises(StageError, match="does not run"):
+        await unit_shape_ok(FakeSystemd(f"run -d --name x localhost/mirror-{IMAGE}:latest"), service())
 
 
 async def test_a_unit_that_pulls_on_start_is_refused() -> None:
