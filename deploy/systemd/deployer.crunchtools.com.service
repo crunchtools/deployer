@@ -1,0 +1,67 @@
+# /srv copy: /srv/deployer.crunchtools.com/config/deployer.crunchtools.com.service
+#
+# A ONESHOT, not a server. Kagetora's queue check starts this unit when the RT
+# Deploy queue is not empty; it drains the queue and exits. Nothing listens and
+# nothing is published.
+#
+# PINNED TO A SEMVER TAG, and with no io.containers.autoupdate label. This is
+# the one service on the host that cannot be deployed by the deploy robot, so
+# it is the one that must not move on its own either. Upgrading it is a /srv
+# commit and a `systemctl daemon-reload`, by a person who read the changelog.
+#
+# TimeoutStartSec is long on purpose. A deploy is a pull (up to 600s), a
+# restart, a settle window, and possibly a rollback and a second settle. The
+# 90-second default for a oneshot would kill a run in the middle of a deploy,
+# which is the worst moment to be killed: :latest would be left on the
+# candidate with nothing having verified it.
+#
+# WHY --network host. The health probes are 127.0.0.1:<port> -- that is where
+# every service on this box publishes -- and RT and Nagios are reached on
+# loopback ports too. The podman socket this already mounts is root-equivalent,
+# so host networking adds no authority it does not already have.
+#
+# WHAT IT CANNOT DO. The image carries no podman binary, no systemctl and no
+# package manager; the program talks to the podman REST API over the socket and
+# to systemd over D-Bus, and its podman surface has no create, start, run or
+# exec. --read-only and --cap-drop=all are belt and braces on top of that.
+#
+# NO :Z ON THE STATE MOUNT. /var/lib/deployer is labelled container_file_t
+# statically (semanage fcontext + restorecon, recorded in the B1 commit) so
+# this container and the nagios-agent container can both reach it. Relabelling
+# it here would give it a private MCS category and the Nagios check -- which
+# reads the same directory to see the holds -- would stop being able to.
+#
+# The state directory is mounted at the SAME PATH it has on the host, so this
+# program, the auto-update hold guard and check_deployer.sh all name one place.
+
+[Unit]
+Description=Podman container - deployer.crunchtools.com (deploy robot, oneshot)
+Documentation=https://github.com/crunchtools/deployer
+Requires=podman.socket
+After=network-online.target podman.socket rt.fatherlinux.com.service
+
+[Service]
+Type=oneshot
+TimeoutStartSec=1800
+ExecStartPre=-/usr/bin/podman rm -f deployer.crunchtools.com
+ExecStart=/usr/bin/podman run --rm --name deployer.crunchtools.com \
+    --label PODMAN_SYSTEMD_UNIT=deployer.crunchtools.com.service \
+    --network host \
+    --read-only \
+    --cap-drop=all \
+    --security-opt no-new-privileges \
+    --memory=512m --memory-swap=512m \
+    --user 0 --security-opt label=type:container_runtime_t \
+    --env-file /srv/deployer.crunchtools.com/config/deployer.env \
+    -e HOME=/tmp \
+    -v /srv/deployer.crunchtools.com/config:/config:ro \
+    -v /var/lib/deployer:/var/lib/deployer \
+    -v /run/podman/podman.sock:/run/podman/podman.sock \
+    -v /run/dbus/system_bus_socket:/run/dbus/system_bus_socket \
+    --tmpfs /tmp \
+    quay.io/crunchtools/deployer:0.1.4 \
+    run
+ExecStopPost=-/usr/bin/podman rm -f deployer.crunchtools.com
+
+[Install]
+WantedBy=multi-user.target

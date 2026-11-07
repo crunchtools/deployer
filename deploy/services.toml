@@ -1,0 +1,83 @@
+# The deploy registry. One table per service.
+#
+# The key is the PODMAN CONTAINER NAME, which is what a ticket's `service:`
+# line must say. It is not the unit name minus `.service`: acquacotta's
+# container and unit match, mcp-pcloud's and mcp-nagios's do not. Read it from
+# `podman inspect --format '{{.Name}}'` rather than assuming.
+#
+# A seat's ticket names the service, the repo and the commit. Everything about
+# how that deploy is *proved* -- the probe, what it must answer, how long it
+# must hold -- lives here, so a seat cannot choose its own proof.
+#
+# An unknown key is a load error, not a value that is ignored. `also_restart`
+# and `preflight` are refused by name: neither is in 0.1.0.
+#
+# `ready` and `settle` are two different windows and the difference is not
+# cosmetic. `ready` is how long the service may take to answer its probe AT
+# ALL after the restart, retried, and it ends on the first passing answer --
+# so a generous one costs nothing when the service comes up fast. `settle` is
+# how long it must then keep answering, sampled, with the first failure fatal.
+# Running them as one window is what made every service here undeployable
+# until 0.1.3: a container unit is active the moment conmon reports the
+# process started, seconds before the process inside it binds its port, and
+# the settle window's first sample landed in that gap. `ready` defaults to 60.
+# Err generous: too large only delays a failure report, too small invents one.
+#
+# On `requestors`: every ticket a seat files arrives as `Creator: scott`,
+# because the seats have no RT accounts of their own -- mcp-rt authenticates as
+# scott for all of them. Who may ask for a deploy is therefore enforced at the
+# Trentina gateway, by profile, where the seats ARE distinguishable
+# (`create_ticket` into Deploy is allowed for developer and josui, denied for
+# kagetora, takeda, claude-web and gemini-web). This list is the second line of
+# that, and it becomes worth splitting the day the seats get RT users.
+
+[service."acquacotta.crunchtools.com"]
+repo = "crunchtools/acquacotta"
+image = "quay.io/crunchtools/acquacotta"
+unit = "acquacotta.crunchtools.com.service"
+nagios_host = "ctr-acquacotta.crunchtools.com"
+requestors = ["scott"]
+# NOT /health -- that route answers 500 on this service today. /api/plugins
+# exercises the app and the database behind it, which is what a probe is for.
+probe = { kind = "http", url = "http://127.0.0.1:8080/api/plugins", expect_status = 200 }
+# This container runs its own init, so it writes nothing to the container's
+# stdout and a failure comment carries no log tail -- the deployer says where to
+# look instead (`podman exec acquacotta.crunchtools.com journalctl -n 50`).
+# Measured, not assumed: podman's logs endpoint returns 0 bytes for it while
+# both MCP servers return their startup lines.
+settle = 60
+# Not measured, and deliberately well over any plausible answer: this one runs
+# systemd, then httpd, then the app, then reaches a database, and the probe
+# exercises all of it. The cost of being wrong in this direction is a slower
+# failure report; the cost of being wrong in the other is a healthy deploy
+# rolled back.
+ready = 180
+rollback = "auto"
+
+[service."mcp-pcloud"]
+repo = "crunchtools/mcp-pcloud"
+image = "quay.io/crunchtools/mcp-pcloud"
+# The container is `mcp-pcloud`; the unit carries the full hostname.
+unit = "mcp-pcloud.crunchtools.com.service"
+nagios_host = "ctr-mcp-pcloud.crunchtools.com"
+requestors = ["scott"]
+# No health route at all: a GET of /mcp answers 400. The `mcp` probe POSTs a
+# JSON-RPC initialize and reads the answer, which is the only check that proves
+# an MCP server is actually serving rather than merely listening.
+probe = { kind = "mcp", url = "http://127.0.0.1:8028/mcp" }
+settle = 30
+# Measured: uvicorn printed "Uvicorn running on http://0.0.0.0:8028" and began
+# answering within a few seconds of the restart. 60 is the default and is
+# already several times that, so it is left unstated rather than written down
+# as though it had been tuned.
+rollback = "auto"
+
+[service."mcp-nagios"]
+repo = "crunchtools/mcp-nagios"
+image = "quay.io/crunchtools/mcp-nagios"
+unit = "mcp-nagios.crunchtools.com.service"
+nagios_host = "ctr-mcp-nagios.crunchtools.com"
+requestors = ["scott"]
+probe = { kind = "mcp", url = "http://127.0.0.1:8026/mcp" }
+settle = 30
+rollback = "auto"

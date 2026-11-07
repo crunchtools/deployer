@@ -6,6 +6,19 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- `deploy/`: reference copies of the unit, the auto-update hold drop-in and
+  `services.toml`, plus a credential-free `deployer.env.example`. `/srv` stays
+  the authoritative home; these exist so the fleet's config-drift check has a
+  counterpart to compare against instead of reporting this service as
+  *unmapped*. They carry the obligation that goes with them — see
+  `deploy/README.md`.
+- A test for the auto-update hold guard, which had none. It reads the
+  `ExecCondition` out of the published drop-in and runs it, so a typo in the
+  file that gets deployed fails the suite rather than passing it: the guard is
+  the only thing standing between a rolled-back image and its return at the
+  next fleet-wide auto-update, and nothing in the package imports it.
+
 ## [0.1.4] - 2026-11-07
 
 ### Added
