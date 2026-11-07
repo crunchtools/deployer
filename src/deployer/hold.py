@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from .statefile import safe_component, write_whole
+
 __all__ = ["Hold", "HoldStore", "MissingGuardError", "require_guard"]
 
 
@@ -120,23 +122,11 @@ class HoldStore:
         self._root = Path(state_dir) / "hold"
 
     def _path(self, unit: str) -> Path:
-        # The unit name is the filename. It comes from the registry, not from a
-        # ticket, so it is not attacker-chosen -- but a separator in it would
-        # still write outside the directory, so one is refused outright.
-        if "/" in unit or unit in (".", ".."):
-            raise ValueError(f"not a usable unit name for a filename: {unit!r}")
-        return self._root / unit
+        return self._root / safe_component(unit, "unit name")
 
     def place(self, hold: Hold) -> Path:
         """Write a hold. Overwrites an existing one for the same unit."""
-        path = self._path(hold.unit)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # Written whole and then moved, so a reader never sees half a file and
-        # conclude there is no hold.
-        scratch = path.with_name(f".{path.name}.new")
-        scratch.write_text(hold.as_json(), encoding="utf-8")
-        scratch.replace(path)
-        return path
+        return write_whole(self._path(hold.unit), hold.as_json())
 
     def get(self, unit: str) -> Hold | None:
         """The hold on ``unit``, or ``None``."""
