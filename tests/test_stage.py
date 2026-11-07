@@ -56,6 +56,9 @@ class FakePodman:
 
     def __init__(self, running_image: str = OLD, pulled: str = NEW, labels: dict[str, str] | None = None):
         self.tags: list[tuple[str, str]] = []
+        #: What podman says the container was created from. The gate reads this
+        #: rather than guessing which word of `podman run` is the image.
+        self.reference = f"{IMAGE}:latest"
         self._running = running_image
         self._pulled = pulled
         # `labels or {...}` would treat an explicitly empty dict as "not given",
@@ -65,8 +68,8 @@ class FakePodman:
     async def inspect_container(self, name: str) -> dict[str, Any]:
         del name
         if not self._running:
-            return {}
-        return {"Image": self._running}
+            return {"ImageName": self.reference}
+        return {"Image": self._running, "ImageName": self.reference}
 
     async def inspect_image(self, name: str) -> ImageRef:
         rev = self._labels.get(name)
@@ -80,24 +83,74 @@ class FakePodman:
         self.tags.append((name, reference))
 
 
+def container(reference: str = f"{IMAGE}:latest") -> dict[str, Any]:
+    """What podman reports for a running container, as the gate reads it."""
+    return {"Image": OLD, "ImageName": reference}
+
+
 async def test_a_well_shaped_unit_passes_the_gate() -> None:
-    await unit_shape_ok(FakeSystemd(f"run -d --name x {IMAGE}:latest"), service())
+    await unit_shape_ok(FakeSystemd(f"run -d --name x {IMAGE}:latest"), service(), container())
 
 
-async def test_a_unit_pinned_to_a_version_is_refused() -> None:
-    with pytest.raises(StageError, match="does not end"):
-        await unit_shape_ok(FakeSystemd(f"run -d {IMAGE}:6.8.0"), service())
+async def test_the_image_need_not_be_the_last_argument() -> None:
+    # `podman run ... IMAGE CMD ARGS` is the ordinary shape for anything that
+    # takes arguments of its own. mcp-pcloud's real unit ends `--port 8028`,
+    # and an ends-with check refused it -- found on the real units, not here.
+    await unit_shape_ok(
+        FakeSystemd(f"run -d --name x {IMAGE}:latest --transport streamable-http --port 8028"),
+        service(),
+        container(),
+    )
+
+
+async def test_a_container_running_a_pinned_tag_is_refused() -> None:
+    # The question the gate exists to answer: would moving :latest change what
+    # this runs. podman answers it directly.
+    with pytest.raises(StageError, match="is running"):
+        await unit_shape_ok(FakeSystemd(f"run -d {IMAGE}:6.8.0"), service(), container(f"{IMAGE}:6.8.0"))
+
+
+async def test_a_unit_that_merely_mentions_latest_is_refused() -> None:
+    # The hole in looking for the reference anywhere in the command line: a
+    # unit that runs something else and passes ours as an option value.
+    with pytest.raises(StageError, match="is running"):
+        await unit_shape_ok(
+            FakeSystemd(f"run -d -e MIRROR={IMAGE}:latest localhost/other:1.0"),
+            service(),
+            container("localhost/other:1.0"),
+        )
+
+
+async def test_a_unit_changed_since_the_container_started_is_refused() -> None:
+    # The container answers for the present. A unit edited since does not, and
+    # the next restart would start something else.
+    with pytest.raises(StageError, match="does not name it"):
+        await unit_shape_ok(FakeSystemd(f"run -d {IMAGE}:6.8.0"), service(), container())
+
+
+async def test_a_unit_naming_the_same_image_twice_is_refused() -> None:
+    with pytest.raises(StageError, match="names both"):
+        await unit_shape_ok(
+            FakeSystemd(f"run -d --name x {IMAGE}:latest --fallback {IMAGE}:6.8.0"),
+            service(),
+            container(),
+        )
+
+
+async def test_a_container_with_no_image_name_is_refused() -> None:
+    with pytest.raises(StageError, match="an unnamed image"):
+        await unit_shape_ok(FakeSystemd(f"run -d {IMAGE}:latest"), service(), {"Image": OLD})
 
 
 async def test_a_unit_that_pulls_on_start_is_refused() -> None:
     systemd = FakeSystemd(f"run -d {IMAGE}:latest", [f"podman pull {IMAGE}:latest"])
     with pytest.raises(StageError, match="pulls on start"):
-        await unit_shape_ok(systemd, service())
+        await unit_shape_ok(systemd, service(), container())
 
 
 async def test_an_unreadable_exec_start_is_refused_not_assumed_fine() -> None:
     with pytest.raises(StageError, match="cannot read ExecStart"):
-        await unit_shape_ok(FakeSystemd(None), service())
+        await unit_shape_ok(FakeSystemd(None), service(), container())
 
 
 async def test_staging_leaves_latest_where_it_started() -> None:

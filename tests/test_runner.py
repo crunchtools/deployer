@@ -157,6 +157,7 @@ class FakePodman:
         self.log_text = "ValueError: no database\n"
         self.fail_tag_on: str | None = None
         self.fail_inspect = False
+        self.reference = f"{IMAGE}:latest"
         self.fail_untag = False
         self.fail_list_images = False
         #: A Config.Env shape this cannot read, to exercise failing closed.
@@ -166,9 +167,10 @@ class FakePodman:
     async def inspect_container(self, name: str) -> dict[str, Any]:
         if self.fail_inspect:
             raise PodmanError("no such container")
-        if self.broken_env:
-            return {"Image": self.running, "Config": {"Env": "PATH=/x"}}
-        return {"Image": self.running, "Config": {"Env": list(self.env)}}
+        config = {"Env": "PATH=/x" if self.broken_env else list(self.env)}
+        # ImageName is the reference the unit created the container from, which
+        # is what the unit-shape gate reads.
+        return {"Image": self.running, "ImageName": self.reference, "Config": config}
 
     async def inspect_image(self, name: str) -> ImageRef:
         key = self.by_ref.get(name, name)
@@ -249,8 +251,10 @@ class FakeSystemd:
 
     async def restart(self, unit: str) -> None:
         self.restarts.append(unit)
-        self.on_restart()
         self.podman.running = self.podman.latest_points_at()
+        # After the world has moved, so a hook can say what the restart really
+        # produced -- a different image, different logs, or an exception.
+        self.on_restart()
 
     async def hold_guard_installed(self) -> bool:
         return self.guard
@@ -1031,3 +1035,54 @@ async def test_cleanup_failures_reach_the_ticket_on_a_rollback_too(tmp_path: Pat
     assert report.outcome == OUTCOME_ROLLED_BACK
     assert world.rt.said("could not be cancelled")
     assert world.rt.said("could not be removed")
+
+
+async def test_a_pinned_service_is_refused_and_told_why(tmp_path: Path) -> None:
+    # Pinning a unit to a semver tag takes it OUT of this deployer's scope:
+    # moving :latest would not change what it runs. The message says so, and
+    # says what to do instead, because "pin it" was the plan's own words for
+    # onboarding and it is wrong.
+    world = World(tmp_path, ticket())
+    world.podman.reference = f"{IMAGE}:2.34.0"
+    report = await world.drain()
+    assert report.outcome == OUTCOME_REFUSED
+    assert world.rt.said("is running")
+    assert world.rt.said("would not change what it runs")
+    assert world.systemd.restarts == []
+
+
+async def test_a_unit_that_starts_the_wrong_image_does_not_blame_the_revision(
+    tmp_path: Path,
+) -> None:
+    # A unit edited behind this program's back starts something that is not the
+    # candidate. The deploy fails and rolls back, which is right -- but nothing
+    # was learned about the revision, and blacklisting it would mean a
+    # perfectly good commit could never be deployed to this service again.
+    world = World(tmp_path, ticket())
+
+    def start_something_else() -> None:
+        world.podman.running = "sha256:" + "c" * 64
+
+    world.systemd.on_restart = start_something_else
+    report = await world.drain()
+
+    assert report.outcome in {OUTCOME_ROLLED_BACK, OUTCOME_ROLLBACK_FAILED}
+    assert not world.attempts.was_rolled_back("acquacotta", WANTED)
+    # Still counted as a rollback of the service, and still held: something is
+    # wrong with this service even if the revision is innocent.
+    assert world.attempts.recent_rollbacks("acquacotta") == 1
+    assert world.holds.held(UNIT)
+    assert world.rt.said("not the candidate")
+
+
+async def test_an_empty_log_says_where_to_look_instead(tmp_path: Path) -> None:
+    # Measured on acquacotta: a container running its own init writes nothing
+    # to the container's stdout, so podman has nothing to hand over. "(nothing)"
+    # reads as "the service failed silently", which is the wrong conclusion.
+    world = World(tmp_path, ticket())
+    world.broken = {CANDIDATE_ID}
+    world.podman.log_text = ""
+    await world.drain()
+    published = "\n".join(text for _, text in world.rt.comments)
+    assert "runs its own init" in published
+    assert "journalctl" in published

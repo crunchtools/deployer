@@ -31,6 +31,7 @@ tag nothing else uses, and deploying is the single later act of moving
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Final, Protocol
@@ -134,22 +135,63 @@ def _exec_lines(value: Any) -> tuple[str, ...]:
     return tuple(lines)
 
 
-async def unit_shape_ok(systemd: UnitOps, service: Service) -> None:
+async def unit_shape_ok(systemd: UnitOps, service: Service, running: Mapping[str, Any]) -> None:
     """Refuse a unit this deployer does not understand.
 
-    Raises :class:`StageError` naming the reason. Neither refusal counts as a
-    deploy attempt: the unit is simply out of scope for 0.1.0.
+    Three questions, and the first is the one that matters. Raises
+    :class:`StageError` naming the reason; none of these counts as a deploy
+    attempt, because the unit is simply out of scope for 0.1.0.
+
+    **What is the container running now?** ``ImageName`` is the reference the
+    unit created it from, so this is evidence rather than a guess. It has to be
+    evidence: ``podman run [options] IMAGE [command]`` cannot be parsed into
+    "which word is the image" without knowing which of podman's options take
+    values, and an earlier version of this gate that looked for the reference
+    anywhere in the command line would have accepted a unit that ran something
+    else and merely mentioned ``:latest`` in an environment variable.
+
+    **Would the NEXT restart start the same thing?** The container answers for
+    the present; a unit edited since it started does not. So ``ExecStart`` must
+    also name ``<image>:latest``, and must not name the same image at another
+    tag -- which of the two a restart would pick is not something to guess at.
+
+    That second check is deliberately **not** a guarantee, and it cannot be
+    one: a unit edited to run a different image entirely, with ours left behind
+    as an option value, passes it. Verification is the layer that catches
+    that -- it compares the running container's image id against the candidate
+    and rolls back on a mismatch, and sets ``ran_something_else`` so the
+    revision is not blamed for it.
+
+    **Does the unit pull on start?** Its own pull would undo the staging this
+    program does.
     """
     latest = f"{service.image}:latest"
+
+    reference = str(running.get("ImageName") or "")
+    if reference != latest:
+        raise StageError(
+            f"{service.unit}: {service.container} is running {reference or 'an unnamed image'}, "
+            f"not {latest}. Moving {latest} would not change what it runs, so this service is "
+            "out of scope: a pinned service is deployed by changing its unit, which this program "
+            "cannot do."
+        )
 
     exec_start = _exec_lines(await systemd.property(service.unit, "ExecStart", SERVICE_IFACE))
     if not exec_start:
         raise StageError(f"{service.unit}: cannot read ExecStart, so its shape is unknown")
 
-    if not any(line.rstrip().endswith(latest) for line in exec_start):
+    words = [word for line in exec_start for word in line.split()]
+    if latest not in words:
         raise StageError(
-            f"{service.unit}: ExecStart does not end in {latest!r}. "
-            "A unit pinned to another tag is out of scope: moving :latest would not change what it runs."
+            f"{service.unit}: the container runs {latest} but ExecStart does not name it. "
+            "The unit has been changed since the container started, and a restart would not "
+            "start what is running now."
+        )
+    elsewhere = [word for word in words if word.startswith(f"{service.image}:") and word != latest]
+    if elsewhere:
+        raise StageError(
+            f"{service.unit}: ExecStart names both {latest} and {elsewhere[0]}. Which of the two "
+            "a restart would start is not something this program should guess at."
         )
 
     pre = _exec_lines(await systemd.property(service.unit, "ExecStartPre", SERVICE_IFACE))
@@ -205,8 +247,6 @@ async def stage(podman: ImageOps, systemd: UnitOps, service: Service, wanted: st
     the caller is free to refuse the ticket afterwards without having changed
     what any unit would start.
     """
-    await unit_shape_ok(systemd, service)
-
     latest = f"{service.image}:latest"
     basename = service.image.rsplit("/", maxsplit=1)[-1]
 
@@ -214,6 +254,9 @@ async def stage(podman: ImageOps, systemd: UnitOps, service: Service, wanted: st
         running = await podman.inspect_container(service.container)
     except PodmanError as exc:
         raise StageError(f"{service.name}: cannot inspect the running container: {exc}") from None
+
+    # Gated on what that inspect found, so the container is read once.
+    await unit_shape_ok(systemd, service, running)
 
     outgoing_id = str(running.get("Image") or "")
     if not outgoing_id:
