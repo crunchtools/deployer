@@ -24,10 +24,13 @@ deciding whether to speak never means parsing RT's history.
 from __future__ import annotations
 
 import re
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Final, Self
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
@@ -39,6 +42,13 @@ DEFAULT_TIMEOUT_SECONDS: Final = 30.0
 #: RT answers REST 1.0 with a status line before the payload.
 _STATUS_RE: Final = re.compile(r"\ART/\S+\s+(\d{3})\s*(.*)")
 _OPEN_STATES: Final = ("new", "open", "stalled")
+#: RT 6 renders dates as ``Fri Nov 06 04:00:46 YYYY``, with no zone in the
+#: string at all. The zone is RT's ``$Timezone`` setting, which is why it has
+#: to be configured here rather than guessed: this RT is on
+#: ``America/New_York`` (RT_Config.pm) while a container's own clock is UTC, so
+#: reading the string as local time would be five hours out -- enough to call a
+#: fresh ticket stale, or to wait forever on an old one.
+_CREATED_FORMAT: Final = "%a %b %d %H:%M:%S %Y"
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,8 +63,23 @@ class RtCredentials:
     base_url: str
     username: str
     password: str
+    timezone: str
     http_user: str = ""
     http_password: str = ""
+
+    def zone(self) -> ZoneInfo:
+        """``timezone`` as a zone, refusing a name the system does not know.
+
+        Checked here, at load, rather than at the first date: a typo in an env
+        file should stop the run with the name in the message, not surface
+        twenty minutes later as an unreadable ticket.
+        """
+        try:
+            return ZoneInfo(self.timezone)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise RtError(
+                f"RT_TIMEZONE {self.timezone!r} is not a timezone this system knows: {exc}"
+            ) from None
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> RtCredentials:
@@ -65,16 +90,19 @@ class RtCredentials:
         half-configured unit is a "could not run" and not a run that silently
         talks to the wrong RT or to none.
         """
-        missing = [name for name in ("RT_URL", "RT_USER", "RT_PASSWORD") if not env.get(name)]
+        missing = [name for name in ("RT_URL", "RT_USER", "RT_PASSWORD", "RT_TIMEZONE") if not env.get(name)]
         if missing:
             raise RtError(f"RT is not configured: {', '.join(missing)} not set")
-        return cls(
+        credentials = cls(
             base_url=env["RT_URL"],
             username=env["RT_USER"],
             password=env["RT_PASSWORD"],
+            timezone=env["RT_TIMEZONE"],
             http_user=env.get("RT_HTTP_USER", ""),
             http_password=env.get("RT_HTTP_PASSWORD", ""),
         )
+        credentials.zone()
+        return credentials
 
 
 class RtError(Exception):
@@ -92,6 +120,9 @@ class Ticket:
     creator: str
     owner: str
     body: str = ""
+    #: When RT says the ticket was filed, as an epoch. The build deadline is
+    #: measured from here, so a wrong zone is a wrong deadline.
+    created: float = 0.0
 
     @property
     def is_open(self) -> bool:
@@ -174,6 +205,7 @@ class RtClient:
 
     def __init__(self, credentials: RtCredentials, client: httpx.AsyncClient | None = None) -> None:
         self._base = credentials.base_url.rstrip("/")
+        self._zone = credentials.zone()
         self._credentials = {"user": credentials.username, "pass": credentials.password}
         if client is not None:
             self._client = client
@@ -240,6 +272,7 @@ class RtClient:
             creator=fields.get("Creator", ""),
             owner=fields.get("Owner", ""),
             body=fields.get("Text", ""),
+            created=_parse_created(fields.get("Created", ""), self._zone, ticket_id),
         )
 
     async def comment(self, ticket_id: int, text: str) -> None:
@@ -251,6 +284,21 @@ class RtClient:
         """Set ticket fields, e.g. ``status="resolved"`` or ``owner="developer1"``."""
         lines = "\n".join(f"{name.capitalize()}: {value}" for name, value in fields.items())
         await self._post(f"ticket/{ticket_id}/edit", {"content": f"{lines}\n"})
+
+
+def _parse_created(value: str, zone: ZoneInfo, ticket_id: int) -> float:
+    """RT's ``Created`` string into an epoch, in RT's own timezone.
+
+    Raises rather than falling back to "now". A ticket whose age cannot be read
+    cannot be told from a ticket whose build is late, and treating an
+    unreadable date as this instant would hand every such ticket a fresh
+    build deadline for ever.
+    """
+    try:
+        naive = time.strptime(value.strip(), _CREATED_FORMAT)
+    except ValueError:
+        raise RtError(f"ticket {ticket_id}: cannot read Created {value!r} as {_CREATED_FORMAT!r}") from None
+    return datetime(*naive[:6], tzinfo=zone).timestamp()
 
 
 def _indent(text: str) -> str:

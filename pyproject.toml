@@ -17,9 +17,12 @@ classifiers = [
 # httpx talks to the podman REST API over its unix socket; dbus-fast talks to
 # systemd. Neither the podman nor the systemctl binary is in the image, which
 # is what keeps this process to the verbs it declares.
+# tzdata is here because the base image carries no /usr/share/zoneinfo and RT
+# renders its dates in a named zone; without it ZoneInfo raises at startup.
 dependencies = [
     "httpx>=0.28",
     "dbus-fast>=2.21",
+    "tzdata>=2024.2",
 ]
 
 [project.scripts]
