@@ -15,8 +15,10 @@ All notable changes to this project are documented here. The format follows
 - Ticket parsing: a strict `key: value` grammar over `service`, `repo`, `commit`
   and an optional `pr`. Prose, a repeated key and an abbreviated sha are all
   refused. One ticket carries one revision; a fix is a new ticket.
-- Podman client over the socket with exactly seven operations — pull, inspect
-  image, inspect container, tag, untag, remove image, list images. Two tests
+- Podman client over the socket with exactly eight operations — pull, inspect
+  image, inspect container, tag, untag, remove image, list images, read a
+  container's logs. Reading logs is a GET: it adds nothing to what this program
+  can *do* to a container, which is why it sits inside the boundary. Two tests
   hold the line: one compares the class against the declared surface, the other
   refuses any method name that hints at a container lifecycle.
 - Unit-shape gate: a unit whose `ExecStart` does not end in `<image>:latest`, or
@@ -49,18 +51,53 @@ All notable changes to this project are documented here. The format follows
   refusing any unit the registry does not name. No `daemon-reload` and no
   unit-file writes, so the static hold guard cannot be rewritten by this
   program. `podman-auto-update.service` is readable and not restartable.
-- Repository scaffold: the `deployer` package, its CLI verbs (`run`,
-  `rollback`, `unhold`, `holds`, and `--dry-run`), the container image, and the
-  org's standard gates. The verbs parse and are not yet wired; an unimplemented
-  verb exits 2 ("could not run") rather than 0, so the unit that starts it
-  cannot read a scaffold as a successful deploy.
+- The `run` state machine, which is the order the rest of the package is used
+  in. The guard is checked before a single ticket is read; everything that can
+  refuse refuses before the host is touched and none of it counts as an
+  attempt; staging is reversible and happens before the decision to deploy; RT
+  and Nagios are told *before* the restart, so an unreachable one leaves the
+  host untouched and the ticket queued rather than deploying something nobody
+  is told about; and after the restart their failures are reported but never
+  undo a good deploy.
+- A hold is not a gate on deploying. A held service is one whose last deploy
+  failed, and the next ticket — carrying the fix — is exactly what should get
+  through; verifying it is how the hold clears. What a hold stops is `podman
+  auto-update`, which would otherwise put the broken `:latest` back overnight.
+  The gate against repeating a mistake is the attempt log: the same revision is
+  never deployed to the same service twice.
+- An exclusive `flock` on the state directory, so two runs cannot overlap and
+  each restore `:latest` from under the other. A second run *stands down* and
+  exits 0: the unit that starts it is a oneshot whose failure wakes a model, and
+  "the previous run is still going" is the most ordinary thing that can happen.
+- Failure reports on the ticket carry the service's own last output, not just
+  the probe's verdict. "The health probe returned 503" does not tell a developer
+  what broke; a traceback does.
+- `deployer unhold` clears the rollback count as well as the hold. They are one
+  decision: the three-rollbacks-in-a-day refusal comes from the gate rather
+  than from the hold, so clearing only the hold would leave the service refused
+  for the rest of the day with nothing on the ticket to say why.
+- CLI verbs wired: `run`, `rollback <service>`, `unhold <service>`, `holds` and
+  `--dry-run`. `holds` and `unhold` read nothing but the state directory, so
+  they work on a host where podman, systemd or RT is the thing that is broken.
+  `rollback` honours a `rollback = "manual"` registry row by refusing and
+  printing the two commands to run by hand. Exit codes: 0 for a verb that did
+  what it was asked — including a deploy that failed and was rolled back
+  cleanly — 1 only for a service that needs a person, and 2 for "could not run".
+- Repository scaffold: the `deployer` package, the container image, and the
+  org's standard gates.
 - The capability boundary this program rests on, asserted by a test: the package
   exposes no container create, start, run or exec. A process that cannot start a
   container cannot mount a live volume and therefore cannot relabel one.
-- Container image on `quay.io/hummingbird/python:3.14-fips` carrying neither a
-  podman binary nor systemctl — the podman REST API over its unix socket and
-  systemd over D-Bus are the only routes out. `journalctl` is staged from the
-  builder because the journal has no D-Bus route.
+- Container image on `quay.io/hummingbird/python:3.14-fips` carrying no package
+  manager, no podman binary, no systemctl and no journalctl — the podman REST
+  API over its unix socket and systemd over D-Bus are the only routes out.
+- RT's `Created` is read in a configured timezone (`RT_TIMEZONE`, required).
+  RT renders dates with no zone in the string and this RT is on
+  `America/New_York` while a container's own clock is UTC; reading the string as
+  local time would be five hours out, which is enough to call a fresh ticket
+  stale or to wait for ever on an old one. An unknown zone name is refused at
+  startup, and an unreadable date is an error rather than being treated as
+  "now" — that would hand the ticket a fresh build deadline on every run.
 
 ## [0.0.0] - 2026-11-07
 
