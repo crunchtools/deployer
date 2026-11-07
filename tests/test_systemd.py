@@ -88,3 +88,11 @@ async def test_the_allowed_set_is_passed_in_not_discovered() -> None:
     narrow = SystemdUnits(allowed_units={"a.service"})
     with pytest.raises(SystemdError, match="registry names"):
         await narrow.restart("b.service")
+
+
+async def test_hold_guard_and_property_are_in_the_declared_surface() -> None:
+    # hold_guard_installed is the one caller that must distinguish "empty" from
+    # "could not read", which is why `property` raises rather than returning
+    # None on a failed read.
+    assert "hold_guard_installed" in ALLOWED_OPERATIONS
+    assert "property" in ALLOWED_OPERATIONS

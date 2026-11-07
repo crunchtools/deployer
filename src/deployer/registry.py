@@ -93,6 +93,16 @@ class Service:
     rollback: RollbackMode = "auto"
 
     @property
+    def container(self) -> str:
+        """The podman container's name.
+
+        On this fleet a unit ``x.service`` runs a container named ``x``, which
+        is the registry key. Named here rather than derived at each call site so
+        the assumption is in one place if a service ever breaks it.
+        """
+        return self.name
+
+    @property
     def rolls_back_automatically(self) -> bool:
         return self.rollback == "auto"
 

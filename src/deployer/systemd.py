@@ -45,7 +45,9 @@ PROPS_IFACE: Final = "org.freedesktop.DBus.Properties"
 AUTO_UPDATE_UNIT: Final = "podman-auto-update.service"
 
 #: The whole surface. Checked by ``tests/test_systemd.py``.
-ALLOWED_OPERATIONS: Final = frozenset({"restart", "start", "state", "property", "close", "connect"})
+ALLOWED_OPERATIONS: Final = frozenset(
+    {"restart", "start", "state", "property", "hold_guard_installed", "close", "connect"}
+)
 
 
 class SystemdError(Exception):
@@ -161,12 +163,29 @@ class SystemdUnits:
             result=str(await self._property(path, UNIT_IFACE, "Result") or ""),
         )
 
+    async def hold_guard_installed(self) -> bool:
+        """Whether ``ExecCondition`` on the auto-update unit is non-empty.
+
+        A read failure raises rather than answering False, so "the guard is
+        missing" and "systemd could not be asked" stay distinguishable. Both
+        stop a deploy; only one of them means someone should go and install a
+        file.
+        """
+        condition = await self.property(AUTO_UPDATE_UNIT, "ExecCondition", SERVICE_IFACE)
+        return bool(condition)
+
     async def property(self, unit: str, name: str, interface: str = SERVICE_IFACE) -> Any:
         """Read one property of a unit. Read-only, any unit.
 
-        This is how ``ExecCondition`` on the auto-update unit is checked: an
-        empty value means the hold guard is not installed, and the deployer
-        refuses to run rather than taking a hold it has no way to enforce.
+        Raises :class:`SystemdError` if the read itself fails. It does **not**
+        return ``None`` for a failed read, because the caller that matters most
+        cannot tell those apart: the hold guard check treats an empty
+        ``ExecCondition`` as "the guard is not installed", and a D-Bus error
+        that arrived as ``None`` would be reported as a missing guard. Wrong
+        reason, and one that sends a person looking at the wrong file.
+
+        A genuinely absent property comes back as its empty value, which is
+        what systemd itself returns.
         """
         return await self._property(await self._unit_path(unit), interface, name)
 
@@ -188,7 +207,8 @@ class SystemdUnits:
             )
         )
         if reply is None or reply.message_type == MessageType.ERROR:
-            return None
+            detail = reply.body if reply is not None else "no reply"
+            raise SystemdError(f"reading {interface}.{name} on {path} failed: {detail}")
         # A dbus Variant carries its value on `.value`; a plain value does not.
         answer = reply.body[0]
         return getattr(answer, "value", answer)
