@@ -50,6 +50,7 @@ from .registry import Registry, RegistryError, Service
 from .rollback import Restored, RollbackError, roll_back, rotate_rollback_tags
 from .rt import RtError, Ticket, TicketSaid
 from .stage import StageError, Staged, Verdict, classify_revision, stage, unit_shape_ok
+from .statefile import safe_component, write_whole
 from .systemd import SystemdError, UnitState
 from .ticket import Request, TicketError, creator_may_request, parse_ticket
 from .verify import Host, Outcome, verify
@@ -68,6 +69,7 @@ __all__ = [
     "UnreadableEnvironment",
     "container_environment",
     "redact",
+    "unsubstitutable",
 ]
 
 DEFAULT_QUEUE: Final = "Deploy"
@@ -77,28 +79,38 @@ DOWNTIME_MARGIN_SECONDS: Final = 300
 #: How much of a refusal goes in the "already said this" record. Long enough
 #: that two different refusals are different, short enough to stay one line.
 SAID_DETAIL_LIMIT: Final = 120
-#: A value at least this long is taken out of anything published whatever it is
-#: called, because a long opaque string is far more likely to be a credential
-#: than a thing worth reading. Shorter values are only removed when their NAME
-#: says they are secret -- replacing every "80" in a traceback because some
-#: variable happens to be set to 80 would make the traceback useless.
-MIN_SECRET_LENGTH: Final = 8
-#: Names that mean "this is a credential, however short it is". A seven
-#: character password is still a password, and length is not what makes a
-#: secret safe to publish.
-SECRET_NAME_PARTS: Final = (
-    "PASSWORD",
-    "PASSWD",
-    "PASS",
-    "SECRET",
-    "TOKEN",
-    "KEY",
-    "CREDENTIAL",
-    "AUTH",
-    "SIGNATURE",
-    "COOKIE",
-    "SESSION",
+#: Environment names whose values are never credentials. Everything NOT on this
+#: list is treated as a secret, whatever it is called and however long it is.
+#:
+#: Default deny: a blocklist of secret-looking names fails by publishing a
+#: credential (``DB=hunter2`` sails through one), an allowlist fails by
+#: redacting something harmless. Adding a name here is a code change.
+PUBLISHABLE_NAMES: Final = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "HOSTNAME",
+        "PWD",
+        "SHLVL",
+        "TERM",
+        "LANG",
+        "LC_ALL",
+        "TZ",
+        "container",
+        "VIRTUAL_ENV",
+        "PYTHONPATH",
+        "PYTHONUNBUFFERED",
+        "PYTHONDONTWRITEBYTECODE",
+        "PYTHON_VERSION",
+    }
 )
+#: A value shorter than this cannot be taken out of text without wrecking it:
+#: replacing every "1" in a traceback leaves nothing to read. A secret this
+#: short therefore stops the output being published at all, rather than being
+#: published because it was awkward.
+MIN_SUBSTITUTABLE_LENGTH: Final = 4
+#: Where the unredacted tail is kept, under the state directory.
+FAILURE_LOG_DIR: Final = "failures"
 
 
 class UnreadableEnvironment(Exception):
@@ -177,32 +189,81 @@ class ImageHost(Protocol):
     no create, start, run or exec to ask for.
     """
 
-    async def inspect_container(self, name: str) -> dict[str, Any]: ...
-    async def inspect_image(self, name: str) -> ImageRef: ...
-    async def pull(self, reference: str) -> str: ...
-    async def tag(self, name: str, reference: str) -> None: ...
-    async def untag(self, name: str, reference: str) -> None: ...
-    async def remove_image(self, name: str, force: bool = ...) -> None: ...
-    async def list_images(self, reference: str | None = ...) -> tuple[ImageRef, ...]: ...
-    async def logs(self, name: str, tail: int = ...) -> str: ...
+    async def inspect_container(self, name: str) -> dict[str, Any]:
+        """A running container by name. ``Image`` is the id it is running and
+        ``Config.Env`` its environment. Raises if there is no such container."""
+        ...
+
+    async def inspect_image(self, name: str) -> ImageRef:
+        """An image by id, name or tag. Raises if it is not present locally."""
+        ...
+
+    async def pull(self, reference: str) -> str:
+        """Pull and return the image id it resolved to. Raises if the pull
+        reported an error, or ended without naming an id."""
+        ...
+
+    async def tag(self, name: str, reference: str) -> None:
+        """Point ``reference`` at the image ``name``, moving it if it exists."""
+        ...
+
+    async def untag(self, name: str, reference: str) -> None:
+        """Remove one reference from an image, leaving the image itself."""
+        ...
+
+    async def remove_image(self, name: str, force: bool = ...) -> None:
+        """Remove by reference. The reference goes, and the image with it when
+        that was the last one; an image tagged elsewhere is left alone."""
+        ...
+
+    async def list_images(self, reference: str | None = ...) -> tuple[ImageRef, ...]:
+        """Images, newest first, optionally filtered by a reference pattern."""
+        ...
+
+    async def logs(self, name: str, tail: int = ...) -> str:
+        """The last ``tail`` lines a container wrote, de-multiplexed. Never
+        raises: a note is returned in place of the output."""
+        ...
 
 
 class UnitHost(Protocol):
     """The systemd surface, as the runner uses it."""
 
-    async def restart(self, unit: str) -> None: ...
-    async def state(self, unit: str) -> UnitState: ...
-    async def property(self, unit: str, name: str, interface: str = ...) -> Any: ...
-    async def hold_guard_installed(self) -> bool: ...
+    async def restart(self, unit: str) -> None:
+        """Restart a unit and wait for the job. Raises if the unit is not one
+        the client was told it may touch, or if systemd refuses the job."""
+        ...
+
+    async def state(self, unit: str) -> UnitState:
+        """Active state, sub-state and last result. Raises if a property read
+        fails -- an absent value and a failed read must not look the same."""
+        ...
+
+    async def property(self, unit: str, name: str, interface: str = ...) -> Any:
+        """One D-Bus property, by interface. ``Result`` lives on the Service
+        interface and ``ActiveState`` on the Unit one; reading either off the
+        wrong interface raises rather than returning nothing."""
+        ...
+
+    async def hold_guard_installed(self) -> bool:
+        """Whether ``podman-auto-update.service`` has a non-empty
+        ``ExecCondition``. Raises if systemd could not be asked, so "the guard
+        is missing" and "systemd is unreachable" stay distinguishable."""
+        ...
 
 
 class Downtime(Protocol):
     """Opening and closing a maintenance window."""
 
-    async def open_downtime(
-        self, host: str, minutes: int, comment: str, service: str | None = ...
-    ) -> None: ...
-    async def cancel_downtime(self, host: str, service: str | None = ...) -> None: ...
+    async def open_downtime(self, host: str, minutes: int, comment: str, service: str | None = ...) -> None:
+        """A fixed window starting now. Without ``service`` the host and every
+        service on it go into downtime, which is what a container restart
+        needs. Raises if Nagios did not confirm the command."""
+        ...
+
+    async def cancel_downtime(self, host: str, service: str | None = ...) -> None:
+        """Close the window. Raises if Nagios did not confirm the command."""
+        ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -509,6 +570,12 @@ class Runner:
         self.attempts.mark_rolled_back(service.name, request.commit)
         self.attempts.record_rollback(service.name)
 
+        # BEFORE the rollback, not after. podman's logs endpoint is addressed by
+        # container NAME, and once the rollback has restarted the unit that name
+        # is the restored container running the old image. Read afterwards, the
+        # ticket would carry the output of the thing that works.
+        logs = await self._log_tail(service)
+
         try:
             restored = await roll_back(self.clients.podman, self.clients.systemd, self.host, service, staged)
         except (RollbackError, SystemdError) as exc:
@@ -549,7 +616,7 @@ class Runner:
                     staged=staged,
                     outcome=outcome,
                     restored=restored,
-                    logs=await self._log_tail(service),
+                    logs=logs,
                 )
             )
             + _as_notes((window, untagged)),
@@ -563,28 +630,23 @@ class Runner:
     # ------------------------------------------------------------- small acts
 
     async def _log_tail(self, service: Service) -> str:
-        """The container's last lines, with its own secrets taken out.
+        """The container's last lines, safe to put on a ticket.
 
         A failing service usually prints the thing that failed, and the thing
-        that failed is often a credential -- a connection string, a token, a
-        key read from the environment. This text goes on an RT ticket, so
-        whatever the service printed is published to everyone who can read the
-        queue.
+        that failed is often a credential -- a connection string, a token, a key
+        read from the environment. This text goes on an RT ticket, so whatever
+        the service printed is published to everyone who can read the queue.
 
-        What can be removed precisely is removed precisely. This program can
-        read the container's own environment, so every value in it long enough
-        to be a secret is replaced by the name it was set under. That covers
-        the case this guards against: a credential the service was handed and
-        then echoed back.
+        So: the whole tail is written to the state directory where only root can
+        read it, and what goes on the ticket is the same tail with every value
+        from the container's environment taken out, bar an allowlist of names
+        that are never credentials. A value too short to substitute out of text
+        safely stops the output being published at all rather than being
+        published because redacting it would be ugly.
 
-        It does not cover a secret the service did not get from its
-        environment -- one fetched at startup, or baked into its image. The
-        tail is short partly for that reason. A service that prints secrets of
-        its own making is a bug in that service, and this cannot know about it.
-
-        Fails closed. If the environment cannot be read then the output cannot
-        be checked, and publishing it anyway would turn a failed read into a
-        leak.
+        Fails closed on the read. If the environment cannot be read then the
+        output cannot be checked, and publishing it anyway would turn a failed
+        read into a leak.
         """
         try:
             inspected = await self.clients.podman.inspect_container(service.container)
@@ -594,7 +656,35 @@ class Runner:
                 "[no logs: the container's environment could not be read, so its output could "
                 f"not be checked for secrets first: {exc}]"
             )
-        return redact(await self.clients.podman.logs(service.container), secrets)
+
+        raw = await self.clients.podman.logs(service.container)
+        kept = self._keep_failure_log(service, raw)
+        too_short = unsubstitutable(secrets)
+        if too_short:
+            return (
+                f"[not published: {', '.join(too_short)} hold values too short to remove from the "
+                "output without wrecking it, so none of it can go on a ticket.]" + kept
+            )
+        return redact(raw, secrets) + kept
+
+    def _keep_failure_log(self, service: Service, raw: str) -> str:
+        """Keep the unredacted tail on the host, and say where it is.
+
+        One file per service, overwritten, so this cannot grow without bound.
+        The directory is 0700 and the file 0600: the secrets in it are already
+        in the container's environment and in the unit's env file, so this adds
+        no exposure to anyone who can read the host -- and the point is that
+        nobody else can.
+        """
+        path = self.state_dir / FAILURE_LOG_DIR / f"{safe_component(service.name, 'service')}.log"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.parent.chmod(0o700)
+            written = write_whole(path, raw)
+            written.chmod(0o600)
+        except OSError as exc:
+            return f"\n\n(the unredacted output could not be kept on the host: {exc})"
+        return f"\n\n(the full, unredacted tail is on the host at {written}, root-only)"
 
     async def _close_window(self, service: Service) -> str:
         """Cancel the maintenance window. Returns a note if it could not be.
@@ -681,11 +771,12 @@ class Runner:
 
 
 def container_environment(inspected: Mapping[str, Any]) -> dict[str, str]:
-    """The container's secrets, as ``name -> value``.
+    """The container's secrets: everything in its environment bar the allowlist.
 
-    podman gives the environment as ``["NAME=value", ...]``. Two rules decide
-    what comes back: a value long enough to be an opaque credential, whatever
-    it is called, and a value of any length whose NAME says it is one.
+    podman gives the environment as ``["NAME=value", ...]``. Everything with a
+    value comes back except the names in :data:`PUBLISHABLE_NAMES`, because
+    deciding what is a credential by looking at its name or its length is a
+    guess, and the consequence of guessing wrong is a key on a ticket.
 
     **Raises** :class:`UnreadableEnvironment` on a shape it cannot read, and
     this is the important part. Returning an empty mapping for a malformed
@@ -703,16 +794,20 @@ def container_environment(inspected: Mapping[str, Any]) -> dict[str, str]:
     found: dict[str, str] = {}
     for entry in raw:
         name, sep, value = str(entry).partition("=")
-        if not sep or not value:
-            continue
-        if len(value) >= MIN_SECRET_LENGTH or _named_like_a_secret(name):
+        if sep and value and name not in PUBLISHABLE_NAMES:
             found[name] = value
     return found
 
 
-def _named_like_a_secret(name: str) -> bool:
-    upper = name.upper()
-    return any(part in upper for part in SECRET_NAME_PARTS)
+def unsubstitutable(secrets: Mapping[str, str]) -> tuple[str, ...]:
+    """Names whose values are too short to remove from text safely.
+
+    When any exist, the output is not published at all. The alternative --
+    publishing because redacting would be ugly -- is the decision this program
+    should never make, and the message names the variables so somebody can
+    either lengthen them or decide they are not secrets.
+    """
+    return tuple(sorted(n for n, v in secrets.items() if len(v) < MIN_SUBSTITUTABLE_LENGTH))
 
 
 def redact(text: str, secrets: Mapping[str, str]) -> str:

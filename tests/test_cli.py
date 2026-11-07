@@ -373,3 +373,117 @@ async def test_a_dry_run_rollback_changes_nothing(tmp_path: Path, capsys: pytest
     assert (systemd.restarts, podman.tagged) == ([], [])
     assert "would put" in capsys.readouterr().out
     assert not HoldStore(tmp_path / "state").held("acquacotta.crunchtools.com.service")
+
+
+def manual_registry_file(tmp_path: Path) -> Path:
+    path = tmp_path / "manual.toml"
+    path.write_text(
+        """
+[service.acquacotta]
+repo = "crunchtools/acquacotta"
+image = "quay.io/crunchtools/acquacotta"
+unit = "acquacotta.crunchtools.com.service"
+nagios_host = "ctr-acquacotta.crunchtools.com"
+requestors = ["scott"]
+probe = { kind = "http", url = "http://127.0.0.1:8080/health" }
+settle = 1
+# The thing under test: a service whose schema changes are not safely
+# reversible by a robot.
+rollback = "manual"
+""",
+        encoding="utf-8",
+    )
+    return path
+
+
+async def test_a_manual_rollback_service_is_refused_before_the_host_is_touched(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The registry is the thing that knows a service carries migrations.
+    # Writing that down is pointless if it is then ignored.
+    state = tmp_path / "state"
+    state.mkdir()
+    podman = RollbackPodman()
+    systemd = RollbackSystemd(podman)
+    code = await _rollback(
+        load_registry(manual_registry_file(tmp_path)),
+        "acquacotta",
+        state,
+        dry_run=False,
+        hands=hands(podman, systemd),
+    )
+    assert code == EXIT_COULD_NOT_RUN
+    assert (systemd.restarts, podman.tagged) == ([], [])
+    err = capsys.readouterr().err
+    assert "rollback = manual" in err
+    # And it says what to do instead, with the two commands.
+    assert "podman tag" in err
+    assert "systemctl restart acquacotta.crunchtools.com.service" in err
+
+
+def test_unhold_stands_down_while_a_deploy_holds_the_lock(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # unhold writes the same two records a failing deploy writes. Run while a
+    # deploy is finishing it can drop a hold that deploy just placed, and the
+    # broken image then comes back at the next auto-update with nothing saying
+    # why.
+    state = tmp_path / "state"
+    state.mkdir()
+    holds = HoldStore(state)
+    holds.place(
+        Hold(
+            unit="acquacotta.crunchtools.com.service",
+            service="acquacotta",
+            ticket=1601,
+            revision="f" * 40,
+        )
+    )
+    with only_one(state):
+        code = main(["--config", str(registry_file(tmp_path)), "--state", str(state), "unhold", "acquacotta"])
+    assert code == EXIT_COULD_NOT_RUN
+    assert "writing the same holds" in capsys.readouterr().err
+    # Untouched, which is the point.
+    assert holds.held("acquacotta.crunchtools.com.service")
+
+
+# --- `run`: the parts of the CLI path that are not the runner ---
+#
+# The state machine itself is tested in test_runner.py against a fake host.
+# What is left here is what `_run` owns: the lock, the status file, and the map
+# from a run's outcome to an exit code.
+
+
+def test_run_stands_down_quietly_when_another_run_holds_the_lock(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Exit 0, because the unit that starts this is a oneshot whose failure
+    # wakes a model, and "the previous run is still going" is the most
+    # ordinary thing that can happen. And no status file: the run that holds
+    # the lock owns it.
+    state = tmp_path / "state"
+    state.mkdir()
+    with only_one(state):
+        code = main(["--config", str(registry_file(tmp_path)), "--state", str(state), "run"])
+    assert code == EXIT_OK
+    assert "standing down" in capsys.readouterr().err
+    assert not (state / "deployer.status").exists()
+
+
+def test_a_half_configured_unit_could_not_run_and_says_so_to_nagios(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Deploying with no way to reach RT is not a deploy. Exit 2, and the status
+    # file says could-not-run so the Nagios check reports it rather than
+    # leaving yesterday's outcome standing.
+    state = tmp_path / "state"
+    state.mkdir()
+    for name in ("RT_URL", "RT_USER", "RT_PASSWORD", "RT_TIMEZONE"):
+        monkeypatch.delenv(name, raising=False)
+    code = main(["--config", str(registry_file(tmp_path)), "--state", str(state), "run"])
+    assert code == EXIT_COULD_NOT_RUN
+    assert "RT is not configured" in capsys.readouterr().err
+    status = (state / "deployer.status").read_text(encoding="utf-8")
+    assert "outcome=could-not-run" in status
+    # Written whole, or a reader cannot tell it from a truncated file.
+    assert status.rstrip().endswith("end=1")

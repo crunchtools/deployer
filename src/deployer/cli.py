@@ -25,22 +25,25 @@ guessing at a location and reporting on whatever happens to be there.
 **Exit codes**, as the CLI Tool profile sets them:
 
 ``0``
-    The verb did what it was asked. For ``run`` that includes an empty queue
-    and a ticket waiting for its build; for ``rollback`` it includes a rollback
-    that verified, which is a task completed even though it leaves a hold.
+    Every ticket drained reached a decided state. That includes a **refusal** --
+    a service not in the registry, a commit nothing built, a requestor not
+    listed: refusing correctly is the tool working, and the ticket is stalled
+    and owned by whoever filed it, which is the channel. It also includes a
+    ticket waiting for its build, and a second run standing down because one
+    is already going. For ``rollback`` it is a rollback that verified.
 ``1``
-    ``run`` drained the queue, and something is now waiting for a person: a
-    refused ticket, a deploy that was rolled back, or a rollback that did not
-    come back. A *deploy* that was rolled back is a task that failed, which is
-    why it is 1 even when the rollback itself went perfectly -- it leaves a
-    held service and a stalled ticket, and a oneshot unit exiting 0 with a
-    service held would be reporting success for a state nobody has dealt with.
-    The wake-up that costs is one per failure, not one per idle minute, which
-    is the shape the whole design is built around.
+    A deploy failed, or a rollback failed to verify. Exit 1 even when the
+    rollback itself went perfectly, because it leaves a held service and a
+    stalled ticket and a oneshot unit exiting 0 with a service held would
+    report success for a state nobody has dealt with. The wake-up that costs is
+    one per failure, not one per idle minute, which is the shape the whole
+    design is built around.
 ``2``
     Could not run: a missing path, an unloadable registry, an unreachable RT,
     the auto-update hold guard being absent, or a verb asked to do something
-    this service's registry row forbids.
+    this service's registry row forbids. Read in python-sdlc's sense as well as
+    the profile's "usage error" -- both mean *this never got far enough to
+    try*, which is what a caller needs to tell apart from a failed deploy.
 """
 
 from __future__ import annotations
@@ -97,14 +100,18 @@ STATUS_FILE_NAME = "deployer.status"
 #: and a test can check it covers every outcome a run can produce.
 EXIT_FOR_OUTCOME: Final[dict[str, int]] = {
     OUTCOME_OK: EXIT_OK,
-    OUTCOME_COULD_NOT_RUN: EXIT_COULD_NOT_RUN,
-    # Drained, but something is waiting for a person. A clean rollback is here
-    # on purpose: it leaves a held service and a stalled ticket, and a unit
-    # that exited 0 with a service held would be reporting success for a state
-    # nobody has dealt with.
-    OUTCOME_REFUSED: EXIT_ERROR,
+    # A refusal is a DECIDED state, not a failure: the ticket named a service
+    # that is not in the registry, or a commit nothing built, or came from
+    # somebody not listed. Refusing correctly is the tool working, and the
+    # ticket is stalled and owned by whoever filed it. That is the channel.
+    OUTCOME_REFUSED: EXIT_OK,
+    # A deploy that failed. Exit 1 even when the rollback itself went
+    # perfectly: it leaves a held service and a stalled ticket, and a unit
+    # exiting 0 with a service held would report success for a state nobody
+    # has dealt with.
     OUTCOME_ROLLED_BACK: EXIT_ERROR,
     OUTCOME_ROLLBACK_FAILED: EXIT_ERROR,
+    OUTCOME_COULD_NOT_RUN: EXIT_COULD_NOT_RUN,
 }
 
 #: Everything that means "this program could not do its job", as opposed to "it
@@ -221,6 +228,12 @@ def _unhold(registry: Registry, name: str, state: Path, dry_run: bool) -> int:
     three-rollbacks-in-a-day limit is refused by the gate rather than by the
     hold, so clearing only the hold would leave it refused for the rest of the
     day with nothing to show why.
+
+    **Under the run lock.** This writes the same two records a failing deploy
+    writes: it clears a hold and rewrites the rollback log. Run while a deploy
+    is finishing, it can drop a hold that deploy just placed -- which is the
+    worst possible outcome, because the broken image then comes back at the
+    next auto-update with nothing saying why.
     """
     try:
         service = registry.get(name)
@@ -228,6 +241,19 @@ def _unhold(registry: Registry, name: str, state: Path, dry_run: bool) -> int:
         print(f"deployer: {exc}", file=sys.stderr)
         return EXIT_COULD_NOT_RUN
 
+    try:
+        with only_one(state):
+            return _clear(service, state, dry_run)
+    except AlreadyRunning as exc:
+        print(
+            f"deployer: {exc}. It is writing the same holds; wait for it to finish and try again.",
+            file=sys.stderr,
+        )
+        return EXIT_COULD_NOT_RUN
+
+
+def _clear(service: Service, state: Path, dry_run: bool) -> int:
+    """Clearing itself, with the lock already held."""
     holds = HoldStore(state)
     hold = holds.get(service.unit)
     attempts = AttemptLog(state)

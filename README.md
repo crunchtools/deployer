@@ -57,16 +57,38 @@ For each ticket:
   on the old image would look like a success.
 - On failure: roll back, re-verify, write a hold, and hand the ticket back to
   whoever filed it with the service's own last output and the probe result on
-  it. That output is published to everyone who can read the queue, so every
-  value in the container's environment long enough to be a credential is
-  replaced by the name it was set under first. If the environment cannot be
-  read, no logs are attached at all — a failed read must not become a leak. If the rollback itself does not verify, cancel the maintenance downtime so
+  it. That output is published to everyone who can read the queue, so it is
+  redacted first — see below. If the rollback itself does not verify, cancel the maintenance downtime so
   Nagios pages a human — a robot with nobody awake has no other move.
 
 RT and Nagios are told before the restart, not after. If either cannot be
 reached, the run stops with the host untouched and the ticket still queued,
 which is a far better outcome than a deploy nobody is told about. Past the
 restart their failures are recorded but never undo a good deploy.
+
+## What goes on a ticket, and what stays on the host
+
+A failing service usually prints the thing that failed, and the thing that
+failed is often a credential it was handed in its environment. The ticket is
+readable by everyone in the queue, so:
+
+- the **whole, unredacted tail** is written to `<state>/failures/<service>.log`,
+  0600 in a 0700 directory, one file per service, overwritten. The ticket names
+  the path;
+- what goes **on the ticket** is that tail with every value from the
+  container's environment removed, *except* an allowlist of names that are
+  never credentials — `PATH`, `HOME`, `LANG` and a handful more.
+
+Default deny, and that is the whole point. A blocklist of secret-looking names
+fails by publishing a credential: `DB=hunter2` sails straight through one. An
+allowlist fails by redacting something harmless, which costs a line of a log.
+Adding a name to it is a code change, which is the right weight for deciding
+that something is never a secret.
+
+Two things stop publication entirely rather than risk it: an environment whose
+shape cannot be read, and a secret whose value is too short to remove from text
+without wrecking it. In the second case the ticket names the variable, so
+somebody can lengthen it or decide it is not a credential.
 
 ## Holds
 
@@ -146,19 +168,20 @@ whatever happened to be there. A missing variable is exit 2, "could not run".
 
 | Code | Meaning |
 |---|---|
-| 0 | the verb did what it was asked. For `run`: an empty queue, a verified deploy, a ticket waiting for its build, or a second run standing down because one is already going. For `rollback`: a rollback that verified |
-| 1 | `run` drained the queue and something is waiting for a person: a refused ticket, a deploy that was rolled back, or a rollback that did not come back |
+| 0 | every ticket drained reached a decided state — including a **refusal**, and including a ticket waiting for its build or a second run standing down. For `rollback`: a rollback that verified |
+| 1 | a deploy failed, or a rollback failed to verify |
 | 2 | could not run: a missing path, an unloadable registry, an unreachable RT, the auto-update hold guard being absent, or a verb asked to do something the registry row forbids |
 
-A *deploy* that was rolled back is exit 1 even when the rollback itself went
-perfectly. It is a task that failed: it leaves a held service and a stalled
-ticket, and a oneshot unit exiting 0 with a service held would be reporting
-success for a state nobody has dealt with. The wake-up that costs is one per
-failure, not one per idle minute, which is the shape the whole design is built
-around.
+A **refusal is exit 0**. A service not in the registry, a commit nothing built,
+a requestor not listed — these are decided states, and refusing correctly is
+the tool working. The ticket is stalled and owned by whoever filed it, and that
+is the channel.
 
-A *rollback a person asked for* is exit 0 when it verifies — that task
-completed. It leaves a hold too, and says so in its output.
+A **deploy that was rolled back is exit 1** even when the rollback itself went
+perfectly. It leaves a held service and a stalled ticket, and a oneshot unit
+exiting 0 with a service held would report success for a state nobody has dealt
+with. The wake-up that costs is one per failure, not one per idle minute, which
+is the shape the whole design is built around.
 
 ## Deploying twice is not deploying twice
 

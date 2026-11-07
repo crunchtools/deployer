@@ -71,14 +71,17 @@ All notable changes to this project are documented here. The format follows
   "the previous run is still going" is the most ordinary thing that can happen.
 - Failure reports on the ticket carry the service's own last output, not just
   the probe's verdict. "The health probe returned 503" does not tell a developer
-  what broke; a traceback does. The output is **redacted first**: a failing
-  service usually prints the thing that failed, and the thing that failed is
-  often a credential it was handed in its environment. Every environment value
-  long enough to be a secret is replaced by the name it was set under, which
-  covers that case precisely. It does not cover a secret the service did not
-  get from its environment, which is part of why the tail is short. If the
-  environment cannot be read, nothing is attached — a failed read must not
-  become a leak.
+  what broke; a traceback does. The whole tail is kept on the host at
+  `<state>/failures/<service>.log`, 0600 in a 0700 directory and overwritten
+  per service, and the ticket carries the same tail with every value from the
+  container's environment removed bar an allowlist of names that are never
+  credentials. Default deny: a blocklist of secret-looking names fails by
+  publishing a credential — `DB=hunter2` sails through one — while an allowlist
+  fails by redacting something harmless. An environment whose shape cannot be
+  read, and a secret too short to substitute out of text safely, both stop
+  publication rather than risk it. The tail is captured **before** the
+  rollback, because podman's logs endpoint is addressed by container name and
+  after a restart that name is the restored container.
 - `deployer unhold` clears the rollback count as well as the hold. They are one
   decision: the three-rollbacks-in-a-day refusal comes from the gate rather
   than from the hold, so clearing only the hold would leave the service refused
@@ -91,6 +94,11 @@ All notable changes to this project are documented here. The format follows
   healthy service to arrive where it already was. If the right revision is
   live and *unhealthy*, the ticket is refused rather than restarted: that is a
   person's call, not a robot's.
+- `deployer rollback` and `deployer unhold` take the same lock as a run. Both
+  write what a failing deploy writes — the rollback moves `:latest` while a
+  deploy's staging is holding it, and unhold clears a hold a deploy may have
+  just placed, which would let the broken image back at the next auto-update
+  with nothing saying why.
 - `deployer rollback <service>` requires the hold guard and places a hold, for
   the same reason the automatic path does: `:latest` still carries the image
   being rolled away from, so without a hold the next auto-update puts it
@@ -101,12 +109,13 @@ All notable changes to this project are documented here. The format follows
   they work on a host where podman, systemd or RT is the thing that is broken.
   `rollback` honours a `rollback = "manual"` registry row by refusing and
   printing the two commands to run by hand. Exit codes as
-  the CLI Tool profile sets them: 0 for success, 1 when the queue was drained
-  but something is waiting for a person — a refused ticket, a rollback, or a
-  rollback that did not come back — and 2 for could-not-run. A clean rollback
-  is 1 on purpose: it leaves a held service and a stalled ticket, and a unit
-  that exited 0 with a service held would be reporting success for a state
-  nobody has dealt with.
+  this repo's constitution sets them: 0 when every ticket drained reached a
+  decided state — a **refusal** included, because refusing correctly is the
+  tool working — 1 when a deploy failed or a rollback failed to verify, and 2
+  for could-not-run. A rolled-back deploy is 1 even when the rollback itself
+  went perfectly: it leaves a held service and a stalled ticket, and a unit
+  that exited 0 with a service held would report success for a state nobody
+  has dealt with.
 - Repository scaffold: the `deployer` package, the container image, and the
   org's standard gates.
 - The capability boundary this program rests on, asserted by a test: the package

@@ -20,6 +20,7 @@ to pass.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,7 @@ from deployer.podman import PodmanError, ImageRef
 from deployer.registry import Probe, Registry, Service
 from deployer.rollback import ROLLBACK_TAGS_KEPT
 from deployer.rt import RtError, Ticket
+from deployer.systemd import SystemdError
 from deployer.runner import (
     OUTCOMES,
     UnreadableEnvironment,
@@ -216,6 +218,10 @@ class FakeSystemd:
         self.restarts: list[str] = []
         self.active = "active"
         self.result = "success"
+        #: Called on every restart, after it is recorded. The seam for a test
+        #: that needs the world to change mid-deploy -- a container whose logs
+        #: differ after the rollback, or a systemd that goes away during one.
+        self.on_restart: Callable[[], None] = lambda: None
 
     async def property(self, unit: str, name: str, interface: str = "") -> Any:
         if name == "ExecStart":
@@ -233,6 +239,7 @@ class FakeSystemd:
 
     async def restart(self, unit: str) -> None:
         self.restarts.append(unit)
+        self.on_restart()
         self.podman.running = self.podman.latest_points_at()
 
     async def hold_guard_installed(self) -> bool:
@@ -745,7 +752,9 @@ def test_every_outcome_a_run_can_produce_has_an_exit_code() -> None:
     ("outcome", "code"),
     [
         (OUTCOME_OK, EXIT_OK),
-        (OUTCOME_REFUSED, EXIT_ERROR),
+        # A decided state, not a failure: refusing correctly is the tool
+        # working, and the ticket is stalled and owned by whoever filed it.
+        (OUTCOME_REFUSED, EXIT_OK),
         (OUTCOME_ROLLED_BACK, EXIT_ERROR),
         (OUTCOME_ROLLBACK_FAILED, EXIT_ERROR),
         (OUTCOME_COULD_NOT_RUN, EXIT_COULD_NOT_RUN),
@@ -780,17 +789,18 @@ async def test_a_secret_from_the_environment_is_not_published(tmp_path: Path) ->
     # handed in its environment.
     world = World(tmp_path, ticket())
     world.broken = {CANDIDATE_ID}
-    world.podman.env = ("FLASK_SECRET_KEY=hunter2-and-then-some", "PORT=8080")
+    world.podman.env = ("FLASK_SECRET_KEY=hunter2-and-then-some", "PATH=/app/venv/bin")
     world.podman.log_text = (
-        "sqlalchemy.exc.OperationalError: auth failed for key hunter2-and-then-some\nlistening on 8080\n"
+        "sqlalchemy.exc.OperationalError: auth failed for key hunter2-and-then-some\n"
+        "running from /app/venv/bin\n"
     )
     await world.drain()
     published = "\n".join(text for _, text in world.rt.comments)
     assert "hunter2-and-then-some" not in published
     assert "<redacted $FLASK_SECRET_KEY>" in published
-    # A port is not a credential, and replacing every 8080 in a traceback
-    # would make the traceback useless.
-    assert "listening on 8080" in published
+    # PATH is on the allowlist: never a credential, and a log is hard to read
+    # without it.
+    assert "running from /app/venv/bin" in published
 
 
 async def test_the_longest_secret_wins_when_one_contains_another(tmp_path: Path) -> None:
@@ -822,16 +832,16 @@ async def test_an_unreadable_environment_means_no_logs_rather_than_raw_logs(tmp_
     [
         # The case this exists for.
         (["TOKEN=super-secret-value"], "auth failed: super-secret-value", "auth failed: <redacted $TOKEN>"),
-        # Too short to be a credential, and replacing it would wreck the line.
-        (["PORT=8080"], "listening on 8080", "listening on 8080"),
-        # Short, but its NAME says it is a secret. Length is not what makes a
-        # secret safe to publish: a seven-character password is a password.
-        (["DB_PASSWORD=hunter7"], "auth failed for hunter7", "auth failed for <redacted $DB_PASSWORD>"),
-        # A short named secret is removed wherever it appears, including inside
-        # an unrelated word. That is the cost of not publishing short
-        # credentials, and it is the right way round: a mangled log line is
-        # recoverable, a published key is not.
-        (["API_KEY=rej"], "key abc rejected", "key abc <redacted $API_KEY>ected"),
+        # On the allowlist: never a credential, and a log is hard to read
+        # without it.
+        (["PATH=/app/venv/bin"], "ran /app/venv/bin/x", "ran /app/venv/bin/x"),
+        # NOT on the allowlist, so it goes whatever it is called. A blocklist of
+        # secret-looking names would have published this one.
+        (["DB=hunter7"], "auth failed for hunter7", "auth failed for <redacted $DB>"),
+        # Removed wherever it appears, including inside an unrelated word. That
+        # is the right way round: a mangled log line is recoverable, a
+        # published key is not.
+        (["API_KEY=rejt"], "abc rejted", "abc <redacted $API_KEY>ed"),
         # An entry with no value has nothing to redact.
         (["EMPTY="], "nothing here", "nothing here"),
         # Several occurrences, not just the first.
@@ -889,3 +899,77 @@ async def test_an_rt_failure_after_a_verified_deploy_is_recovered_on_the_next_ru
     # The one thing that must not happen.
     assert world.systemd.restarts == [UNIT]
     assert world.rt.status()[-1] == "resolved"
+
+
+async def test_a_short_secret_stops_the_output_being_published_at_all(tmp_path: Path) -> None:
+    # Too short to substitute out of the text without wrecking it, and
+    # publishing it because redacting would be ugly is the decision this
+    # program must not make. The message names the variable.
+    world = World(tmp_path, ticket())
+    world.broken = {CANDIDATE_ID}
+    world.podman.env = ("DB=ab",)
+    world.podman.log_text = "connected to ab as root\n"
+    await world.drain()
+    published = "\n".join(text for _, text in world.rt.comments)
+    assert "connected to" not in published
+    assert "not published" in published
+    assert "DB" in published
+
+
+async def test_the_unredacted_tail_is_kept_on_the_host(tmp_path: Path) -> None:
+    # What the ticket cannot carry, the host keeps. One file per service,
+    # overwritten, root-only.
+    world = World(tmp_path, ticket())
+    world.broken = {CANDIDATE_ID}
+    world.podman.env = ("TOKEN=a-long-enough-secret",)
+    world.podman.log_text = "failed with a-long-enough-secret\n"
+    await world.drain()
+
+    kept = tmp_path / "failures" / "acquacotta.log"
+    assert kept.read_text(encoding="utf-8") == "failed with a-long-enough-secret\n"
+    assert kept.stat().st_mode & 0o077 == 0
+    assert (tmp_path / "failures").stat().st_mode & 0o077 == 0
+    # And the ticket says where it is, without repeating what is in it.
+    published = "\n".join(text for _, text in world.rt.comments)
+    assert str(kept) in published
+    assert "a-long-enough-secret" not in published
+
+
+async def test_the_logs_come_from_the_failed_image_not_the_restored_one(tmp_path: Path) -> None:
+    # podman's logs endpoint is addressed by container NAME, so once the
+    # rollback has restarted the unit that name is the container running the
+    # OLD image. Read afterwards the ticket would carry the output of the
+    # thing that works, which is worse than carrying none.
+    world = World(tmp_path, ticket())
+    world.broken = {CANDIDATE_ID}
+    world.podman.log_text = "the candidate died here\n"
+
+    def the_rollback_brings_a_working_container() -> None:
+        # The second restart is the rollback's; the first is the deploy's.
+        if len(world.systemd.restarts) > 1:
+            world.podman.log_text = "the restored container is fine\n"
+
+    world.systemd.on_restart = the_rollback_brings_a_working_container
+    await world.drain()
+    published = "\n".join(text for _, text in world.rt.comments)
+    assert "the candidate died here" in published
+    assert "the restored container is fine" not in published
+
+
+async def test_a_rollback_that_raises_is_a_person_not_a_crash(tmp_path: Path) -> None:
+    # attempted=True on purpose: the tag or the restart may well have happened
+    # before the exception, so the state of the service is unknown and
+    # "nothing was touched" is the one thing that cannot be said.
+    world = World(tmp_path, ticket())
+    world.broken = {CANDIDATE_ID}
+
+    def systemd_goes_away_during_the_rollback() -> None:
+        if len(world.systemd.restarts) > 1:
+            raise SystemdError("systemd went away mid-rollback")
+
+    world.systemd.on_restart = systemd_goes_away_during_the_rollback
+    report = await world.drain()
+    assert report.outcome == OUTCOME_ROLLBACK_FAILED
+    assert world.holds.held(UNIT)
+    assert world.rt.said("THE ROLLBACK DID NOT COME BACK")
+    assert world.rt.said("systemd went away mid-rollback")
