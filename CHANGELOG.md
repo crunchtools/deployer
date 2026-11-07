@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- `deploy/`: reference copies of the unit, the auto-update hold drop-in and
+  `services.toml`, plus a credential-free `deployer.env.example`. `/srv` stays
+  the authoritative home; these exist so the fleet's config-drift check has a
+  counterpart to compare against instead of reporting this service as
+  *unmapped*. They carry the obligation that goes with them — see
+  `deploy/README.md`.
+
 ## [0.1.4] - 2026-11-07
 
 ### Added
