@@ -1,0 +1,16 @@
+# Gatehouse findings judged rather than fixed. Each one says why the finding is
+# wrong here, not why fixing it is inconvenient.
+
+# The queue is a handful of tickets, not a page of them, and RT is on the
+# loopback. The per-ticket fetch is what keeps one unreadable ticket from
+# poisoning the batch -- tests/test_runner.py pins that property, because the
+# queue is other people's work and one bad ticket blocking the rest would be a
+# denial of service anybody who can file a ticket could cause. A `format=l`
+# search would return every ticket's fields in one call and lose exactly that.
+[[findings]]
+agent = "performance"
+category = "performance"
+file = "src/deployer/runner.py"
+evidence = "ids = await self.clients.rt.open_tickets(self.queue)\n\nresults: list[TicketResult] = []\nfor ticket_id in ids:\n    results.append(await self._ticket(ticket_id))"
+status = "not-a-bug"
+reason = "N is the depth of a deploy queue -- a handful -- and RT is on the loopback, so the extra round trips are not a cost worth trading for. Fetching the batch in one search would mean one malformed ticket could poison the whole read, and isolating that is a property this program is tested for."

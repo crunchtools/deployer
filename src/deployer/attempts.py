@@ -106,3 +106,25 @@ class AttemptLog:
     ) -> bool:
         """Whether ``service`` has been rolled back too often to keep trying."""
         return self.recent_rollbacks(service, within) >= limit
+
+    def forget_rollbacks(self, service: str) -> int:
+        """Drop ``service``'s rollbacks from the log. Returns how many went.
+
+        What ``deployer unhold`` calls, and the only thing that clears the
+        three-in-24-hours refusal. Without it a service that hit the limit
+        would stay refused for a whole day even after the fix shipped, and the
+        person who fixed it would have no way to say so.
+
+        Other services' lines are rewritten untouched, so unholding one service
+        does not reset the count for another.
+        """
+        wanted = safe_component(service, "service")
+        try:
+            lines = self._log.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            return 0
+        kept = [line for line in lines if line.partition("\t")[2].strip() != wanted]
+        gone = len(lines) - len(kept)
+        if gone:
+            write_whole(self._log, "".join(f"{line}\n" for line in kept))
+        return gone

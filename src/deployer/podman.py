@@ -1,9 +1,9 @@
 """The podman surface, and nothing beyond it.
 
 This module is the capability boundary made real. It speaks to the podman
-Libpod REST API over its unix socket, and it offers exactly seven operations:
+Libpod REST API over its unix socket, and it offers exactly eight operations:
 pull an image, inspect an image, inspect a container, tag, untag, remove an
-image, and list images.
+image, list images, and read a container's logs.
 
 There is no create, start, run or exec here, and that absence is the design
 rather than an oversight. A process that can start a container can mount a
@@ -41,6 +41,14 @@ PULL_TIMEOUT_SECONDS: Final = 600.0
 # A response larger than this is not something this program needs to read.
 MAX_RESPONSE_BYTES: Final = 10 * 1024 * 1024
 
+#: How many log lines go on a ticket. Enough to show a traceback, little
+#: enough that the comment is still readable.
+DEFAULT_LOG_LINES: Final = 40
+#: A log frame header is 8 bytes: one stream byte, three reserved, four of
+#: big-endian length.
+_FRAME_HEADER_BYTES: Final = 8
+_STREAM_BYTES: Final = frozenset({0, 1, 2})
+
 REVISION_LABEL: Final = "org.opencontainers.image.revision"
 VERSION_LABEL: Final = "org.opencontainers.image.version"
 
@@ -55,6 +63,7 @@ ALLOWED_OPERATIONS: Final = frozenset(
         "untag",
         "remove_image",
         "list_images",
+        "logs",
         "close",
     }
 )
@@ -184,7 +193,7 @@ class PodmanImages:
         except json.JSONDecodeError as exc:
             raise PodmanError(f"{method} {path}: podman's answer was not JSON: {exc}") from None
 
-    # --- the seven ---
+    # --- the eight ---
 
     async def pull(self, reference: str) -> str:
         """Pull ``reference`` and return the image id it resolved to.
@@ -281,8 +290,67 @@ class PodmanImages:
             )
         return tuple(found)
 
+    async def logs(self, name: str, tail: int = DEFAULT_LOG_LINES) -> str:
+        """The last ``tail`` lines a container has written. Read-only.
+
+        Here because a developer reading a stalled ticket needs to see what the
+        service said as it failed, and "the health probe returned 502" is not
+        that. The unit's journal would say less: a container that starts and
+        then answers wrongly is a perfectly healthy unit.
+
+        Reading logs is a GET. It adds nothing to what this program can *do* to
+        a container -- there is still no create, start, run or exec -- which is
+        why it sits inside the boundary rather than breaking it.
+
+        Never raises. A comment explaining a failed deploy is worth sending
+        without its log tail; losing the comment because the log fetch failed
+        would be the wrong trade.
+        """
+        try:
+            response = await self._request(
+                "GET",
+                f"/containers/{name}/logs",
+                {"stdout": "true", "stderr": "true", "tail": str(max(1, tail))},
+            )
+        except PodmanError as exc:
+            return f"[no logs: {exc}]"
+        return _demultiplex(response.content)
+
     @staticmethod
     def _require_dict(value: Any, where: str) -> dict[str, Any]:
         if not isinstance(value, dict):
             raise PodmanError(f"{where}: expected an object, got {type(value).__name__}")
         return value
+
+
+def _demultiplex(raw: bytes) -> str:
+    """Docker's multiplexed log stream into plain text.
+
+    A container without a TTY has its stdout and stderr interleaved as frames:
+    one stream byte, three reserved, four bytes of big-endian length, then the
+    payload. A container WITH a TTY has no frames at all and the body is the
+    text itself.
+
+    Which of the two arrives is a property of how the container was created, so
+    this reads either: a first byte that is not a stream number, or a declared
+    length that runs past the end of the data, means the bytes are not frames
+    and the whole thing is decoded as text. Guessing wrong the other way would
+    print eight bytes of binary header in front of every line.
+    """
+    if not raw:
+        return ""
+    if raw[0] not in _STREAM_BYTES:
+        return raw.decode("utf-8", errors="replace")
+
+    parts: list[str] = []
+    offset = 0
+    while offset + _FRAME_HEADER_BYTES <= len(raw):
+        if raw[offset] not in _STREAM_BYTES:
+            return raw.decode("utf-8", errors="replace")
+        length = int.from_bytes(raw[offset + 4 : offset + _FRAME_HEADER_BYTES], "big")
+        start = offset + _FRAME_HEADER_BYTES
+        if start + length > len(raw):
+            return raw.decode("utf-8", errors="replace")
+        parts.append(raw[start : start + length].decode("utf-8", errors="replace"))
+        offset = start + length
+    return "".join(parts)
