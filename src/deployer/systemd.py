@@ -24,7 +24,8 @@ forget.
 
 from __future__ import annotations
 
-from collections.abc import Container
+import asyncio
+from collections.abc import Awaitable, Callable, Container
 from dataclasses import dataclass
 from types import TracebackType
 from typing import Any, Final, Protocol, Self
@@ -43,6 +44,12 @@ PROPS_IFACE: Final = "org.freedesktop.DBus.Properties"
 
 #: Readable but never writable: the hold guard lives on this unit.
 AUTO_UPDATE_UNIT: Final = "podman-auto-update.service"
+
+#: How long to wait for a restart to finish before giving up on knowing.
+#: Generous: a container has to stop, be removed and be created again, and the
+#: unit's own TimeoutStartSec is usually longer than this.
+RESTART_TIMEOUT_SECONDS: Final = 120.0
+RESTART_POLL_SECONDS: Final = 1.0
 
 #: The whole surface. Checked by ``tests/test_systemd.py``.
 ALLOWED_OPERATIONS: Final = frozenset(
@@ -87,7 +94,12 @@ class UnitState:
 class SystemdUnits:
     """Restart, start and read units named in the registry, over D-Bus."""
 
-    def __init__(self, allowed_units: Container[str], bus: Bus | None = None) -> None:
+    def __init__(
+        self,
+        allowed_units: Container[str],
+        bus: Bus | None = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
         """``allowed_units`` is the set ``restart`` and ``start`` will act on.
 
         Anything outside it is refused. The registry supplies this, so the
@@ -95,9 +107,11 @@ class SystemdUnits:
         reading tells this program nothing it should not know and the
         auto-update unit has to be readable for the hold guard check.
 
-        ``bus`` is for tests. In production it is left out and the system bus is
-        connected on first use.
+        ``bus`` and ``sleep`` are for tests. In production both are left out:
+        the system bus is connected on first use, and waiting for a restart
+        waits in real time.
         """
+        self._sleep = sleep
         self._allowed = allowed_units
         self._bus: Bus | None = bus
 
@@ -161,9 +175,48 @@ class SystemdUnits:
         return reply
 
     async def restart(self, unit: str) -> None:
-        """Restart a unit named in the registry."""
+        """Restart a unit named in the registry, and WAIT for it to come back.
+
+        ``RestartUnit`` **queues a job and returns**. It does not wait, and that
+        cost a real deploy: verification ran immediately afterwards, read
+        ``ActiveState`` as ``deactivating`` -- the old container was still
+        stopping -- and failed on its first sample. The rollback then did the
+        same thing, so a perfectly good service was reported as "down, needs a
+        person" while it was coming up fine. Every deploy would have done it.
+
+        Waiting on ``ActiveEnterTimestamp`` rather than on ``ActiveState``
+        alone, because the old instance is still ``active`` for the moment
+        between the job being queued and the stop beginning. A timestamp newer
+        than the one read before the restart is proof that a NEW activation
+        happened; "it is active" is not.
+
+        Raises if the unit ends up failed, or if the restart has not completed
+        within :data:`RESTART_TIMEOUT_SECONDS` -- a deploy that cannot be told
+        to have finished must not be verified as if it had.
+        """
         self._require_in_scope(unit, "restart")
+        before = await self._active_enter(unit)
         await self._call("RestartUnit", "ss", [unit, "replace"])
+
+        waited = 0.0
+        while True:
+            state = await self.state(unit)
+            if state.failed or state.active_state == "failed":
+                raise SystemdError(f"{unit} failed to restart: {state.active_state}, result {state.result!r}")
+            if state.active_state == "active" and await self._active_enter(unit) > before:
+                return
+            if waited >= RESTART_TIMEOUT_SECONDS:
+                raise SystemdError(
+                    f"{unit} was still {state.active_state} {RESTART_TIMEOUT_SECONDS:.0f}s after "
+                    "the restart was queued, so whether it came back is unknown"
+                )
+            await self._sleep(RESTART_POLL_SECONDS)
+            waited += RESTART_POLL_SECONDS
+
+    async def _active_enter(self, unit: str) -> int:
+        """``ActiveEnterTimestamp`` in microseconds, or 0 for a unit never started."""
+        value = await self.property(unit, "ActiveEnterTimestamp", UNIT_IFACE)
+        return int(value) if isinstance(value, int) else 0
 
     async def start(self, unit: str) -> None:
         """Start a unit named in the registry."""

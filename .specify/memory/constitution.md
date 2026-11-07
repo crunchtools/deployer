@@ -1,6 +1,6 @@
 # deployer Constitution
 
-> **Version:** 0.1.0
+> **Version:** 0.2.0
 > **Ratified:** 2026-11-07
 > **Amended:** 2026-11-07
 > **Status:** Active
@@ -92,8 +92,20 @@ delete:
 | Path | What |
 |------|------|
 | `hold/<unit>` | A rolled-back service. Carries ticket, revision, time. **Never expires.** |
-| `rolled-back/<service>/<rev>` | A revision that was started and failed to verify. Never deployed again. |
+| `rolled-back/<service>/<rev>` | A revision that was started and failed to verify. Never deployed **automatically** again. |
 | `tickets/<id>` | What has already been said on a ticket, so a waiting one is not commented on every run. |
 
 A hold has no expiry because expiry means a known-bad image going live when
 nobody got to the alert in time. A red check is the better failure.
+
+`rolled-back/<service>/<rev>` is cleared by `deployer unhold <service>`, for
+the revision that service's hold names, and by nothing else. Amended at 0.2.0:
+the rule used to read "never deployed again", and that was wrong in one
+direction. A rollback is not always the revision's fault — the deployer itself
+reported a healthy service as down once, because `RestartUnit` queues a job and
+returns and verification read a unit mid-restart — and a permanent record
+condemned a good commit with no way back but editing this directory. Which the
+section above explicitly contemplates ("backing anything out is a file
+delete"), so the amendment changes who does it, not whether it can be done: a
+person who has cleared the hold, having seen the revision the hold names.
+Nothing automatic clears it, and nothing automatic retries a revision.

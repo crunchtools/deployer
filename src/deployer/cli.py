@@ -267,12 +267,23 @@ def _clear(service: Service, state: Path, dry_run: bool) -> int:
 
     cleared = holds.clear(service.unit)
     forgotten = attempts.forget_rollbacks(service.name)
+    # And the revision the hold names. A revision that was rolled back is never
+    # retried AUTOMATICALLY, and that stays true -- but when the rollback was
+    # the deployer's own fault, or the environment's, the person who has just
+    # looked at it needs a way to say "that commit was fine". This is it, and
+    # the hold file names the revision so they can see what they are forgiving.
+    forgiven = attempts.forgive(service.name, hold.revision) if hold else False
     if not cleared:
         print(f"{service.unit} was not held; forgot {forgotten} recent rollback(s)")
         return EXIT_OK
     print(
         f"cleared the hold on {service.unit} (ticket {hold.ticket if hold else '?'}) and forgot "
         f"{forgotten} recent rollback(s). podman auto-update will no longer skip it."
+        + (
+            f"\n{hold.revision[:12]} may be deployed again; file a new ticket for it."
+            if forgiven and hold
+            else ""
+        )
     )
     return EXIT_OK
 

@@ -6,6 +6,27 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- **`restart` now waits for the unit to come back.** `RestartUnit` over D-Bus
+  *queues a job and returns*. Verification ran immediately afterwards, read
+  `ActiveState` as `deactivating` — the old container was still stopping — and
+  failed on its first sample. The rollback then did the same thing, so the
+  first real deploy reported a perfectly healthy service as *"down, needs a
+  person"*, cancelled its maintenance window to page, and held it. Every deploy
+  would have done exactly that.
+
+  It waits on `ActiveEnterTimestamp` rather than on `ActiveState` alone: the
+  old instance is still `active` in the moment between the job being queued and
+  the stop beginning, so "it is active" is not proof that a restart happened. A
+  newer activation timestamp is. A restart that has not completed within 120
+  seconds, or that ends `failed`, raises — a deploy that cannot be told to have
+  finished must not be verified as though it had.
+- `deployer unhold` now also forgives the revision its hold names. A rolled-back
+  revision is still never retried *automatically*, but a rollback is not always
+  the revision's fault — the bug above condemned a good commit — and without
+  this the only way back was editing the state directory by hand. It takes a
+  person who has looked: the hold file names the revision.
+
 ## [0.1.1] - 2026-11-07
 
 ## [0.1.0] - 2026-11-07

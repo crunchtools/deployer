@@ -159,3 +159,26 @@ def test_forgetting_does_not_forgive_the_revision(tmp_path: Path) -> None:
     log.record_rollback("acquacotta")
     log.forget_rollbacks("acquacotta")
     assert log.was_rolled_back("acquacotta", "f" * 40)
+
+
+def test_forgiving_lets_a_revision_be_deployed_again(tmp_path: Path) -> None:
+    # A rollback is not always the revision's fault. The deployer itself has
+    # reported a healthy service as down; without a way back, a good commit
+    # would be condemned for ever by a bad afternoon.
+    log = AttemptLog(tmp_path)
+    log.mark_rolled_back(SERVICE, "f" * 40)
+    assert log.forgive(SERVICE, "f" * 40)
+    assert not log.was_rolled_back(SERVICE, "f" * 40)
+
+
+def test_forgiving_what_was_never_recorded_says_so(tmp_path: Path) -> None:
+    assert not AttemptLog(tmp_path).forgive(SERVICE, "f" * 40)
+
+
+def test_forgiving_one_revision_leaves_another(tmp_path: Path) -> None:
+    log = AttemptLog(tmp_path)
+    log.mark_rolled_back(SERVICE, "a" * 40)
+    log.mark_rolled_back(SERVICE, "b" * 40)
+    log.forgive(SERVICE, "a" * 40)
+    assert not log.was_rolled_back(SERVICE, "a" * 40)
+    assert log.was_rolled_back(SERVICE, "b" * 40)
