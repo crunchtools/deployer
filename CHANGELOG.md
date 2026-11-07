@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-07
+
 ### Added
 - Service registry (`services.toml`): one row per service holding the image, the
   unit, the health probe and what it must return, the settle window, the build
