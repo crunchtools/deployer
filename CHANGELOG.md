@@ -7,6 +7,22 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Service registry (`services.toml`): one row per service holding the image, the
+  unit, the health probe and what it must return, the settle window, the build
+  deadline, whether rollback is automatic, and which requestors may file for it.
+  An unknown key is a load error, and `also_restart` and `preflight` are refused
+  by name with the reason rather than quietly ignored.
+- Ticket parsing: a strict `key: value` grammar over `service`, `repo`, `commit`
+  and an optional `pr`. Prose, a repeated key and an abbreviated sha are all
+  refused. One ticket carries one revision; a fix is a new ticket.
+- Podman client over the socket with exactly seven operations — pull, inspect
+  image, inspect container, tag, untag, remove image, list images. Two tests
+  hold the line: one compares the class against the declared surface, the other
+  refuses any method name that hints at a container lifecycle.
+- Systemd client over D-Bus with restart, start, state and one property read,
+  refusing any unit the registry does not name. No `daemon-reload` and no
+  unit-file writes, so the static hold guard cannot be rewritten by this
+  program. `podman-auto-update.service` is readable and not restartable.
 - Repository scaffold: the `deployer` package, its CLI verbs (`run`,
   `rollback`, `unhold`, `holds`, and `--dry-run`), the container image, and the
   org's standard gates. The verbs parse and are not yet wired; an unimplemented
