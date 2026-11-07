@@ -118,6 +118,11 @@ class Outcome:
     ok: bool
     reason: str = ""
     probe_detail: str = ""
+    #: The unit came back running something that is not the candidate at all.
+    #: Nothing was learned about the candidate, so the caller must not record
+    #: the revision as one that broke this service -- the next ticket for it
+    #: deserves a fair hearing once whatever started the wrong image is fixed.
+    ran_something_else: bool = False
 
     @property
     def failed(self) -> bool:
@@ -193,6 +198,7 @@ async def verify(host: Host, service: Service, candidate_image_id: str) -> Outco
                     f"{service.container} is running {running_image or 'nothing'}, "
                     f"not the candidate {candidate_image_id}"
                 ),
+                ran_something_else=True,
             )
 
         result = await probe_once(service.probe, host.client)

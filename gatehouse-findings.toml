@@ -14,3 +14,27 @@ file = "src/deployer/runner.py"
 evidence = "ids = await self.clients.rt.open_tickets(self.queue)\n\nresults: list[TicketResult] = []\nfor ticket_id in ids:\n    results.append(await self._ticket(ticket_id))"
 status = "not-a-bug"
 reason = "N is the depth of a deploy queue -- a handful -- and RT is on the loopback, so the extra round trips are not a cost worth trading for. Fetching the batch in one search would mean one malformed ticket could poison the whole read, and isolating that is a property this program is tested for."
+
+# The ExecStart half of the unit-shape gate is not a guarantee and the code now
+# says so. Which word of `podman run [options] IMAGE [command]` is the image
+# cannot be decided without knowing which of podman's hundred-odd options take
+# values -- `-v /srv/x/config:/config:ro` is a single word containing both a
+# slash and a colon, and every real unit on this fleet has several.
+#
+# What the gate CAN prove, it proves from evidence: ImageName on the running
+# container is the reference the unit created it from. The case this finding
+# names -- a unit edited to run something else, with ours left behind as an
+# option value -- is caught by verification, which compares the running
+# container's image id against the candidate and rolls back on a mismatch.
+#
+# The real consequence of that case was that it blamed the revision for a unit
+# problem, which would have blacklisted a perfectly good commit for ever.
+# Outcome.ran_something_else now carries the distinction, and adf7efb's
+# follow-up stops the attempt being recorded. Tested.
+[[findings]]
+agent = "bugs"
+category = "bug"
+file = "src/deployer/stage.py"
+evidence = "latest not in words"
+status = "not-a-bug"
+reason = "podman's option grammar makes the image operand undecidable without a table of which options take values; the gate proves what it can from ImageName and verification catches the rest, rolling back and -- now -- not blaming the revision for a unit that was edited behind this program's back"

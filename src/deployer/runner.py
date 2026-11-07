@@ -568,7 +568,13 @@ class Runner:
         outcome: Outcome,
     ) -> TicketResult:
         """It did not hold. Roll back once, hold the service, hand it back."""
-        self.attempts.mark_rolled_back(service.name, request.commit)
+        # Not when the unit came back running something that is not the
+        # candidate at all. Nothing was learned about this revision then -- the
+        # fault is in whatever started the wrong image, usually a unit edited
+        # behind this program's back -- and blacklisting it would mean a
+        # perfectly good commit could never be deployed to this service again.
+        if not outcome.ran_something_else:
+            self.attempts.mark_rolled_back(service.name, request.commit)
         self.attempts.record_rollback(service.name)
 
         # BEFORE the rollback, not after. podman's logs endpoint is addressed by

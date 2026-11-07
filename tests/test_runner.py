@@ -251,8 +251,10 @@ class FakeSystemd:
 
     async def restart(self, unit: str) -> None:
         self.restarts.append(unit)
-        self.on_restart()
         self.podman.running = self.podman.latest_points_at()
+        # After the world has moved, so a hook can say what the restart really
+        # produced -- a different image, different logs, or an exception.
+        self.on_restart()
 
     async def hold_guard_installed(self) -> bool:
         return self.guard
@@ -1047,3 +1049,27 @@ async def test_a_pinned_service_is_refused_and_told_why(tmp_path: Path) -> None:
     assert world.rt.said("is running")
     assert world.rt.said("would not change what it runs")
     assert world.systemd.restarts == []
+
+
+async def test_a_unit_that_starts_the_wrong_image_does_not_blame_the_revision(
+    tmp_path: Path,
+) -> None:
+    # A unit edited behind this program's back starts something that is not the
+    # candidate. The deploy fails and rolls back, which is right -- but nothing
+    # was learned about the revision, and blacklisting it would mean a
+    # perfectly good commit could never be deployed to this service again.
+    world = World(tmp_path, ticket())
+
+    def start_something_else() -> None:
+        world.podman.running = "sha256:" + "c" * 64
+
+    world.systemd.on_restart = start_something_else
+    report = await world.drain()
+
+    assert report.outcome in {OUTCOME_ROLLED_BACK, OUTCOME_ROLLBACK_FAILED}
+    assert not world.attempts.was_rolled_back("acquacotta", WANTED)
+    # Still counted as a rollback of the service, and still held: something is
+    # wrong with this service even if the revision is innocent.
+    assert world.attempts.recent_rollbacks("acquacotta") == 1
+    assert world.holds.held(UNIT)
+    assert world.rt.said("not the candidate")

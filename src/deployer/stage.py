@@ -155,6 +155,13 @@ async def unit_shape_ok(systemd: UnitOps, service: Service, running: Mapping[str
     also name ``<image>:latest``, and must not name the same image at another
     tag -- which of the two a restart would pick is not something to guess at.
 
+    That second check is deliberately **not** a guarantee, and it cannot be
+    one: a unit edited to run a different image entirely, with ours left behind
+    as an option value, passes it. Verification is the layer that catches
+    that -- it compares the running container's image id against the candidate
+    and rolls back on a mismatch, and sets ``ran_something_else`` so the
+    revision is not blamed for it.
+
     **Does the unit pull on start?** Its own pull would undo the staging this
     program does.
     """
