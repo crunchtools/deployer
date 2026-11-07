@@ -214,3 +214,64 @@ async def test_remove_image_surfaces_an_http_error() -> None:
     async with client(lambda _r: httpx.Response(409, text="image is in use")) as images:
         with pytest.raises(PodmanError, match="409"):
             await images.remove_image("localhost/x:rollback-1")
+
+
+# --- logs ---
+
+
+def _frame(stream: int, text: str) -> bytes:
+    payload = text.encode()
+    return bytes([stream, 0, 0, 0]) + len(payload).to_bytes(4, "big") + payload
+
+
+async def test_logs_demultiplex_the_frame_format() -> None:
+    # A container without a TTY has stdout and stderr interleaved as frames.
+    # Printing the eight-byte headers would put binary in front of every line.
+    body = _frame(1, "starting\n") + _frame(2, "Traceback\n") + _frame(1, "bound :8080\n")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body)
+
+    async with client(handler) as images:
+        assert await images.logs("acquacotta") == "starting\nTraceback\nbound :8080\n"
+
+
+async def test_logs_from_a_tty_container_are_read_as_plain_text() -> None:
+    # With a TTY there are no frames at all, and which arrives is a property of
+    # how the container was created rather than something to configure.
+    async with client(lambda _r: httpx.Response(200, content=b"plain output\n")) as images:
+        assert await images.logs("acquacotta") == "plain output\n"
+
+
+async def test_a_declared_length_past_the_end_is_read_as_text() -> None:
+    # Not frames after all, or a truncated response. Either way, decoding the
+    # bytes is better than returning a fragment.
+    broken = bytes([1, 0, 0, 0]) + (9999).to_bytes(4, "big") + b"short"
+    async with client(lambda _r: httpx.Response(200, content=broken)) as images:
+        assert "short" in await images.logs("acquacotta")
+
+
+async def test_the_tail_count_is_passed_to_podman() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(200, content=b"")
+
+    async with client(handler) as images:
+        await images.logs("acquacotta", tail=5)
+    assert "tail=5" in seen[0]
+    assert "stderr=true" in seen[0]
+
+
+async def test_a_failed_log_read_is_a_note_not_an_exception() -> None:
+    # The comment explaining a failed deploy is worth sending without its log
+    # tail; losing the comment because the log fetch failed is the wrong trade.
+    async with client(lambda _r: httpx.Response(500, text="boom")) as images:
+        answer = await images.logs("acquacotta")
+    assert answer.startswith("[no logs:")
+
+
+async def test_no_logs_at_all_is_an_empty_string() -> None:
+    async with client(lambda _r: httpx.Response(200, content=b"")) as images:
+        assert await images.logs("acquacotta") == ""
