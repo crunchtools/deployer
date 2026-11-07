@@ -76,13 +76,30 @@ All notable changes to this project are documented here. The format follows
   decision: the three-rollbacks-in-a-day refusal comes from the gate rather
   than from the hold, so clearing only the hold would leave the service refused
   for the rest of the day with nothing on the ticket to say why.
+- Deploying is idempotent. If the container is already running the commit the
+  ticket names, nothing is restarted: the run verifies what is there and
+  finishes the ticket. The failure that makes this worth having is a deploy
+  that verified and then could not be written back to RT — the ticket stays
+  open, comes round again two minutes later, and would otherwise restart a
+  healthy service to arrive where it already was. If the right revision is
+  live and *unhealthy*, the ticket is refused rather than restarted: that is a
+  person's call, not a robot's.
+- `deployer rollback <service>` requires the hold guard and places a hold, for
+  the same reason the automatic path does: `:latest` still carries the image
+  being rolled away from, so without a hold the next auto-update puts it
+  straight back. The hold records ticket 0, meaning "a person did this by
+  hand".
 - CLI verbs wired: `run`, `rollback <service>`, `unhold <service>`, `holds` and
   `--dry-run`. `holds` and `unhold` read nothing but the state directory, so
   they work on a host where podman, systemd or RT is the thing that is broken.
   `rollback` honours a `rollback = "manual"` registry row by refusing and
-  printing the two commands to run by hand. Exit codes: 0 for a verb that did
-  what it was asked — including a deploy that failed and was rolled back
-  cleanly — 1 only for a service that needs a person, and 2 for "could not run".
+  printing the two commands to run by hand. Exit codes as
+  the CLI Tool profile sets them: 0 for success, 1 when the queue was drained
+  but something is waiting for a person — a refused ticket, a rollback, or a
+  rollback that did not come back — and 2 for could-not-run. A clean rollback
+  is 1 on purpose: it leaves a held service and a stalled ticket, and a unit
+  that exited 0 with a service held would be reporting success for a state
+  nobody has dealt with.
 - Repository scaffold: the `deployer` package, the container image, and the
   org's standard gates.
 - The capability boundary this program rests on, asserted by a test: the package

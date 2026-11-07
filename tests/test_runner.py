@@ -27,6 +27,7 @@ import httpx
 import pytest
 
 from deployer.attempts import ROLLBACK_LIMIT, AttemptLog
+from deployer.cli import EXIT_ERROR, EXIT_FOR_OUTCOME, EXIT_OK, EXIT_COULD_NOT_RUN
 from deployer.hold import Hold, HoldStore, MissingGuardError
 from deployer.nagios import NagiosError
 from deployer.podman import PodmanError, ImageRef
@@ -34,6 +35,7 @@ from deployer.registry import Probe, Registry, Service
 from deployer.rollback import ROLLBACK_TAGS_KEPT
 from deployer.rt import RtError, Ticket
 from deployer.runner import (
+    OUTCOMES,
     OUTCOME_COULD_NOT_RUN,
     OUTCOME_OK,
     OUTCOME_REFUSED,
@@ -679,3 +681,81 @@ async def test_a_dry_run_still_reports_a_unit_it_would_refuse(tmp_path: Path) ->
     report = await world.drain()
     assert report.outcome == OUTCOME_REFUSED
     assert "pulls on start" in report.detail
+
+
+# ------------------------------------------------- already running the commit
+
+
+async def test_a_revision_already_live_is_finished_without_a_restart(tmp_path: Path) -> None:
+    # The path a ticket takes when the deploy landed and RT could not be told.
+    # Restarting a healthy service to arrive where it already is would be a
+    # production restart in exchange for nothing.
+    world = World(tmp_path, ticket())
+    world.podman.running = CANDIDATE_ID
+    report = await world.drain()
+    assert report.outcome == OUTCOME_OK
+    assert "already live" in report.detail
+    assert world.systemd.restarts == []
+    assert world.nagios.opened == []
+    assert world.rt.status() == ["resolved"]
+    assert world.rt.said("Already deployed.")
+
+
+async def test_a_revision_already_live_clears_its_hold(tmp_path: Path) -> None:
+    world = World(tmp_path, ticket())
+    world.podman.running = CANDIDATE_ID
+    world.holds.place(Hold(unit=UNIT, service="acquacotta", ticket=1600, revision=OTHER, at=NOW))
+    await world.drain()
+    assert not world.holds.held(UNIT)
+
+
+async def test_a_revision_already_live_but_unhealthy_is_refused_not_restarted(tmp_path: Path) -> None:
+    # Running the right revision and not answering is a person's problem. A
+    # robot that restarted to fix it would be guessing.
+    world = World(tmp_path, ticket())
+    world.podman.running = CANDIDATE_ID
+    world.broken = {CANDIDATE_ID}
+    report = await world.drain()
+    assert report.outcome == OUTCOME_REFUSED
+    assert world.systemd.restarts == []
+    assert world.rt.said("will not restart a service that is already on the right revision")
+    assert not world.holds.held(UNIT)
+
+
+# ----------------------------------------------------------- the exit codes
+
+
+def test_every_outcome_a_run_can_produce_has_an_exit_code() -> None:
+    # A new outcome without a row here would be a KeyError at the end of a
+    # real run, after the work was done.
+    assert set(EXIT_FOR_OUTCOME) == set(OUTCOMES)
+
+
+@pytest.mark.parametrize(
+    ("outcome", "code"),
+    [
+        (OUTCOME_OK, EXIT_OK),
+        (OUTCOME_REFUSED, EXIT_ERROR),
+        (OUTCOME_ROLLED_BACK, EXIT_ERROR),
+        (OUTCOME_ROLLBACK_FAILED, EXIT_ERROR),
+        (OUTCOME_COULD_NOT_RUN, EXIT_COULD_NOT_RUN),
+    ],
+)
+def test_the_exit_codes_follow_the_profile(outcome: str, code: int) -> None:
+    assert EXIT_FOR_OUTCOME[outcome] == code
+
+
+async def test_a_clean_rollback_still_exits_nonzero(tmp_path: Path) -> None:
+    # It leaves a held service and a stalled ticket. A unit that exited 0 with
+    # a service held would be reporting success for a state nobody has dealt
+    # with, and the wake-up it costs is per failure rather than per minute.
+    world = World(tmp_path, ticket())
+    world.broken = {CANDIDATE_ID}
+    report = await world.drain()
+    assert EXIT_FOR_OUTCOME[report.outcome] == EXIT_ERROR
+
+
+async def test_a_verified_deploy_exits_zero(tmp_path: Path) -> None:
+    world = World(tmp_path, ticket())
+    report = await world.drain()
+    assert EXIT_FOR_OUTCOME[report.outcome] == EXIT_OK

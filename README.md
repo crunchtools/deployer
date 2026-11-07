@@ -143,13 +143,25 @@ whatever happened to be there. A missing variable is exit 2, "could not run".
 
 | Code | Meaning |
 |---|---|
-| 0 | the verb did what it was asked — **including** a deploy that failed and was rolled back cleanly, and including a second run standing down because one is already going |
-| 1 | a service needs a person: a rollback that did not come back |
+| 0 | success: nothing to do, a verified deploy, a ticket waiting for its build, or a second run standing down because one is already going |
+| 1 | drained, but something is waiting for a person: a refused ticket, a deploy that was rolled back, or a rollback that did not come back |
 | 2 | could not run: a missing path, an unloadable registry, an unreachable RT, or the auto-update hold guard being absent |
 
-A rollback is a *success* of this program. The unit that starts it is a oneshot
-whose failure wakes a model, and waking one to be told what the ticket already
-says would be the expensive way to learn nothing.
+A clean rollback is exit 1 on purpose. It leaves a held service and a stalled
+ticket, and a unit that exited 0 with a service held would be reporting success
+for a state nobody has dealt with. The wake-up that costs is per failure, not
+per minute, which is the shape the whole design is built around.
+
+## Deploying twice is not deploying twice
+
+If the container is already running the commit the ticket names, nothing is
+restarted. The run verifies what is there and finishes the ticket.
+
+That matters more than it sounds. The expensive failure is a deploy that
+verified and then could not be written back to RT: the ticket stays open, comes
+round again two minutes later, and without this would restart a healthy service
+to arrive exactly where it already was. It also covers the case where something
+else — an auto-update, a person — put that image live first.
 
 ## Licence
 

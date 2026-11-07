@@ -303,6 +303,8 @@ class Runner:
 
         age = max(0, int(self.now() - ticket.created))
         verdict = classify_revision(staged.candidate_revision, request.commit, age, service)
+        if verdict is Verdict.MATCH and staged.outgoing_image_id == staged.candidate_image_id:
+            return await self._already_live(ticket, request, service, staged)
         if verdict is Verdict.WAITING:
             return await self._waiting(ticket, request, service, age)
         if verdict is Verdict.STALE:
@@ -331,6 +333,50 @@ class Runner:
             OUTCOME_OK,
             f"t{ticket.id} would deploy {service.name} {request.short_commit} to {service.unit}",
         )
+
+    async def _already_live(
+        self, ticket: Ticket, request: Request, service: Service, staged: Staged
+    ) -> TicketResult:
+        """The container is already running the candidate. Change nothing.
+
+        Two ways to arrive here. The ordinary one: a previous run deployed this
+        revision and verified it, and then RT could not be told -- the comment
+        or the status change failed, so the ticket is still open and comes
+        round again. The other: something else put that image live, which on a
+        fleet where `:latest` moves on a timer is not rare.
+
+        Either way the service is already where the ticket asks it to be, and
+        restarting it to arrive where it already is would be a production
+        restart in exchange for nothing. So this verifies and finishes the
+        ticket. It is what makes a deploy idempotent, and therefore what makes
+        an RT failure after a good deploy recoverable rather than something
+        that restarts a healthy service on the next run.
+        """
+        outcome = await verify(self.host, service, staged.candidate_image_id)
+        await self._untag_candidate(staged)
+        if outcome.failed:
+            # Running the right revision and unhealthy is not something to fix
+            # by restarting. A person decides that.
+            return await self._refuse(
+                ticket,
+                f"{service.unit} is already running {request.short_commit}, and it is not healthy: "
+                f"{outcome.reason or outcome.probe_detail}. Nothing was changed; this deployer "
+                "will not restart a service that is already on the right revision.",
+            )
+
+        cleared = self.holds.clear(service.unit)
+        await self.clients.rt.comment(
+            ticket.id,
+            f"Already deployed. {service.unit} was already running {request.short_commit} "
+            f"(image {staged.candidate_image_id[:19]}) when this ticket came round, and it "
+            f"verified: the unit is active, the container is running that exact image, and "
+            f"{service.probe.url} answered for {service.settle}s. Nothing was restarted.\n"
+            "If you expected a deploy here, the likeliest explanation is that an earlier run "
+            "deployed it and could not reach RT to say so."
+            + ("\nThe hold on this service is cleared." if cleared else ""),
+        )
+        await self.clients.rt.set_fields(ticket.id, status="resolved")
+        return TicketResult(OUTCOME_OK, f"{service.name} {request.short_commit} already live")
 
     async def _waiting(self, ticket: Ticket, request: Request, service: Service, age: int) -> TicketResult:
         """The image for this commit is not pushed yet, and the build has time left.

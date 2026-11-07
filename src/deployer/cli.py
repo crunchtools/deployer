@@ -22,13 +22,16 @@ deployment, not of this program, so both come from the environment
 is no built-in path: a missing one exits 2 -- "could not run" -- rather than
 guessing at a location and reporting on whatever happens to be there.
 
-**Exit codes.** ``0`` means the verb did what it was asked, including a deploy
-that failed and was rolled back cleanly -- the rollback is a success of this
-program, and a oneshot unit going ``failed`` for it would wake a model to be
-told something the ticket already says. ``1`` is kept for a service that needs
-a person: a rollback that did not come back. ``2`` is "could not run" and
-covers a missing path, an unloadable registry, an unreachable RT, and the
-auto-update hold guard being absent.
+**Exit codes**, as the CLI Tool profile sets them. ``0`` is success: nothing to
+do, a verified deploy, or a ticket waiting for its build. ``1`` is a failure
+with something actionable behind it -- a refused ticket, a deploy that was
+rolled back, or a rollback that did not come back. A clean rollback is exit 1
+on purpose: it leaves a held service and a stalled ticket, and a unit that
+exited 0 with a service held would be reporting success for a state nobody has
+dealt with. The cost of the resulting wake-up is per failure, not per minute,
+which is the shape the whole design is built around. ``2`` is "could not run":
+a missing path, an unloadable registry, an unreachable RT, or the auto-update
+hold guard being absent.
 """
 
 from __future__ import annotations
@@ -39,12 +42,13 @@ import os
 import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Final
 
 import httpx
 
 from . import __version__
 from .attempts import AttemptLog
-from .hold import HoldStore, MissingGuardError
+from .hold import Hold, HoldStore, MissingGuardError, require_guard
 from .nagios import NagiosCommands, NagiosCredentials, NagiosError, write_status
 from .lock import AlreadyRunning, only_one
 from .podman import PodmanError, PodmanImages
@@ -53,7 +57,10 @@ from .rollback import RollbackError, roll_back
 from .rt import RtClient, RtCredentials, RtError
 from .runner import (
     OUTCOME_COULD_NOT_RUN,
+    OUTCOME_OK,
+    OUTCOME_REFUSED,
     OUTCOME_ROLLBACK_FAILED,
+    OUTCOME_ROLLED_BACK,
     Clients,
     RunReport,
     Runner,
@@ -72,6 +79,21 @@ CONFIG_ENV = "DEPLOYER_CONFIG"
 STATE_ENV = "DEPLOYER_STATE"
 QUEUE_ENV = "DEPLOYER_QUEUE"
 STATUS_FILE_NAME = "deployer.status"
+
+#: What a run exits with, as the CLI Tool profile sets the codes. A table
+#: rather than a chain of conditions, so the contract can be read in one place
+#: and a test can check it covers every outcome a run can produce.
+EXIT_FOR_OUTCOME: Final[dict[str, int]] = {
+    OUTCOME_OK: EXIT_OK,
+    OUTCOME_COULD_NOT_RUN: EXIT_COULD_NOT_RUN,
+    # Drained, but something is waiting for a person. A clean rollback is here
+    # on purpose: it leaves a held service and a stalled ticket, and a unit
+    # that exited 0 with a service held would be reporting success for a state
+    # nobody has dealt with.
+    OUTCOME_REFUSED: EXIT_ERROR,
+    OUTCOME_ROLLED_BACK: EXIT_ERROR,
+    OUTCOME_ROLLBACK_FAILED: EXIT_ERROR,
+}
 
 #: Everything that means "this program could not do its job", as opposed to "it
 #: did its job and the deploy was bad". Caught in one place so every verb
@@ -153,7 +175,7 @@ async def _dispatch(args: argparse.Namespace, registry: Registry, env: Mapping[s
     if args.verb == "unhold":
         return _unhold(registry, Path(args.state), args.service, dry_run=args.dry_run)
     if args.verb == "rollback":
-        return await _rollback(registry, args.service, env, dry_run=args.dry_run)
+        return await _rollback(registry, args.service, Path(args.state), dry_run=args.dry_run)
     return await _run(args, registry, env)
 
 
@@ -217,11 +239,13 @@ def _unhold(registry: Registry, state: Path, name: str, dry_run: bool) -> int:
     return EXIT_OK
 
 
-async def _rollback(registry: Registry, name: str, env: Mapping[str, str], dry_run: bool) -> int:
+async def _rollback(registry: Registry, name: str, state: Path, dry_run: bool) -> int:
     """Put a service back on its newest rollback image, by hand.
 
-    No ticket, no Nagios window and no hold: this is a person doing it on
-    purpose, and the window and the hold exist to manage a robot's decisions.
+    No ticket and no Nagios window -- a person doing this on purpose will open
+    their own window if they want one. A hold, though, yes: `:latest` still
+    carries the image being rolled away from, so without one the next
+    auto-update puts it straight back.
     """
     try:
         service = registry.get(name)
@@ -244,9 +268,14 @@ async def _rollback(registry: Registry, name: str, env: Mapping[str, str], dry_r
 
     try:
         async with PodmanImages() as podman, SystemdUnits(_units(registry)) as systemd:
+            # The guard matters here for the same reason it matters on a run.
+            # This rollback puts an older image live while `:latest` still
+            # carries the newer, broken one, so unless a hold is honoured the
+            # broken image comes back at the next podman auto-update.
+            await require_guard(systemd)
             staged = await _newest_rollback(podman, service)
             if dry_run:
-                print(f"would put {service.unit} back on {staged.rollback_tag}")
+                print(f"would put {service.unit} back on {staged.rollback_tag} and hold it")
                 return EXIT_OK
             async with httpx.AsyncClient() as probes:
                 host = Host(systemd=systemd, podman=podman, client=probes)
@@ -255,13 +284,26 @@ async def _rollback(registry: Registry, name: str, env: Mapping[str, str], dry_r
         print(f"deployer: {exc}", file=sys.stderr)
         return EXIT_COULD_NOT_RUN
 
+    # Ticket 0 means "no ticket -- a person did this by hand".
+    HoldStore(state).place(
+        Hold(
+            unit=service.unit,
+            service=service.name,
+            ticket=0,
+            revision=staged.outgoing_revision or staged.outgoing_image_id,
+        )
+    )
+
     if restored.needs_a_person:
         print(
             f"deployer: {service.unit} did not come back on {staged.rollback_tag}: {restored.reason}",
             file=sys.stderr,
         )
         return EXIT_ERROR
-    print(f"{service.unit} is back on {staged.rollback_tag} and verified")
+    print(
+        f"{service.unit} is back on {staged.rollback_tag} and verified, and is now held. "
+        f"podman auto-update will skip it until `deployer unhold {service.name}`."
+    )
     return EXIT_OK
 
 
@@ -290,7 +332,7 @@ async def _run(args: argparse.Namespace, registry: Registry, env: Mapping[str, s
 
     write_status(status, report.outcome, report.detail, holds=list(HoldStore(state)))
     print(f"{report.outcome}: {report.detail} ({report.tickets} ticket(s))")
-    return EXIT_ERROR if report.outcome == OUTCOME_ROLLBACK_FAILED else EXIT_OK
+    return EXIT_FOR_OUTCOME[report.outcome]
 
 
 async def _drain(
