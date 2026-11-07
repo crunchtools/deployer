@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-07
+
 ### Fixed
 - **`restart` now waits for the unit to come back.** `RestartUnit` over D-Bus
   *queues a job and returns*. Verification ran immediately afterwards, read
