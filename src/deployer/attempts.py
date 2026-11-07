@@ -107,6 +107,28 @@ class AttemptLog:
         """Whether ``service`` has been rolled back too often to keep trying."""
         return self.recent_rollbacks(service, within) >= limit
 
+    def forgive(self, service: str, revision: str) -> bool:
+        """Let ``revision`` be deployed to ``service`` again. Returns whether it
+        had been recorded.
+
+        What ``deployer unhold`` calls for the revision its hold names. The
+        rule that a rolled-back revision is never retried stays -- nothing
+        AUTOMATIC retries one -- but a rollback is not always the revision's
+        fault: the deployer has had a bug that reported a healthy service as
+        down, and an environment can fail a probe for its own reasons. Without
+        this, a good commit would be condemned for ever by a bad afternoon, and
+        the only way back would be editing the state directory by hand.
+
+        It takes a person who has looked: the hold file names the revision, so
+        whoever clears the hold can see exactly what they are forgiving.
+        """
+        path = self._revision_path(service, revision)
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return False
+        return True
+
     def forget_rollbacks(self, service: str) -> int:
         """Drop ``service``'s rollbacks from the log. Returns how many went.
 

@@ -103,39 +103,120 @@ async def test_hold_guard_and_property_are_in_the_declared_surface() -> None:
 
 
 class FakeBus:
-    """A stand-in for dbus-fast's MessageBus, recording the calls made."""
+    """A stand-in for dbus-fast's MessageBus, recording the calls made.
 
-    def __init__(self, reply: Any = "ok", error: bool = False, none: bool = False) -> None:
+    It models the one thing about systemd that matters here: ``RestartUnit``
+    queues a job and returns, and the unit's ``ActiveEnterTimestamp`` only
+    moves once the restart has actually happened. ``comes_back`` says whether
+    it ever does.
+    """
+
+    def __init__(self, reply: Any = "ok", *, error: bool = False, none: bool = False) -> None:
         self.calls: list[tuple[str, list[Any]]] = []
         self._reply = reply
         self._error = error
         self._none = none
+        #: Set by the tests that care. `comes_back` is whether the queued job
+        #: ever runs; `ends` is the state it leaves the unit in when it does;
+        #: `stuck_at` is the state while it has not; `error_on` fails one member.
+        self.comes_back = True
+        self.ends = "active"
+        self.stuck_at = "deactivating"
+        self.error_on: str | None = None
+        self.properties: dict[str, Any] = {
+            "ActiveState": "active",
+            "SubState": "running",
+            "Result": "success",
+            "ActiveEnterTimestamp": 1_000_000,
+        }
 
     async def call(self, message: Any) -> Any:
         self.calls.append((message.member, list(message.body)))
         if self._none:
             return None
-        if self._error:
+        if self._error or message.member == self.error_on:
             return SimpleNamespace(message_type=MessageType.ERROR, body=["boom"])
         # LoadUnit must answer with a valid object path: dbus-fast validates it
         # when the next Message is built, so a stub value fails there instead
         # of in the code under test.
-        body = ["/org/freedesktop/systemd1/unit/stub"] if message.member == "LoadUnit" else [self._reply]
+        if message.member == "LoadUnit":
+            body: list[Any] = ["/org/freedesktop/systemd1/unit/stub"]
+        elif message.member == "Get":
+            _interface, name = message.body
+            body = [self.properties.get(name, self._reply)]
+        else:
+            if message.member == "RestartUnit" and self.comes_back:
+                # What systemd does once the job has actually run.
+                self.properties["ActiveState"] = self.ends
+                self.properties["ActiveEnterTimestamp"] += 5_000_000
+                if self.ends == "failed":
+                    self.properties["Result"] = "exit-code"
+            elif message.member == "RestartUnit":
+                # The job was queued and nothing has happened yet. By default
+                # the old instance is stopping, which is the state a real
+                # deploy read and called a failure.
+                self.properties["ActiveState"] = self.stuck_at
+            body = [self._reply]
         return SimpleNamespace(message_type=MessageType.METHOD_RETURN, body=body)
 
     def disconnect(self) -> None:
         return None
 
 
+async def no_wait(_seconds: float) -> None:
+    """A sleep that does not, so a 120-second timeout takes no time."""
+    return None
+
+
 def connected(bus: FakeBus, allowed: set[str] | None = None) -> SystemdUnits:
     """A client with a recording bus, passed in rather than patched over."""
-    return SystemdUnits(allowed_units=allowed if allowed is not None else {IN_SCOPE}, bus=bus)
+    return SystemdUnits(allowed_units=allowed if allowed is not None else {IN_SCOPE}, bus=bus, sleep=no_wait)
 
 
 async def test_restart_sends_restartunit_with_replace() -> None:
     bus = FakeBus()
     await connected(bus).restart(IN_SCOPE)
-    assert bus.calls == [("RestartUnit", [IN_SCOPE, "replace"])]
+    assert ("RestartUnit", [IN_SCOPE, "replace"]) in bus.calls
+
+
+async def test_restart_waits_for_the_unit_to_come_back() -> None:
+    # RestartUnit queues a job and returns. Verifying immediately read
+    # ActiveState as `deactivating` -- the old container still stopping -- and
+    # failed on the first sample, then the rollback did the same, so a healthy
+    # service was reported as "down, needs a person". Every deploy would have.
+    bus = FakeBus()
+    await connected(bus).restart(IN_SCOPE)
+    members = [member for member, _body in bus.calls]
+    # It read the timestamp before, restarted, and read the state after.
+    assert members.index("RestartUnit") > 0
+    assert "Get" in members[members.index("RestartUnit") + 1 :]
+
+
+async def test_a_restart_that_never_comes_back_raises() -> None:
+    # Better than verifying as if it had finished: a deploy that cannot be
+    # told to have completed must not be called verified.
+    bus = FakeBus()
+    bus.comes_back = False
+    with pytest.raises(SystemdError, match="was still deactivating"):
+        await connected(bus).restart(IN_SCOPE)
+
+
+async def test_a_restart_that_ends_failed_raises_at_once() -> None:
+    bus = FakeBus()
+    bus.ends = "failed"
+    with pytest.raises(SystemdError, match="failed to restart"):
+        await connected(bus).restart(IN_SCOPE)
+
+
+async def test_an_unchanged_activation_timestamp_is_not_a_restart() -> None:
+    # The old instance is still `active` in the moment between the job being
+    # queued and the stop beginning, so "it is active" is not proof. A newer
+    # ActiveEnterTimestamp is.
+    bus = FakeBus()
+    bus.comes_back = False
+    bus.stuck_at = "active"
+    with pytest.raises(SystemdError, match="was still active"):
+        await connected(bus).restart(IN_SCOPE)
 
 
 async def test_start_sends_startunit_with_replace() -> None:
@@ -145,7 +226,16 @@ async def test_start_sends_startunit_with_replace() -> None:
 
 
 async def test_an_error_reply_to_a_call_raises() -> None:
+    # Errors on the method call itself. The first call a restart makes is now
+    # LoadUnit, because it reads the activation timestamp before restarting.
+    bus = FakeBus()
+    bus.error_on = "RestartUnit"
     with pytest.raises(SystemdError, match="RestartUnit failed"):
+        await connected(bus).restart(IN_SCOPE)
+
+
+async def test_an_error_reading_the_state_before_a_restart_raises() -> None:
+    with pytest.raises(SystemdError, match="failed"):
         await connected(FakeBus(error=True)).restart(IN_SCOPE)
 
 
