@@ -157,11 +157,17 @@ class FakePodman:
         self.log_text = "ValueError: no database\n"
         self.fail_tag_on: str | None = None
         self.fail_inspect = False
+        self.fail_untag = False
+        self.fail_list_images = False
+        #: A Config.Env shape this cannot read, to exercise failing closed.
+        self.broken_env = False
         self.env: tuple[str, ...] = ()
 
     async def inspect_container(self, name: str) -> dict[str, Any]:
         if self.fail_inspect:
             raise PodmanError("no such container")
+        if self.broken_env:
+            return {"Image": self.running, "Config": {"Env": "PATH=/x"}}
         return {"Image": self.running, "Config": {"Env": list(self.env)}}
 
     async def inspect_image(self, name: str) -> ImageRef:
@@ -192,6 +198,8 @@ class FakePodman:
         self.by_ref[reference] = self.by_ref.get(name, name)
 
     async def untag(self, name: str, reference: str) -> None:
+        if self.fail_untag:
+            raise PodmanError("the tag will not go")
         self.untagged.append((name, reference))
         self.by_ref.pop(reference, None)
 
@@ -199,6 +207,8 @@ class FakePodman:
         self.removed.append(name)
 
     async def list_images(self, reference: str | None = None) -> tuple[ImageRef, ...]:
+        if self.fail_list_images:
+            raise PodmanError("the image store is unreadable")
         return self.rollback_images
 
     async def logs(self, name: str, tail: int = 40) -> str:
@@ -973,3 +983,51 @@ async def test_a_rollback_that_raises_is_a_person_not_a_crash(tmp_path: Path) ->
     assert world.holds.held(UNIT)
     assert world.rt.said("THE ROLLBACK DID NOT COME BACK")
     assert world.rt.said("systemd went away mid-rollback")
+
+
+async def test_an_env_shape_that_cannot_be_read_stops_publication(tmp_path: Path) -> None:
+    # The inspect succeeded, so the PodmanError branch does not fire; it is the
+    # SHAPE that is unreadable. Publishing anyway would be failing open on the
+    # one path where failing open means leaking.
+    world = World(tmp_path)
+    world.podman.broken_env = True
+    world.podman.log_text = "secret-looking thing\n"
+    tail = await world.runner._log_tail(SERVICE)
+    assert "secret-looking thing" not in tail
+    assert "Config.Env is str, not a list" in tail
+
+
+async def test_a_tail_that_cannot_be_kept_on_the_host_says_so(tmp_path: Path) -> None:
+    # The note matters because the ticket's redacted copy is then the only
+    # record, and a reader should know that rather than assume the path works.
+    world = World(tmp_path)
+    (tmp_path / "failures").write_text("not a directory", encoding="utf-8")
+    tail = await world.runner._log_tail(SERVICE)
+    assert "could not be kept on the host" in tail
+
+
+async def test_cleanup_failures_reach_the_ticket_rather_than_vanishing(tmp_path: Path) -> None:
+    # None of these should fail a verified deploy, and none should disappear
+    # either: a docstring once claimed they went in the status file and
+    # nothing put them there.
+    world = World(tmp_path, ticket())
+    world.nagios.fail_cancel = True
+    world.podman.fail_untag = True
+    world.podman.fail_list_images = True
+    report = await world.drain()
+    assert report.outcome == OUTCOME_OK
+    assert world.rt.status() == ["open", "resolved"]
+    assert world.rt.said("could not be cancelled")
+    assert world.rt.said("could not be removed")
+    assert world.rt.said("could not be rotated")
+
+
+async def test_cleanup_failures_reach_the_ticket_on_a_rollback_too(tmp_path: Path) -> None:
+    world = World(tmp_path, ticket())
+    world.broken = {CANDIDATE_ID}
+    world.nagios.fail_cancel = True
+    world.podman.fail_untag = True
+    report = await world.drain()
+    assert report.outcome == OUTCOME_ROLLED_BACK
+    assert world.rt.said("could not be cancelled")
+    assert world.rt.said("could not be removed")
