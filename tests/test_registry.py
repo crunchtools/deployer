@@ -13,6 +13,7 @@ import pytest
 
 from deployer.registry import (
     DEFAULT_BUILD_DEADLINE_SECONDS,
+    DEFAULT_READY_SECONDS,
     DEFAULT_SETTLE_SECONDS,
     RegistryError,
     load_registry,
@@ -22,6 +23,7 @@ from deployer.registry import (
 # facts the fixture asserts, not incidental literals.
 EXPECTED_ROWS = 2
 PCLOUD_SETTLE = 90
+PCLOUD_READY = 20
 
 GOOD = """
 [service."acquacotta.crunchtools.com"]
@@ -39,6 +41,7 @@ unit = "mcp-pcloud.crunchtools.com.service"
 nagios_host = "ctr-mcp-pcloud.crunchtools.com"
 requestors = ["developer1"]
 settle = 90
+ready = 20
 build_deadline = 1800
 rollback = "manual"
 probe = { kind = "mcp", url = "http://127.0.0.1:8021/mcp" }
@@ -60,6 +63,7 @@ def test_a_good_registry_loads_both_rows(tmp_path: Path) -> None:
 def test_defaults_apply_where_a_row_is_silent(tmp_path: Path) -> None:
     svc = load_registry(write(tmp_path, GOOD)).get("acquacotta.crunchtools.com")
     assert svc.settle == DEFAULT_SETTLE_SECONDS
+    assert svc.ready == DEFAULT_READY_SECONDS
     assert svc.build_deadline == DEFAULT_BUILD_DEADLINE_SECONDS
     assert svc.rolls_back_automatically is True
     assert svc.probe.expect_body is None
@@ -68,6 +72,7 @@ def test_defaults_apply_where_a_row_is_silent(tmp_path: Path) -> None:
 def test_explicit_values_win_and_manual_rollback_is_honoured(tmp_path: Path) -> None:
     svc = load_registry(write(tmp_path, GOOD)).get("mcp-pcloud.crunchtools.com")
     assert svc.settle == PCLOUD_SETTLE
+    assert svc.ready == PCLOUD_READY
     assert svc.rolls_back_automatically is False
     assert svc.probe.kind == "mcp"
 
@@ -171,3 +176,9 @@ def test_an_empty_registry_is_refused(tmp_path: Path) -> None:
 def test_a_stray_top_level_table_is_refused(tmp_path: Path) -> None:
     with pytest.raises(RegistryError, match="unknown key 'defaults'"):
         load_registry(write(tmp_path, GOOD + "\n[defaults]\nsettle = 10\n"))
+
+
+@pytest.mark.parametrize("value", ["0", "-5", '"30"', "1.5"])
+def test_ready_must_be_a_positive_integer(tmp_path: Path, value: str) -> None:
+    with pytest.raises(RegistryError, match="ready must be a positive integer"):
+        load_registry(write(tmp_path, GOOD.replace("ready = 20", f"ready = {value}")))

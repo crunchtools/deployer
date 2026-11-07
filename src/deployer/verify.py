@@ -16,6 +16,21 @@ The window matters as much as the checks. A service that answers once and then
 falls over thirty seconds later has not deployed; it has failed slowly. So the
 probe is sampled repeatedly and a single bad answer ends it, rather than
 polling until something passes.
+
+But that is two questions, not one, and running them together made every
+service here undeployable. *Has it come up yet* is answered by waiting, with
+retries, up to ``ready``. *Having come up, does it stay up* is answered by
+sampling, with the first failure fatal, for ``settle``. A container unit is
+``active`` the moment conmon reports the process started, which is several
+seconds before the process inside is listening, so a settle window that began
+at the restart spent its first sample in that gap and called a healthy deploy
+broken. Measured on the first real ticket: mcp-pcloud went from "open" to
+"rolled back, needs a person" in twelve seconds, with a settle of thirty, on a
+service that was fine.
+
+The two checks the host can answer without waiting -- is the unit active, is
+the right image running -- stay fatal in both phases. Only the probe is given
+time, because only the probe is asking something that has to finish starting.
 """
 
 from __future__ import annotations
@@ -167,13 +182,78 @@ async def probe_once(probe: Probe, client: httpx.AsyncClient | None = None) -> P
     return ProbeResult(ok=True, detail=f"{probe.url}: {response.status_code}")
 
 
-async def verify(host: Host, service: Service, candidate_image_id: str) -> Outcome:
-    """Hold the three checks for ``service.settle`` seconds.
+async def _host_facts(host: Host, service: Service, candidate_image_id: str) -> Outcome | None:
+    """The two checks that need no waiting, or ``None`` if both pass.
 
-    The first failure returns; there is no retrying, because a check that
-    retried until something passed would be measuring patience rather than
-    health.
+    Neither answer improves by being asked again. The unit was already seen
+    active by the restart, so an inactive one now is a service that started and
+    stopped; and a container running an image nobody staged is running it as
+    firmly in sixty seconds as it is today. So these are fatal in the readiness
+    phase as well, and only the probe is given time.
     """
+    state = await host.systemd.state(service.unit)
+    if not state.is_active:
+        return Outcome(ok=False, reason=f"{service.unit} is {state.active_state}, not active")
+    if state.failed:
+        return Outcome(ok=False, reason=f"{service.unit} reports result {state.result!r}")
+
+    running = await host.podman.inspect_container(service.container)
+    running_image = str(running.get("Image") or "")
+    if running_image != candidate_image_id:
+        # The deploy "succeeded" onto something other than what was staged.
+        return Outcome(
+            ok=False,
+            reason=(
+                f"{service.container} is running {running_image or 'nothing'}, "
+                f"not the candidate {candidate_image_id}"
+            ),
+            ran_something_else=True,
+        )
+    return None
+
+
+async def _wait_until_ready(host: Host, service: Service, candidate_image_id: str) -> Outcome:
+    """Wait up to ``service.ready`` for the probe to answer once.
+
+    Retrying is the point here, and it is not the same thing as retrying until
+    something passes: the window is bounded, it is spent before the settle
+    window rather than inside it, and the two host facts above still end it
+    immediately. A service that never answers inside ``ready`` has not started.
+    """
+    waited = 0.0
+    while True:
+        fatal = await _host_facts(host, service, candidate_image_id)
+        if fatal is not None:
+            return fatal
+
+        result = await probe_once(service.probe, host.client)
+        if result.ok:
+            return Outcome(ok=True, probe_detail=result.detail)
+
+        if waited >= service.ready:
+            return Outcome(
+                ok=False,
+                reason=f"health probe never answered within {service.ready}s of the restart",
+                probe_detail=result.detail,
+            )
+
+        wait = min(SAMPLE_INTERVAL_SECONDS, service.ready - waited)
+        await host.sleep(wait)
+        waited += wait
+
+
+async def verify(host: Host, service: Service, candidate_image_id: str) -> Outcome:
+    """Wait up to ``service.ready`` for the service, then hold it for ``settle``.
+
+    Inside the settle window the first failure returns; there is no retrying,
+    because a check that retried until something passed would be measuring
+    patience rather than health. Before that window there is nothing to measure
+    yet -- see the module docstring.
+    """
+    ready = await _wait_until_ready(host, service, candidate_image_id)
+    if ready.failed:
+        return ready
+
     # Elapsed time, not a sample count. Counting samples under-covers any
     # settle that is not a multiple of the interval: settle=9 gave two samples
     # and one five-second wait, and reported success after five seconds. Here
@@ -182,24 +262,9 @@ async def verify(host: Host, service: Service, candidate_image_id: str) -> Outco
     elapsed = 0.0
 
     while True:
-        state = await host.systemd.state(service.unit)
-        if not state.is_active:
-            return Outcome(ok=False, reason=f"{service.unit} is {state.active_state}, not active")
-        if state.failed:
-            return Outcome(ok=False, reason=f"{service.unit} reports result {state.result!r}")
-
-        running = await host.podman.inspect_container(service.container)
-        running_image = str(running.get("Image") or "")
-        if running_image != candidate_image_id:
-            # The deploy "succeeded" onto something other than what was staged.
-            return Outcome(
-                ok=False,
-                reason=(
-                    f"{service.container} is running {running_image or 'nothing'}, "
-                    f"not the candidate {candidate_image_id}"
-                ),
-                ran_something_else=True,
-            )
+        fatal = await _host_facts(host, service, candidate_image_id)
+        if fatal is not None:
+            return fatal
 
         result = await probe_once(service.probe, host.client)
         if not result.ok:

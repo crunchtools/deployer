@@ -1,8 +1,12 @@
 """Verification tests.
 
-The two that earn their place: a restart that came back on the *old* image must
-fail, and a probe that answers once and then stops must fail. Both would pass a
-naive "is it up?" check, and both are real deploys that did not happen.
+The three that earn their place: a restart that came back on the *old* image
+must fail, a probe that answers once and then stops must fail, and a probe that
+is refused for the first few seconds and then answers must SUCCEED. The first
+two would pass a naive "is it up?" check and are real deploys that did not
+happen. The third is the opposite mistake and the one that shipped: every
+service here was undeployable because the settle window began at the restart,
+and a container unit is active seconds before the process inside it listens.
 """
 
 from __future__ import annotations
@@ -19,8 +23,10 @@ from deployer.verify import SAMPLE_INTERVAL_SECONDS, Host, probe_once, verify
 CANDIDATE = "sha256:candidate"
 OLD = "sha256:old"
 SETTLE = 60
-# One at t=0 plus one per interval, so the end of the window is covered too.
-SAMPLES = int(SETTLE // SAMPLE_INTERVAL_SECONDS) + 1
+READY = 60
+# One at t=0 plus one per interval, so the end of the window is covered too,
+# plus the single readiness check a healthy service passes on its first try.
+SAMPLES = int(SETTLE // SAMPLE_INTERVAL_SECONDS) + 2
 
 
 def service(**over: Any) -> Service:
@@ -33,6 +39,7 @@ def service(**over: Any) -> Service:
         "nagios_host": "ctr-acquacotta.crunchtools.com",
         "requestors": ("developer1",),
         "settle": SETTLE,
+        "ready": READY,
     }
     return Service(**{**base, **over})
 
@@ -59,6 +66,24 @@ class FakePodman:
 
 async def nosleep(_seconds: float) -> None:
     return None
+
+
+def refusing_then(refusals: int, status: int) -> httpx.AsyncClient:
+    """A client that refuses the connection ``refusals`` times, then answers.
+
+    Connection refused rather than a 503, because that is what the host
+    actually does between conmon reporting the process started and the process
+    binding its port: there is nothing listening to return a status at all.
+    """
+    left = [refusals]
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        if left[0] > 0:
+            left[0] -= 1
+            raise httpx.ConnectError("connection refused")
+        return httpx.Response(status, text='{"result":{}}')
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
 
 def responder(*statuses: int) -> httpx.AsyncClient:
@@ -128,10 +153,10 @@ async def test_a_probe_that_passes_then_fails_inside_the_window_fails() -> None:
 @pytest.mark.parametrize(
     ("settle", "expected_samples"),
     [
-        (1, 2),  # shorter than one interval: start, then the 1s remainder
-        (5, 2),  # exactly one interval
-        (9, 3),  # NOT a multiple: start, +5, +4 -- the remainder is still waited
-        (60, 13),
+        (1, 3),  # shorter than one interval: ready, start, then the 1s remainder
+        (5, 3),  # exactly one interval
+        (9, 4),  # NOT a multiple: start, +5, +4 -- the remainder is still waited
+        (60, 14),
     ],
 )
 async def test_the_whole_settle_window_is_covered(settle: int, expected_samples: int) -> None:
@@ -235,3 +260,68 @@ async def test_an_mcp_probe_rejects_json_without_the_jsonrpc_marker() -> None:
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(plain)) as client:
         assert not (await probe_once(Probe(kind="mcp", url="http://x/mcp"), client)).ok
+
+
+async def test_a_probe_refused_at_first_and_then_answering_deploys() -> None:
+    """The bug that shipped, and the reason this phase exists.
+
+    mcp-pcloud's unit went active the moment conmon reported the process
+    started; uvicorn bound its port a couple of seconds later. The old settle
+    window spent its first sample in that gap, so the first real ticket this
+    deployer ever ran went from open to "rolled back, needs a person" in twelve
+    seconds -- against a service that was perfectly healthy.
+    """
+    systemd = FakeSystemd()
+    # Refused, refused, then answering, and answering for the whole window.
+    async with refusing_then(2, 200) as client:
+        outcome = await verify(Host(systemd, FakePodman(), nosleep, client), service(), CANDIDATE)
+    assert outcome.ok
+
+
+async def test_a_probe_that_never_answers_fails_naming_the_window() -> None:
+    # Bounded: "wait for it" is not "wait forever", and the message says which
+    # window ran out so the next person does not have to guess.
+    waits: list[float] = []
+
+    async def record(seconds: float) -> None:
+        waits.append(seconds)
+
+    async with refusing_then(10_000, 200) as client:
+        outcome = await verify(
+            Host(FakeSystemd(), FakePodman(), record, client), service(ready=20), CANDIDATE
+        )
+    assert outcome.failed
+    assert "never answered within 20s" in outcome.reason
+    assert "connection refused" in outcome.probe_detail
+    # Exactly the readiness window, and not one second of the settle window.
+    assert sum(waits) == pytest.approx(20.0)
+
+
+async def test_readiness_does_not_wait_on_a_unit_that_is_already_dead() -> None:
+    # The two facts the host can answer without waiting stay fatal in this
+    # phase too. A unit that started and stopped will not start by itself, and
+    # a minute of polling a dead unit is a minute of nobody being told.
+    waits: list[float] = []
+
+    async def record(seconds: float) -> None:
+        waits.append(seconds)
+
+    async with refusing_then(10_000, 200) as client:
+        outcome = await verify(
+            Host(FakeSystemd(active="failed", result="exit-code"), FakePodman(), record, client),
+            service(),
+            CANDIDATE,
+        )
+    assert outcome.failed
+    assert "not active" in outcome.reason
+    assert waits == []
+
+
+async def test_readiness_does_not_wait_on_the_wrong_image() -> None:
+    # Same reasoning: a container running an image nobody staged is running it
+    # just as firmly in sixty seconds, and ran_something_else must survive the
+    # new phase or the revision gets blacklisted for someone else's mistake.
+    async with refusing_then(10_000, 200) as client:
+        outcome = await verify(Host(FakeSystemd(), FakePodman(OLD), nosleep, client), service(), CANDIDATE)
+    assert outcome.failed
+    assert outcome.ran_something_else

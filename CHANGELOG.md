@@ -6,6 +6,33 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- `ready` in the registry: how long a service may take to answer its health
+  probe after the restart, default 60 seconds, separate from `settle`.
+
+### Fixed
+- **Verification now waits for the service to come up before it starts
+  requiring it to stay up.** Those are two questions and running them as one
+  made every service in the registry undeployable. A container unit is `active`
+  the moment conmon reports the process started, which is seconds before the
+  process inside it binds its port, so the settle window spent its first sample
+  in that gap and a single connection-refused ended the deploy. Measured on the
+  first real ticket this deployer ran: mcp-pcloud went from *open* to *"rolled
+  back, needs a person"* in twelve seconds, with a settle window of thirty, on
+  a service that was fine — and the good commit it was deploying was recorded
+  as one that had broken the service.
+
+  `ready` is a bounded, retrying wait for the first passing probe; `settle` is
+  unchanged — sampled, with the first failure fatal. The two checks the host
+  can answer without waiting, *is the unit active* and *is the staged image the
+  one running*, stay fatal in both phases, so a dead unit is still reported at
+  once rather than polled for a minute.
+- An empty log tail no longer asserts why it was empty. It had one explanation
+  built in — the container runs its own init — and put *"mcp-pcloud runs its
+  own init"* on ticket 1571, which is false; the container was two seconds old
+  and had not printed yet. It now reports the emptiness and names both
+  commands.
+
 ## [0.1.2] - 2026-11-07
 
 ### Fixed

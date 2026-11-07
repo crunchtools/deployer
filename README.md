@@ -52,9 +52,12 @@ For each ticket:
   commit the ticket named. If no such image exists yet and the ticket is young,
   wait and say so once; if it is old, stall it.
 - Verify: the unit is active, the running container's image ID *is* the
-  candidate, and the health probe holds continuously for the settle window.
-  Checking the image ID matters — without it, a restart that quietly came back
-  on the old image would look like a success.
+  candidate, and the health probe — given up to `ready` seconds to answer at
+  all — then holds continuously for the settle window. Checking the image ID
+  matters: without it, a restart that quietly came back on the old image would
+  look like a success. Separating `ready` from `settle` matters just as much,
+  because a container unit is active the moment conmon reports the process
+  started, several seconds before the process inside it is listening.
 - On failure: roll back, re-verify, write a hold, and hand the ticket back to
   whoever filed it with the service's own last output and the probe result on
   it. That output is published to everyone who can read the queue, so it is
@@ -142,10 +145,12 @@ registry, so that a seat cannot choose its own proof.
 ## Configuration
 
 `services.toml` holds one row per service: the unit, the image, the health
-probe and what it should return, the settle window, how long to wait for a
-build, whether rollback is automatic, and who may file tickets for it. A
-service with database migrations is `rollback = "manual"`: old code against a
-new schema is worse than a failed deploy with the downtime still open.
+probe and what it should return, how long the service may take to come up
+(`ready`, default 60s) and how long it must then stay up (`settle`, default
+60s), how long to wait for a build, whether rollback is automatic, and who may
+file tickets for it. A service with database migrations is
+`rollback = "manual"`: old code against a new schema is worse than a failed
+deploy with the downtime still open.
 
 An unknown key is a load error rather than a value that is ignored.
 
