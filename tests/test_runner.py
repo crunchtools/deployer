@@ -1195,15 +1195,33 @@ async def test_a_deployed_ticket_records_the_version_and_the_digest(tmp_path: Pa
     assert "sha256:0f1e2d3c4b5a6978" in published
 
 
-async def test_an_unlabelled_image_says_so_rather_than_printing_none(tmp_path: Path) -> None:
-    # Both are optional on a real image: a build outside the pipeline sets no
-    # version, and a locally built image has no registry digest. "None" on a
-    # ticket reads as a bug in the robot rather than a fact about the image.
+@pytest.mark.parametrize(
+    ("version", "digest"),
+    [
+        (None, None),
+        (None, "sha256:0f1e2d3c4b5a6978"),
+        ("2.34.0", None),
+    ],
+)
+async def test_a_missing_label_says_so_rather_than_printing_none(
+    tmp_path: Path, version: str | None, digest: str | None
+) -> None:
+    """Each field independently, including the two mixed cases.
+
+    Both are optional on a real image and for different reasons: a build
+    outside the pipeline sets no version, and a locally built image has no
+    registry digest. Testing only the all-or-none cases would hide a
+    regression that fell back to one field's value for both -- Gatehouse's
+    point, and the fields are independent, so the test has to be too.
+
+    `None` on a ticket reads as a bug in the robot rather than a fact about
+    the image, which is why the absence is spelled out in words.
+    """
     world = World(tmp_path, ticket())
-    world.podman.candidate_version = None
-    world.podman.candidate_digest = None
+    world.podman.candidate_version = version
+    world.podman.candidate_digest = digest
     await world.drain()
     published = "\n".join(text for _, text in world.rt.comments)
-    assert "version unlabelled" in published
-    assert "digest none reported" in published
+    assert f"version {version or 'unlabelled'}" in published
+    assert f"digest {digest or 'none reported'}" in published
     assert "None" not in published
