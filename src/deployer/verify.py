@@ -21,6 +21,7 @@ polling until something passes.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Final, Protocol
@@ -58,6 +59,34 @@ class ContainerReader(Protocol):
     """The container read verification needs."""
 
     async def inspect_container(self, name: str) -> dict[str, Any]: ...
+
+
+def _is_jsonrpc_answer(body: str) -> bool:
+    """Whether ``body`` really is a JSON-RPC answer to ``initialize``.
+
+    Parsed rather than searched for the text ``"result"``: an HTML error page
+    that happens to contain the word would have passed a substring check, and
+    the point of this probe is to prove something is answering MCP.
+
+    Streamable HTTP may frame the answer as server-sent events, so ``data:``
+    lines are unwrapped before parsing. Either a ``result`` or an ``error`` is
+    an answer -- a server that refuses the handshake is still running.
+    """
+    candidates = [body]
+    if "data:" in body:
+        candidates = [line.partition("data:")[2].strip() for line in body.splitlines() if "data:" in line]
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if (
+            isinstance(parsed, dict)
+            and parsed.get("jsonrpc") == "2.0"
+            and ("result" in parsed or "error" in parsed)
+        ):
+            return True
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,8 +157,8 @@ async def probe_once(probe: Probe, client: httpx.AsyncClient | None = None) -> P
     body = response.text
     if probe.expect_body and probe.expect_body not in body:
         return ProbeResult(ok=False, detail=f"{probe.url}: body does not contain {probe.expect_body!r}")
-    if probe.kind == "mcp" and '"result"' not in body and '"error"' not in body:
-        return ProbeResult(ok=False, detail=f"{probe.url}: initialize returned no JSON-RPC result")
+    if probe.kind == "mcp" and not _is_jsonrpc_answer(body):
+        return ProbeResult(ok=False, detail=f"{probe.url}: initialize returned no JSON-RPC answer")
     return ProbeResult(ok=True, detail=f"{probe.url}: {response.status_code}")
 
 
@@ -140,14 +169,14 @@ async def verify(host: Host, service: Service, candidate_image_id: str) -> Outco
     retried until something passed would be measuring patience rather than
     health.
     """
-    # Sample at t=0 and then every interval through the settle duration, so the
-    # END of the window is covered: with settle=60 and a 5s interval that is 13
-    # samples and 12 waits, which is 60 seconds, not 55. A settle shorter than
-    # one interval gets a single sample at the start and no wait -- stated here
-    # rather than left to integer division.
-    samples = int(service.settle // SAMPLE_INTERVAL_SECONDS) + 1
+    # Elapsed time, not a sample count. Counting samples under-covers any
+    # settle that is not a multiple of the interval: settle=9 gave two samples
+    # and one five-second wait, and reported success after five seconds. Here
+    # the loop runs until the whole window has passed, and the last wait is
+    # trimmed to whatever is left of it, so the final sample lands at the end.
+    elapsed = 0.0
 
-    for sample in range(samples):
+    while True:
         state = await host.systemd.state(service.unit)
         if not state.is_active:
             return Outcome(ok=False, reason=f"{service.unit} is {state.active_state}, not active")
@@ -170,7 +199,9 @@ async def verify(host: Host, service: Service, candidate_image_id: str) -> Outco
         if not result.ok:
             return Outcome(ok=False, reason="health probe failed", probe_detail=result.detail)
 
-        if sample + 1 < samples:
-            await host.sleep(SAMPLE_INTERVAL_SECONDS)
+        if elapsed >= service.settle:
+            return Outcome(ok=True, probe_detail=f"held for {service.settle}s")
 
-    return Outcome(ok=True, probe_detail=f"held for {service.settle}s")
+        wait = min(SAMPLE_INTERVAL_SECONDS, service.settle - elapsed)
+        await host.sleep(wait)
+        elapsed += wait

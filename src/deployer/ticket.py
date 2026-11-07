@@ -71,9 +71,13 @@ def _scan(body: str) -> dict[str, str]:
 
     for number, line in enumerate(lines, start=1):
         text = line.strip()
-        # Blank lines and a markdown fence are the two things RT and the seats
-        # add without meaning anything by them.
-        if not text or text.startswith(("```", "#")):
+        # Blank lines only. Fences and headings used to be skipped too, which
+        # contradicted this repo's own rule that a body is a key: value grammar
+        # and nothing else -- and a parser that skips what it does not
+        # understand lets one body mean two things. A seat writes this body to a
+        # documented format; a person who adds prose gets a refusal naming the
+        # line, which is fixable in one edit.
+        if not text:
             continue
 
         match = _LINE_RE.match(text)

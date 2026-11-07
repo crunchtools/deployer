@@ -38,9 +38,17 @@ def test_a_hash_prefixed_pr_is_accepted() -> None:
     assert parse_ticket(f"service: x\nrepo: a/b\ncommit: {SHA}\npr: #7\n").pr == HASH_PREFIXED_PR
 
 
-def test_blank_lines_fences_and_headings_are_ignored() -> None:
-    body = f"```\n\n# Deploy\nservice: x\n\nrepo: a/b\ncommit: {SHA}\n```\n"
-    assert parse_ticket(body).service == "x"
+def test_blank_lines_are_ignored() -> None:
+    assert parse_ticket(f"\nservice: x\n\nrepo: a/b\n\ncommit: {SHA}\n\n").service == "x"
+
+
+@pytest.mark.parametrize("noise", ["```", "```toml", "# Deploy", "## notes"])
+def test_fences_and_headings_are_refused_not_skipped(noise: str) -> None:
+    # They used to be skipped, which contradicted this repo's own rule that a
+    # body is a key: value grammar and nothing else. A parser that skips what
+    # it does not understand lets one body mean two things.
+    with pytest.raises(TicketError, match="not a 'key: value' line"):
+        parse_ticket(f"{noise}\nservice: x\nrepo: a/b\ncommit: {SHA}\n")
 
 
 def test_an_uppercase_sha_is_normalised() -> None:

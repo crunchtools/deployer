@@ -110,8 +110,9 @@ async def rotate_rollback_tags(
 ) -> tuple[str, ...]:
     """Remove all but the newest ``keep`` ``rollback-*`` tags for a service.
 
-    Returns the tags removed. Rollback images are application-sized and
-    unrotated ones have filled a host's disk before now.
+    Returns the tags actually removed -- not the ones selected, so a caller
+    reporting "rotated 3" is reporting three that went. Rollback images are
+    application-sized and unrotated ones have filled a fleet host's disk.
     """
     basename = service.image.rsplit("/", maxsplit=1)[-1]
     pattern = f"localhost/{basename}:rollback-*"
@@ -124,12 +125,20 @@ async def rotate_rollback_tags(
         tags.extend(tag for tag in image.tags if tag.startswith(f"localhost/{basename}:rollback-"))
 
     doomed = tuple(tags[keep:])
+    removed: list[str] = []
     for tag in doomed:
         try:
-            await podman.untag(tag, tag)
+            # Removing BY THE TAG, with no untag first. Untagging makes the
+            # reference stop resolving, so the removal that followed it failed
+            # and was swallowed -- leaving the image data on disk, which is the
+            # one thing this rotation exists to prevent. podman's DELETE on a
+            # tagged reference drops the tag, and the image with it when that
+            # was the last reference; an image still tagged elsewhere is left
+            # alone, which is correct.
             await podman.remove_image(tag)
         except PodmanError:
             # A tag that will not go is not worth failing a good deploy over;
-            # the disk check in Nagios is what notices if it accumulates.
+            # the Nagios disk check is what notices accumulation.
             continue
-    return doomed
+        removed.append(tag)
+    return tuple(removed)

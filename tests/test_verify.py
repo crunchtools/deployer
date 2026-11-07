@@ -125,14 +125,30 @@ async def test_a_probe_that_passes_then_fails_inside_the_window_fails() -> None:
     assert "502" in outcome.probe_detail
 
 
-async def test_a_settle_shorter_than_the_interval_samples_once() -> None:
-    # The explicit policy: one sample at the start and no wait, rather than
-    # whatever integer division happens to produce.
+@pytest.mark.parametrize(
+    ("settle", "expected_samples"),
+    [
+        (1, 2),  # shorter than one interval: start, then the 1s remainder
+        (5, 2),  # exactly one interval
+        (9, 3),  # NOT a multiple: start, +5, +4 -- the remainder is still waited
+        (60, 13),
+    ],
+)
+async def test_the_whole_settle_window_is_covered(settle: int, expected_samples: int) -> None:
+    # Counting samples under-covered any non-multiple settle: settle=9 used to
+    # report success after five seconds. The loop now runs on elapsed time and
+    # trims the last wait to what is left.
+    waits: list[float] = []
+
+    async def record(seconds: float) -> None:
+        waits.append(seconds)
+
     systemd = FakeSystemd()
     async with responder(200) as client:
-        outcome = await verify(Host(systemd, FakePodman(), nosleep, client), service(settle=1), CANDIDATE)
+        outcome = await verify(Host(systemd, FakePodman(), record, client), service(settle=settle), CANDIDATE)
     assert outcome.ok
-    assert systemd.calls == 1
+    assert systemd.calls == expected_samples
+    assert sum(waits) == pytest.approx(float(settle))
 
 
 async def test_a_short_settle_still_checks_once() -> None:
@@ -171,7 +187,7 @@ async def test_an_mcp_probe_requires_a_jsonrpc_answer() -> None:
     async with httpx.AsyncClient(transport=httpx.MockTransport(empty)) as client:
         result = await probe_once(Probe(kind="mcp", url="http://x/mcp"), client)
     assert not result.ok
-    assert "no JSON-RPC result" in result.detail
+    assert "no JSON-RPC answer" in result.detail
 
 
 async def test_an_mcp_probe_accepts_a_jsonrpc_error_as_alive() -> None:
@@ -191,3 +207,31 @@ async def test_an_unreachable_probe_is_a_failure_with_the_reason() -> None:
         result = await probe_once(Probe(kind="http", url="http://x/"), client)
     assert not result.ok
     assert "connection refused" in result.detail
+
+
+async def test_an_mcp_probe_rejects_a_body_that_merely_mentions_result() -> None:
+    # A substring check passed this: an error page with the word "result" in it
+    # proved nothing, and proving something answers MCP is the whole point.
+    def html(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="<html><body>no result found</body></html>")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(html)) as client:
+        assert not (await probe_once(Probe(kind="mcp", url="http://x/mcp"), client)).ok
+
+
+async def test_an_mcp_probe_reads_a_server_sent_event_framed_answer() -> None:
+    # Streamable HTTP may frame the answer as SSE, so data: lines are unwrapped.
+    def sse(_request: httpx.Request) -> httpx.Response:
+        body = 'event: message\ndata: {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"x"}}\n\n'
+        return httpx.Response(200, text=body)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(sse)) as client:
+        assert (await probe_once(Probe(kind="mcp", url="http://x/mcp"), client)).ok
+
+
+async def test_an_mcp_probe_rejects_json_without_the_jsonrpc_marker() -> None:
+    def plain(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text='{"result": "ok"}')
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(plain)) as client:
+        assert not (await probe_once(Probe(kind="mcp", url="http://x/mcp"), client)).ok

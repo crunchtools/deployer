@@ -165,6 +165,17 @@ async def test_a_podman_failure_during_rollback_is_a_rollback_error() -> None:
             await roll_back(Broken(), FakeRestarter(), host, service(), staged())
 
 
+async def test_rotation_removes_by_tag_without_untagging_first() -> None:
+    # Untagging made the reference stop resolving, so the removal that followed
+    # it failed and was swallowed -- leaving the image data on disk, which is
+    # the one thing the rotation exists to prevent.
+    tags = tuple(f"localhost/acquacotta:rollback-{n}" for n in range(3))
+    podman = FakePodman(tags=tags)
+    removed = await rotate_rollback_tags(podman, service())
+    assert removed == (tags[2],)
+    assert podman.removed == [tags[2]]
+
+
 async def test_rotation_keeps_two_and_removes_the_rest() -> None:
     tags = tuple(f"localhost/acquacotta:rollback-{n}" for n in range(5))
     podman = FakePodman(tags=tags)
@@ -194,5 +205,5 @@ async def test_a_tag_that_will_not_go_does_not_fail_a_good_deploy() -> None:
             raise PodmanError("image is in use")
 
     podman = Stubborn(tags=tuple(f"localhost/acquacotta:rollback-{n}" for n in range(4)))
-    removed = await rotate_rollback_tags(podman, service())
-    assert len(removed) == ROLLBACK_TAGS_KEPT
+    # Reports what actually went, which is nothing here, and does not raise.
+    assert await rotate_rollback_tags(podman, service()) == ()
