@@ -157,6 +157,7 @@ class FakePodman:
         self.log_text = "ValueError: no database\n"
         self.fail_tag_on: str | None = None
         self.fail_inspect = False
+        self.reference = f"{IMAGE}:latest"
         self.fail_untag = False
         self.fail_list_images = False
         #: A Config.Env shape this cannot read, to exercise failing closed.
@@ -166,9 +167,10 @@ class FakePodman:
     async def inspect_container(self, name: str) -> dict[str, Any]:
         if self.fail_inspect:
             raise PodmanError("no such container")
-        if self.broken_env:
-            return {"Image": self.running, "Config": {"Env": "PATH=/x"}}
-        return {"Image": self.running, "Config": {"Env": list(self.env)}}
+        config = {"Env": "PATH=/x" if self.broken_env else list(self.env)}
+        # ImageName is the reference the unit created the container from, which
+        # is what the unit-shape gate reads.
+        return {"Image": self.running, "ImageName": self.reference, "Config": config}
 
     async def inspect_image(self, name: str) -> ImageRef:
         key = self.by_ref.get(name, name)
@@ -1031,3 +1033,17 @@ async def test_cleanup_failures_reach_the_ticket_on_a_rollback_too(tmp_path: Pat
     assert report.outcome == OUTCOME_ROLLED_BACK
     assert world.rt.said("could not be cancelled")
     assert world.rt.said("could not be removed")
+
+
+async def test_a_pinned_service_is_refused_and_told_why(tmp_path: Path) -> None:
+    # Pinning a unit to a semver tag takes it OUT of this deployer's scope:
+    # moving :latest would not change what it runs. The message says so, and
+    # says what to do instead, because "pin it" was the plan's own words for
+    # onboarding and it is wrong.
+    world = World(tmp_path, ticket())
+    world.podman.reference = f"{IMAGE}:2.34.0"
+    report = await world.drain()
+    assert report.outcome == OUTCOME_REFUSED
+    assert world.rt.said("is running")
+    assert world.rt.said("would not change what it runs")
+    assert world.systemd.restarts == []

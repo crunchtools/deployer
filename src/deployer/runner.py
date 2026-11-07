@@ -431,8 +431,9 @@ class Runner:
         refusal most worth knowing about before a real run.
         """
         try:
-            await unit_shape_ok(self.clients.systemd, service)
-        except (StageError, SystemdError) as exc:
+            running = await self.clients.podman.inspect_container(service.container)
+            await unit_shape_ok(self.clients.systemd, service, running)
+        except (StageError, SystemdError, PodmanError) as exc:
             return TicketResult(OUTCOME_REFUSED, f"t{ticket.id} would be refused: {exc}")
         return TicketResult(
             OUTCOME_OK,
