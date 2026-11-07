@@ -112,6 +112,12 @@ class Staged:
     rollback_tag: str
     candidate_image_id: str
     candidate_revision: str | None
+    #: The release that went out, and the digest that identifies it anywhere
+    #: else. Both go on the ticket: a commit answers "which code", a version
+    #: answers "which release", and a digest is the only one of the three that
+    #: means the same thing in a registry, in a signature and on another host.
+    candidate_version: str | None
+    candidate_digest: str | None
     candidate_tag: str
     latest_tag: str
 
@@ -285,6 +291,8 @@ async def stage(podman: ImageOps, systemd: UnitOps, service: Service, wanted: st
         rollback_tag=rollback_tag,
         candidate_image_id=candidate_id,
         candidate_revision=candidate.revision,
+        candidate_version=candidate.version,
+        candidate_digest=candidate.digest,
         candidate_tag=candidate_tag,
         latest_tag=latest,
     )

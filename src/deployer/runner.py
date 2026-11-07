@@ -51,7 +51,7 @@ from .rollback import Restored, RollbackError, roll_back, rotate_rollback_tags
 from .rt import RtError, Ticket, TicketSaid
 from .stage import StageError, Staged, Verdict, classify_revision, stage, unit_shape_ok
 from .statefile import safe_component, write_whole
-from .systemd import SystemdError, UnitState
+from .systemd import RESTART_TIMEOUT_SECONDS, SystemdError, UnitState
 from .ticket import Request, TicketError, creator_may_request, parse_ticket
 from .verify import Host, Outcome, verify
 
@@ -75,6 +75,12 @@ __all__ = [
 DEFAULT_QUEUE: Final = "Deploy"
 #: Added to the settle window when opening downtime, to cover the pull, the
 #: restart and a rollback that has to settle all over again.
+#: Added on top of the two full verification windows below, for the work that
+#: is not either of them: the tag moves, the log capture, and the RT and Nagios
+#: round trips at both ends. Erring long costs unmonitored minutes only if this
+#: process dies mid-deploy, because a window is cancelled explicitly on success
+#: and on a rollback that did not verify. Erring short pages somebody in the
+#: middle of a rollback that is working, which is the mistake this replaced.
 DOWNTIME_MARGIN_SECONDS: Final = 300
 #: How much of a refusal goes in the "already said this" record. Long enough
 #: that two different refusals are different, short enough to stay one line.
@@ -280,6 +286,28 @@ class Clients:
     nagios: Downtime
     probes: httpx.AsyncClient | None = None
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
+
+
+def _window_minutes(service: Service) -> int:
+    """How long to suppress Nagios for, in minutes.
+
+    TWICE the whole verification, because a deploy that fails does all of it
+    again: restart, wait for the service to come up, hold it for the settle
+    window. The first version of this was `settle + margin`, which predated
+    both the restart wait and the `ready` window and so sized the window from
+    one of the three things it has to cover. acquacotta got six minutes
+    against a good path of up to 120 + 180 + 60 = 360 seconds and a rollback
+    path near 720, so any acquacotta rollback would have paged somebody in the
+    middle of a rollback that was succeeding -- and the one page this design
+    raises deliberately, a rollback that did NOT come back, would have arrived
+    indistinguishable from it.
+
+    Sized from the service's own numbers rather than a constant, because
+    `ready` and `settle` are per service and the whole point of those keys is
+    that acquacotta is not an MCP server.
+    """
+    one_pass = RESTART_TIMEOUT_SECONDS + service.ready + service.settle
+    return max(1, ceil((2 * one_pass + DOWNTIME_MARGIN_SECONDS) / 60))
 
 
 @dataclass(slots=True)
@@ -511,7 +539,7 @@ class Runner:
         ticket still queued, which is a much better outcome than a deploy
         nobody is told about.
         """
-        minutes = max(1, ceil((service.settle + DOWNTIME_MARGIN_SECONDS) / 60))
+        minutes = _window_minutes(service)
         try:
             await self.clients.rt.set_fields(ticket.id, status="open")
             await self.clients.nagios.open_downtime(
@@ -547,7 +575,9 @@ class Runner:
         await self.clients.rt.comment(
             ticket.id,
             f"Deployed. {service.unit} is running {version[:12]} "
-            f"(image {staged.candidate_image_id[:19]}), verified for {service.settle}s: the unit is "
+            f"(version {staged.candidate_version or 'unlabelled'}, "
+            f"digest {staged.candidate_digest or 'none reported'}, "
+            f"image {staged.candidate_image_id[:19]}), verified for {service.settle}s: the unit is "
             f"active, the container is running that exact image, and {service.probe.url} answered "
             f"throughout.\n"
             f"Rollback image kept as {staged.rollback_tag}."

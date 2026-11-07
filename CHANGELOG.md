@@ -21,6 +21,26 @@ All notable changes to this project are documented here. The format follows
   the only thing standing between a rolled-back image and its return at the
   next fleet-wide auto-update, and nothing in the package imports it.
 
+### Fixed
+- **The maintenance window now outlasts a rollback.** It was sized
+  `settle + 300`, which predated both the restart wait and the `ready` window
+  and so measured one of the three things it has to cover. acquacotta got six
+  minutes against a good path of up to 120 + 180 + 60 = 360 seconds and a
+  rollback path near 720, so **a rollback that was working would have paged
+  somebody in the middle of it** — and the one page this design raises
+  deliberately, a rollback that did *not* come back, would have arrived
+  indistinguishable from that noise.
+
+  It is now twice the whole verification plus the margin, computed from the
+  service's own `ready` and `settle`, because the point of those keys being
+  per service is that acquacotta is not an MCP server. Caught by the cto
+  review of the program's done claim, not by a test.
+- The Deployed comment carries the **version and the digest**, not only the
+  revision and a local image id. `ImageRef.version` existed for this and its
+  docstring said so; nothing used it. A commit answers "which code", a version
+  answers "which release", and a digest is the only one of the three that means
+  the same thing in a registry, in a signature and on another host.
+
 ## [0.1.4] - 2026-11-07
 
 ### Added

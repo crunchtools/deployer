@@ -46,6 +46,7 @@ from deployer.runner import (
     OUTCOME_ROLLED_BACK,
     Clients,
     Runner,
+    _window_minutes,
     container_environment,
     redact,
 )
@@ -76,6 +77,11 @@ SERVICE = Service(
     build_deadline=1800,
 )
 REGISTRY = Registry({"acquacotta": SERVICE})
+
+
+def _fields(service: Service) -> dict[str, Any]:
+    """The service's own values, so a test can clone it with one changed."""
+    return {name: getattr(service, name) for name in service.__slots__}
 
 
 def body(service: str = "acquacotta", repo: str = "crunchtools/acquacotta", commit: str = WANTED) -> str:
@@ -1098,3 +1104,52 @@ async def test_an_empty_log_says_where_to_look_instead(tmp_path: Path) -> None:
     # And no invented reason for which of the two it was.
     assert "runs its own init" not in published
     assert "journalctl" in published
+
+
+# --- the maintenance window's length ---
+
+
+@pytest.mark.parametrize(
+    ("ready", "settle", "least"),
+    [
+        # acquacotta's real numbers: the rollback path is 2 x (120 restart +
+        # 180 ready + 60 settle) = 720s, and the window must outlast it.
+        (180, 60, 12),
+        # mcp-pcloud's and mcp-nagios's: 2 x (120 + 60 + 30) = 420s.
+        (60, 30, 7),
+    ],
+)
+def test_the_window_outlasts_a_rollback(ready: int, settle: int, least: int) -> None:
+    """The window has to cover the FAILING path, not the succeeding one.
+
+    The first version was `settle + margin`, which predated both the restart
+    wait and the `ready` window: acquacotta got six minutes against a good
+    path of up to 360 seconds and a rollback path near 720, so a rollback that
+    was WORKING would have paged somebody in the middle of it -- and the one
+    page this design raises deliberately, a rollback that did not come back,
+    would have been indistinguishable from that noise.
+
+    Asserted as a floor rather than an exact figure, because the margin on top
+    is a judgement call and this is the part that is not.
+    """
+    service = SERVICE.__class__(**{**_fields(SERVICE), "ready": ready, "settle": settle})
+    assert _window_minutes(service) >= least
+
+
+def test_the_window_is_sized_per_service_not_from_a_constant() -> None:
+    # The whole point of `ready` and `settle` being per service is that
+    # acquacotta is not an MCP server. A window that ignored them would be
+    # wrong for one of the two.
+    slow = SERVICE.__class__(**{**_fields(SERVICE), "ready": 180, "settle": 60})
+    quick = SERVICE.__class__(**{**_fields(SERVICE), "ready": 60, "settle": 30})
+    assert _window_minutes(slow) > _window_minutes(quick)
+
+
+async def test_a_deploy_opens_a_window_of_that_length(tmp_path: Path) -> None:
+    # And the number actually reaches Nagios, rather than being computed and
+    # then not used.
+    world = World(tmp_path, ticket())
+    await world.drain()
+    assert world.nagios.opened, "no window was opened"
+    _host, minutes, _comment = world.nagios.opened[0]
+    assert minutes == _window_minutes(SERVICE)
