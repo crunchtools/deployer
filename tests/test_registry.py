@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import trustme
 
 from deployer.registry import (
     DEFAULT_BUILD_DEADLINE_SECONDS,
@@ -180,6 +181,18 @@ def test_a_log_probe_loads_and_carries_no_url(tmp_path: Path) -> None:
     assert probe.url == "", "a log probe must not carry a URL to put on a ticket"
 
 
+def real_bundle(tmp_path: Path) -> Path:
+    """A PEM bundle OpenSSL will actually load.
+
+    A file holding a plausible-looking BEGIN line will not do any more: the
+    registry loads what it accepts, because stat'ing it was the difference
+    between exit 2 and a rolled-back deploy.
+    """
+    bundle = tmp_path / "origin-ca.pem"
+    trustme.CA().cert_pem.write_to_path(bundle)
+    return bundle
+
+
 def one_service(probe: str) -> str:
     """The fixture's first row, with its probe replaced."""
     return GOOD.split('[service."mcp-pcloud')[0].replace(
@@ -190,8 +203,7 @@ def one_service(probe: str) -> str:
 
 def test_a_tls_row_loads_and_carries_the_name_and_the_bundle(tmp_path: Path) -> None:
     """The row ``proxy.crunchtools.com`` needs: one name, one trust bundle."""
-    bundle = tmp_path / "origin-ca.pem"
-    bundle.write_text("-----BEGIN CERTIFICATE-----\n", encoding="utf-8")
+    bundle = real_bundle(tmp_path)
     text = one_service(
         '{ kind = "http", url = "https://127.0.0.1:443/", server_name = "crunchtools.com", '
         f'ca_file = "{bundle}", expect_status = 200 }}'
@@ -216,8 +228,7 @@ def test_the_tls_keys_ride_on_the_scheme_not_on_the_kind(tmp_path: Path) -> None
     Nothing about these keys is specific to the ``http`` kind -- what decides
     whether a certificate is offered is the URL, so that is what gates them.
     """
-    bundle = tmp_path / "origin-ca.pem"
-    bundle.write_text("-----BEGIN CERTIFICATE-----\n", encoding="utf-8")
+    bundle = real_bundle(tmp_path)
     text = one_service(
         f'{{ kind = "mcp", url = "https://127.0.0.1:443/mcp", server_name = "mcp.crunchtools.com", '
         f'ca_file = "{bundle}" }}'
@@ -249,6 +260,24 @@ def test_a_ca_file_that_is_not_there_is_refused_at_load_and_names_the_path(tmp_p
         load_registry(write(tmp_path, text))
     assert str(missing) in str(exc.value)
     assert "is not a file" in str(exc.value)
+
+
+def test_a_ca_file_that_is_not_a_bundle_is_refused_at_load(tmp_path: Path) -> None:
+    """An unloadable bundle is the registry being wrong, which is exit 2.
+
+    Stat'ing the path was not enough. A file that is there but is not PEM
+    loaded fine here and then failed the probe, which is exit 1 -- a deploy
+    reported as broken, rolled back, on a ticket, in a window it spent. The
+    bundle is therefore loaded while the registry is being read, so the fault
+    is named as what it is.
+    """
+    junk = tmp_path / "origin-ca.pem"
+    junk.write_text("this is not a certificate\n", encoding="utf-8")
+    text = one_service(f'{{ kind = "http", url = "https://127.0.0.1:443/", ca_file = "{junk}" }}')
+    with pytest.raises(RegistryError) as exc:
+        load_registry(write(tmp_path, text))
+    assert str(junk) in str(exc.value)
+    assert "is not a bundle OpenSSL will load" in str(exc.value)
 
 
 @pytest.mark.parametrize("value", ["0", "-1", '"60"', "true"])

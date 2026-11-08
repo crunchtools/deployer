@@ -26,10 +26,11 @@ All notable changes to this project are documented here. The format follows
   nothing reads `getpeercert()` to compare names by hand: on a loopback socket
   the verification is not a MITM defence, it *is* the check.
 
-  Both keys are refused on a URL that is not `https`, and a `ca_file` naming a
-  file that is not there is refused when the registry loads. The alternative
-  was a registry that loads and then fails every probe for that service in a
-  maintenance window, to learn what one `stat` knew.
+  Both keys are refused on a URL that is not `https`, and a `ca_file` is
+  *loaded* while the registry is read rather than stat'ed — absent or not PEM,
+  either way the registry is wrong, which is exit 2, "could not run". The
+  alternative was a configuration error arriving as exit 1: a deploy reported
+  as broken, rolled back, on a ticket, in a maintenance window it spent.
 
   Tested against a real TLS listener, with certificates minted in the test by
   `trustme` (a new dev dependency; it cannot reach the image, which installs

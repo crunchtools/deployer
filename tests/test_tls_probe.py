@@ -222,11 +222,13 @@ async def test_a_server_name_without_a_ca_file_also_gets_its_own_client(tmp_path
 
 @pytest.mark.asyncio
 async def test_a_ca_file_that_is_not_a_bundle_fails_the_probe_rather_than_raising(tmp_path: Path) -> None:
-    """The registry refuses a ``ca_file`` that is absent, not one that is junk.
+    """The narrow case the registry cannot catch: the bundle changed afterwards.
 
-    A file that is there but is not PEM is this program's fault rather than the
-    service's, and it has to arrive as a failed probe with the path in it, not
-    as a traceback out of the middle of a maintenance window.
+    An unloadable bundle in the registry is exit 2 at load -- see
+    ``test_a_ca_file_that_is_not_a_bundle_is_refused_at_load``. One that is
+    replaced under a running deployer is still this program's fault rather
+    than the service's, and it has to arrive as a failed probe with the path
+    in it, not as a traceback out of the middle of a maintenance window.
     """
     junk = tmp_path / "not-a-bundle.pem"
     junk.write_text("this is not a certificate\n", encoding="utf-8")

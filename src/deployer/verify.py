@@ -211,10 +211,10 @@ async def probe_once(probe: Probe, client: httpx.AsyncClient | None = None) -> P
     try:
         http = shared or _client_for(probe)
     except (OSError, ssl.SSLError) as exc:
-        # The registry refuses a ca_file that is absent at load time, so this
-        # is a file that has gone away or is not a PEM bundle. It is this
-        # program's fault, not the service's, and it says so rather than
-        # arriving as a traceback in the middle of a maintenance window.
+        # The registry loads every ca_file it accepts, so reaching here means
+        # the bundle changed under a running deployer. Still this program's
+        # fault rather than the service's, and it says so rather than arriving
+        # as a traceback in the middle of a maintenance window.
         return ProbeResult(ok=False, detail=f"{probe.url}: cannot use ca_file {probe.ca_file!r}: {exc}")
     headers, extensions = _tls_request_parts(probe)
     try:

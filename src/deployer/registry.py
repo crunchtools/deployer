@@ -14,6 +14,7 @@ registry that lied about what it was going to do.
 
 from __future__ import annotations
 
+import ssl
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -239,9 +240,13 @@ def _parse_tls(table: dict[str, Any], url: str, where: str) -> tuple[str | None,
     carrying them over plaintext claims a certificate was checked when no
     certificate was ever offered.
 
-    A ``ca_file`` that names nothing is a load error too. The alternative is a
-    registry that loads and then fails every probe for that service at deploy
-    time, which spends a maintenance window to learn what one ``stat`` knew.
+    A ``ca_file`` is checked by *loading* it here, not by stat'ing it. Both
+    outcomes are the registry being wrong rather than the service being
+    unhealthy, and the constitution gives those different exit codes: an
+    unloadable registry is exit 2, "could not run", where a failed probe is
+    exit 1 and takes a rollback and a ticket with it. A bundle that is absent
+    or is not PEM would otherwise reach the probe and be reported as the
+    service failing, in a maintenance window, having spent one.
     """
     wrong = sorted(_TLS_PROBE_KEYS & table.keys())
     if wrong and not url.startswith(_HTTPS_PREFIX):
@@ -250,8 +255,15 @@ def _parse_tls(table: dict[str, Any], url: str, where: str) -> tuple[str | None,
             "there is no certificate to verify on a plaintext URL"
         )
     ca_file = _optional_str(table, "ca_file", where)
-    if ca_file is not None and not Path(ca_file).is_file():
-        raise ValidationError(f"{where}.probe.ca_file {ca_file!r} is not a file this deployer can read")
+    if ca_file is not None:
+        if not Path(ca_file).is_file():
+            raise ValidationError(f"{where}.probe.ca_file {ca_file!r} is not a file this deployer can read")
+        try:
+            ssl.create_default_context(cafile=ca_file)
+        except (OSError, ssl.SSLError) as exc:
+            raise ValidationError(
+                f"{where}.probe.ca_file {ca_file!r} is not a bundle OpenSSL will load: {exc}"
+            ) from None
     return _optional_str(table, "server_name", where), ca_file
 
 
