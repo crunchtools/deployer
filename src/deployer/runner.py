@@ -578,8 +578,7 @@ class Runner:
             f"(version {staged.candidate_version or 'unlabelled'}, "
             f"digest {staged.candidate_digest or 'none reported'}, "
             f"image {staged.candidate_image_id[:19]}), verified for {service.settle}s: the unit is "
-            f"active, the container is running that exact image, and {service.probe.url} answered "
-            f"throughout.\n"
+            f"active, the container is running that exact image, and {_proof_phrase(service)}.\n"
             f"Rollback image kept as {staged.rollback_tag}."
             + (f"\nRemoved {len(rotated)} older rollback tag(s)." if rotated else "")
             + ("\nThe hold on this service is cleared; auto-update is no longer skipped." if cleared else "")
@@ -871,6 +870,23 @@ def redact(text: str, secrets: Mapping[str, str]) -> str:
     for name, value in sorted(secrets.items(), key=lambda item: len(item[1]), reverse=True):
         text = text.replace(value, f"<redacted ${name}>")
     return text
+
+
+def _proof_phrase(service: Service) -> str:
+    """What the ticket may truthfully claim was proved.
+
+    A ``log`` probe reaches nothing over the network, so the sentence that
+    names a URL and says it "answered throughout" would be an invention. The
+    comment is the only receipt a deploy leaves; it has to say which of the two
+    things actually happened.
+    """
+    if service.probe.reads_log:
+        return (
+            f"it logged {service.probe.expect!r} after starting and then held "
+            f"that same container, with no restart, for the whole window "
+            f"(no health probe: this service answers nothing over the network)"
+        )
+    return f"{service.probe.url} answered throughout"
 
 
 def _as_notes(reasons: Iterable[str]) -> str:

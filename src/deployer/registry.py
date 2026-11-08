@@ -25,7 +25,7 @@ from .validate import ValidationError
 
 __all__ = ["Probe", "RegistryError", "Service", "load_registry"]
 
-ProbeKind = Literal["http", "mcp"]
+ProbeKind = Literal["http", "mcp", "log"]
 RollbackMode = Literal["auto", "manual"]
 
 DEFAULT_SETTLE_SECONDS: Final = 60
@@ -47,7 +47,13 @@ _SERVICE_KEYS: Final = frozenset(
     }
 )
 _REQUIRED_SERVICE_KEYS: Final = frozenset({"repo", "image", "unit", "probe", "nagios_host", "requestors"})
-_PROBE_KEYS: Final = frozenset({"kind", "url", "expect_status", "expect_body"})
+_PROBE_KEYS: Final = frozenset({"kind", "url", "expect", "expect_status", "expect_body"})
+#: Which probe keys belong to which kind. A key that belongs to another kind is
+#: refused by name rather than ignored: `url` on a `log` row would read as a
+#: service that is being reached over HTTP when nothing of the sort happens,
+#: and a silently dropped key is how a registry starts lying about its proof.
+_HTTP_ONLY_PROBE_KEYS: Final = frozenset({"url", "expect_status", "expect_body"})
+_LOG_ONLY_PROBE_KEYS: Final = frozenset({"expect"})
 
 # Named so the error message can say why a key is refused rather than only that
 # it is unknown. Being told "not in 0.1.0" is actionable; "unknown key" invites
@@ -71,12 +77,35 @@ class Probe:
     the only health signal an MCP server reliably has -- several of them expose
     no ``/health`` route at all, so an HTTP status check against one would pass
     without testing anything.
+
+    ``log`` is for a service with no network surface at all: the agent seats
+    answer nothing, and Nagios watches them with one check that says "the
+    container is running". It waits for ``expect`` to appear in the container's
+    own log and then holds on the container's identity rather than on any
+    answer. It proves less than the other two and says so -- but the
+    alternative on offer was leaving those services taking whatever ``:latest``
+    held at their last restart, which proves nothing whatsoever.
+
+    What it is deliberately *not* is a probe that cannot fail. A kind meaning
+    "look at nothing" would pass for a container whose main process is
+    ``sleep``, which is roughly what a Claude Code seat looks like from the
+    outside, and a check that cannot fail is worse than no check because it
+    gets trusted.
     """
 
     kind: ProbeKind
-    url: str
+    #: Empty on a ``log`` row, where it is a refused key rather than an omitted
+    #: one -- see ``_HTTP_ONLY_PROBE_KEYS``.
+    url: str = ""
+    #: The line that must appear in the log. ``log`` rows only.
+    expect: str | None = None
     expect_status: int = 200
     expect_body: str | None = None
+
+    @property
+    def reads_log(self) -> bool:
+        """Whether this probe is answered by the log rather than by a request."""
+        return self.kind == "log"
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,14 +176,41 @@ class Registry:
         return len(self.services)
 
 
+def _refuse_keys_of_the_other_kind(table: dict[str, Any], kind: ProbeKind, where: str) -> None:
+    """Refuse probe keys that belong to a different kind than the row declares.
+
+    Ignoring them would be worse than refusing: a `log` row carrying a `url`
+    reads as a service being reached over HTTP when nothing of the sort
+    happens, and the row would be claiming a proof it is not performing.
+    """
+    wrong = sorted((_HTTP_ONLY_PROBE_KEYS if kind == "log" else _LOG_ONLY_PROBE_KEYS) & table.keys())
+    if not wrong:
+        return
+    why = "a log probe reaches nothing over the network" if kind == "log" else "expect belongs to a log probe"
+    raise ValidationError(f"{where}.probe has {', '.join(wrong)} but kind is {kind!r}: {why}")
+
+
 def _parse_probe(raw: Any, where: str) -> Probe:
     table = validate.mapping(raw, f"{where}.probe")
     validate.known_keys(table, _PROBE_KEYS, f"{where}.probe")
-    kind_name = validate.one_of(table.get("kind"), ("http", "mcp"), f"{where}.probe.kind")
+    kind_name = validate.one_of(table.get("kind"), ("http", "mcp", "log"), f"{where}.probe.kind")
     # Narrowed by hand rather than cast: one_of guarantees membership, but its
     # return type is str, and a cast here would be the same suppression in a
     # longer spelling.
-    kind: ProbeKind = "http" if kind_name == "http" else "mcp"
+    kind: ProbeKind
+    if kind_name == "http":
+        kind = "http"
+    elif kind_name == "mcp":
+        kind = "mcp"
+    else:
+        kind = "log"
+
+    _refuse_keys_of_the_other_kind(table, kind, where)
+
+    if kind == "log":
+        expect = validate.non_empty_str(table.get("expect"), f"{where}.probe.expect")
+        return Probe(kind=kind, expect=expect)
+
     url = validate.non_empty_str(table.get("url"), f"{where}.probe.url")
     status = validate.positive_int(table.get("expect_status", 200), f"{where}.probe.expect_status")
     body = table.get("expect_body")
