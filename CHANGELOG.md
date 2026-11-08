@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-07
+
 ### Added
 - **A third probe kind, `log`, for services that answer nothing.** The agent
   seats — Kagetora, Josui and the developer seats — expose no port, and Nagios
