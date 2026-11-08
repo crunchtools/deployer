@@ -21,6 +21,7 @@ to pass.
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -77,6 +78,10 @@ SERVICE = Service(
     build_deadline=1800,
 )
 REGISTRY = Registry({"acquacotta": SERVICE})
+#: The same service with a `log` probe, for the paths whose wording has to
+#: differ when there is no URL and nothing answered over the network.
+READY_LINE = "taking commands"
+SEAT_REGISTRY = Registry({"acquacotta": replace(SERVICE, probe=Probe(kind="log", expect=READY_LINE))})
 
 
 def _fields(service: Service) -> dict[str, Any]:
@@ -172,6 +177,9 @@ class FakePodman:
         self.removed: list[str] = []
         self.rollback_images: tuple[ImageRef, ...] = ()
         self.log_text = "ValueError: no database\n"
+        #: The container's identity, in the shape a `log` probe reads it.
+        self.container_id = "c0ffee"
+        self.started_at = "2027-01-01T00:00:00.000000000Z"
         self.fail_tag_on: str | None = None
         self.fail_inspect = False
         self.reference = f"{IMAGE}:latest"
@@ -186,8 +194,19 @@ class FakePodman:
             raise PodmanError("no such container")
         config = {"Env": "PATH=/x" if self.broken_env else list(self.env)}
         # ImageName is the reference the unit created the container from, which
-        # is what the unit-shape gate reads.
-        return {"Image": self.running, "ImageName": self.reference, "Config": config}
+        # is what the unit-shape gate reads. Id, RestartCount and
+        # State.StartedAt are what a `log` probe reads: the first two pin the
+        # container's identity across the settle window, and the third is the
+        # floor for the log read. They are here in the libpod shape measured on
+        # podman 5.8.2, not a convenient one.
+        return {
+            "Image": self.running,
+            "ImageName": self.reference,
+            "Config": config,
+            "Id": self.container_id,
+            "RestartCount": 0,
+            "State": {"StartedAt": self.started_at},
+        }
 
     async def inspect_image(self, name: str) -> ImageRef:
         key = self.by_ref.get(name, name)
@@ -318,7 +337,7 @@ class FakeNagios:
 class World:
     """One host, one RT, and a runner pointed at them."""
 
-    def __init__(self, state: Path, *tickets: Ticket) -> None:
+    def __init__(self, state: Path, *tickets: Ticket, registry: Registry | None = None) -> None:
         self.rt = FakeRt(*tickets)
         self.podman = FakePodman()
         self.systemd = FakeSystemd(self.podman)
@@ -336,7 +355,7 @@ class World:
             return httpx.Response(503 if unwell else 200, text="nope" if unwell else "ok")
 
         self.runner = Runner(
-            registry=REGISTRY,
+            registry=registry or REGISTRY,
             state_dir=state,
             clients=Clients(
                 rt=self.rt,
@@ -767,6 +786,28 @@ async def test_a_revision_already_live_is_finished_without_a_restart(tmp_path: P
     assert world.nagios.opened == []
     assert world.rt.status() == ["resolved"]
     assert world.rt.said("Already deployed.")
+
+
+async def test_the_already_live_comment_does_not_claim_a_url_answered(tmp_path: Path) -> None:
+    """The second place the receipt could lie, found in production on 2026-11-08.
+
+    ``_proof_phrase`` exists because the success comment used to end "and
+    <url> answered throughout" on every tier, which is an invention on a
+    ``log`` row. The already-live comment carried its OWN copy of that
+    sentence with the URL interpolated directly, so RT 1589 resolved josui
+    saying "and  answered for 120s" -- a blank where the proof belongs, on the
+    one tier that proves least. Fixing it in one place left the other lying.
+    """
+    world = World(tmp_path, ticket(), registry=SEAT_REGISTRY)
+    world.podman.running = CANDIDATE_ID
+    world.podman.log_text = f"josui: serving: {READY_LINE} on /tmp/sock after 1s\n"
+    report = await world.drain()
+    assert report.outcome == OUTCOME_OK
+    assert world.systemd.restarts == []
+    assert world.rt.said("Already deployed.")
+    assert world.rt.said(READY_LINE)
+    # The bug verbatim: a sentence with nothing in front of "answered".
+    assert not world.rt.said(" answered for ")
 
 
 async def test_a_revision_already_live_clears_its_hold(tmp_path: Path) -> None:
