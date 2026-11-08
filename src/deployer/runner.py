@@ -515,7 +515,7 @@ class Runner:
             f"Already deployed. {service.unit} was already running {request.short_commit} "
             f"(image {staged.candidate_image_id[:19]}) when this ticket came round, and it "
             f"verified: the unit is active, the container is running that exact image, and "
-            f"{service.probe.url} answered for {service.settle}s. Nothing was restarted.\n"
+            f"{_proof_phrase(service)}. Nothing was restarted.\n"
             "If you expected a deploy here, the likeliest explanation is that an earlier run "
             "deployed it and could not reach RT to say so."
             + ("\nThe hold on this service is cleared." if cleared else "")
