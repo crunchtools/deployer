@@ -81,3 +81,22 @@ requestors = ["scott"]
 probe = { kind = "mcp", url = "http://127.0.0.1:8026/mcp" }
 settle = 30
 rollback = "auto"
+
+[service."mcp-cloudflare"]
+repo = "crunchtools/mcp-cloudflare"
+image = "quay.io/crunchtools/mcp-cloudflare"
+# The container is `mcp-cloudflare`; the unit carries the full hostname.
+unit = "mcp-cloudflare.crunchtools.com.service"
+nagios_host = "ctr-mcp-cloudflare.crunchtools.com"
+requestors = ["scott"]
+# Measured 200 against an initialize POST before onboarding. There is no
+# /health route, which is why every MCP server here probes the handshake
+# instead of a status code that would pass without testing anything.
+probe = { kind = "mcp", url = "http://127.0.0.1:8008/mcp" }
+settle = 30
+# NOT THE ROBOT'S JOB, AND NOT ITS FAULT: after this deploys, sessions already
+# connected to the gateway keep their old tool list until someone runs
+# reconnect_backend cloudflare. That is crunchtools/trentina#752. The deployer
+# holds no capability to call into the gateway and should not gain one -- it is
+# a model-free root process that will shortly be deploying the gateway itself.
+rollback = "auto"
