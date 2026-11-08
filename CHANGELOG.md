@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-08
+
 ### Added
 - **The Cloudflare Origin CA root ships in the image**, at
   `/etc/deployer/cloudflare-origin-ca.pem`, so an `https` probe can name it as
