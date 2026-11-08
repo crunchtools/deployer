@@ -100,3 +100,180 @@ settle = 30
 # holds no capability to call into the gateway and should not gain one -- it is
 # a model-free root process that will shortly be deploying the gateway itself.
 rollback = "auto"
+
+[service."images.rootsofthevalley.org"]
+repo = "crunchtools/rotv"
+image = "quay.io/crunchtools/images-rotv"
+unit = "images.rootsofthevalley.org.service"
+nagios_host = "ctr-images.rootsofthevalley.org"
+requestors = ["scott"]
+# Measured 200 before onboarding. /health is 404 on this one -- the route is
+# under /api.
+probe = { kind = "http", url = "http://127.0.0.1:8094/api/health", expect_status = 200 }
+settle = 60
+# This is the image-server, not the app: it runs no migrations of its own, so
+# it comes up quickly. The default would probably do; 120 costs nothing when a
+# service answers fast, because `ready` ends on the first passing answer.
+ready = 120
+rollback = "auto"
+# ONE REPO, TWO IMAGES. crunchtools/rotv builds both this and `rotv` from one
+# push, by two workflows. A ticket names the SERVICE, so each is deployed on
+# its own -- and that matters, because restarting the app is a multi-minute
+# outage while restarting this is not. Deploy only the one whose code changed.
+
+[service."rootsofthevalley.org"]
+repo = "crunchtools/rotv"
+image = "quay.io/crunchtools/rotv"
+unit = "rootsofthevalley.org.service"
+nagios_host = "ctr-rootsofthevalley.org"
+requestors = ["scott"]
+probe = { kind = "http", url = "http://127.0.0.1:8082/api/health", expect_status = 200 }
+settle = 60
+# A RESTART HERE BOOTS POSTGRESQL AND RUNS EVERY MIGRATION BEFORE THE BACKEND
+# LISTENS, which is a multi-minute user-visible outage on the public site. 600
+# is not measured and is deliberately far past any plausible answer: `ready`
+# ends on the first passing probe, so being generous costs nothing when it
+# comes up fast, while being short invents a failure and rolls back a healthy
+# deploy. That is bug 5 of this program, and this is the service most likely
+# to repeat it.
+ready = 600
+# MANUAL, not auto, and this row had it wrong until 2026-11-08. The README's
+# own rule is that a service with database migrations is `rollback = "manual"`,
+# because old code against a new schema is worse than a failed deploy with the
+# downtime still open -- and the comment directly above says a restart here
+# runs every migration. ROTV's migrations are numbered and forward-only, so an
+# automatic rollback to the previous image would put the old backend on a
+# schema it has never seen, on the public site, unattended. A failure now
+# leaves the new code running and hands it to a person: `deployer rollback
+# rootsofthevalley.org` is the one command, and the rollback image stays on the
+# host.
+rollback = "manual"
+
+[service."postiz.crunchtools.com"]
+repo = "crunchtools/postiz"
+image = "quay.io/crunchtools/postiz"
+unit = "postiz.crunchtools.com.service"
+nagios_host = "ctr-postiz.crunchtools.com"
+requestors = ["scott"]
+# Measured before onboarding. NOT "/" -- that is a 307 to /auth, which proves
+# only that something is routing. NOT /api/health -- 404 here. /p/health is a
+# real health route and answers 200.
+probe = { kind = "http", url = "http://127.0.0.1:8092/p/health", expect_status = 200 }
+settle = 60
+# Node plus Temporal plus Prisma behind it. Not measured; deliberately well
+# past any plausible answer, because ready ends on the first passing probe so
+# a generous window costs nothing when it comes up fast.
+ready = 300
+rollback = "auto"
+
+[service."proxy.crunchtools.com"]
+repo = "crunchtools/proxy"
+image = "quay.io/crunchtools/proxy"
+unit = "proxy.crunchtools.com.service"
+nagios_host = "ctr-proxy.crunchtools.com"
+requestors = ["scott"]
+# THIS PROBE CHECKS THE CERTIFICATE, NOT JUST A STATUS CODE, and that is the
+# whole reason this service could not be onboarded until 0.4.0.
+#
+# proxy serves every site on the estate by Host header and terminates TLS. The
+# only other probe expressible against it is a plain GET to port 80, which
+# answers 301 -- and would answer 301 just as happily with no certificate
+# loaded, the wrong certificate loaded, or mod_ssl failing to start. That is
+# the one failure this service exists to prevent, so a probe blind to it is not
+# worth having on the host's most important container.
+#
+# server_name goes out as both the SNI and the Host header; ca_file is the
+# Cloudflare Origin CA root shipped inside the deployer image. Python verifies
+# the chain, the dates and the hostname, so the deploy is accepted only if the
+# certificate being served still verifies as this name.
+#
+# Measured against the live proxy from inside the deployer image before
+# onboarding: crunchtools.com gave 200, www.crunchtools.com gave 301 (the cert
+# covers the wildcard), and not-ours.example.com was REFUSED with
+# CERTIFICATE_VERIFY_FAILED, hostname mismatch. The refusal is the point.
+probe = { kind = "http", url = "https://127.0.0.1:443/", server_name = "crunchtools.com", ca_file = "/etc/deployer/cloudflare-origin-ca.pem", expect_status = 200 }
+settle = 60
+# httpd with mod_ssl and no application behind it, so it answers quickly. 120
+# is generous and costs nothing, since ready ends on the first passing probe.
+ready = 120
+rollback = "auto"
+
+[service."trentina"]
+repo = "crunchtools/trentina"
+image = "quay.io/crunchtools/trentina"
+# The container is `trentina`; the unit carries the full hostname.
+unit = "trentina.crunchtools.com.service"
+nagios_host = "ctr-trentina.crunchtools.com"
+requestors = ["scott"]
+# This is the gateway every seat and every MCP backend talks through, so the
+# probe asserts more than "something answered on 8019". /health returns
+# {"status":"ok","classifier":"loaded",...}, and `classifier":"loaded"` is the
+# one field worth holding: the gateway's whole job is judging content, and a
+# process that serves /health with no classifier loaded is serving nothing that
+# matters. A 200 alone would pass for that.
+probe = { kind = "http", url = "http://127.0.0.1:8019/health", expect_status = 200, expect_body = "\"classifier\":\"loaded\"" }
+# The gateway answered 12s after a measured restart on 2026-11-08. `ready` ends
+# on the first passing probe, so 180 is margin and costs nothing.
+ready = 180
+# Longer than the fleet default. The failure this service actually has is not a
+# crash but memory growth: on 2026-11-07 an unreleased 6.11.0 build climbed to
+# the unit's 4g cap over about two hours and was SIGKILLed, taking the git
+# proxy, the egress listener and all three developer seats with it. No settle
+# window catches a two-hour curve -- the Nagios "Container memory" check is
+# what catches that, at 85% and 95% of the cgroup limit, which the 8g cap puts
+# at 6.8G and 7.6G. 120s is here to catch a fast crash loop, and the honest
+# statement is that this window does not prove memory behaviour.
+settle = 120
+rollback = "auto"
+
+[service."kagetora.crunchtools.com"]
+repo = "crunchtools/hermes"
+image = "quay.io/crunchtools/hermes"
+unit = "kagetora.crunchtools.com.service"
+nagios_host = "ctr-kagetora.crunchtools.com"
+requestors = ["scott"]
+# A LOG PROBE, because this seat answers nothing over the network. Nagios
+# monitors it with "Container is running", which is true of a container whose
+# main process is `sleep`. The entrypoint prints `ready: cron list answered
+# after Ns` once the gateway is actually taking commands, and `gave up: ...` on
+# failure -- two lines with no shared substring, so a watcher told to wait for
+# one cannot be satisfied by the other. The deployer reads the log only since
+# this container's own StartedAt, so the previous run's line cannot pass, and
+# then holds on the container's identity and restart count for the settle
+# window rather than re-reading the log.
+probe = { kind = "log", expect = "ready:" }
+ready = 180
+settle = 120
+# MANUAL, and this is a decision rather than caution. Hermes keeps its state in
+# /app/.hermes, and whether it migrates that directory forward on start is NOT
+# known: the Hermes package is upstream and is not vendored in this repo, so
+# there is nothing here to read. Until someone reads it, an automatic rollback
+# could put older code on a data dir a newer version has already written. A
+# failed deploy therefore leaves the new image running and hands it to a
+# person: `deployer rollback kagetora.crunchtools.com`.
+rollback = "manual"
+
+[service."josui.crunchtools.com"]
+repo = "crunchtools/josui"
+image = "quay.io/crunchtools/josui"
+unit = "josui.crunchtools.com.service"
+nagios_host = "ctr-josui.crunchtools.com"
+requestors = ["scott"]
+# A LOG PROBE. Like kagetora this seat answers nothing over the network, and
+# from outside a Claude Code seat looks like a process sitting still. The
+# entrypoint prints `serving: taking commands on <socket> after Ns` once the
+# control socket exists, and `gave up: <socket> never appeared in Ns` when it
+# does not. The two share no substring, so a watcher waiting for one cannot be
+# satisfied by the other -- which was the first draft's bug, and a readiness
+# check that cannot fail is worse than none because it gets trusted.
+probe = { kind = "log", expect = "taking commands" }
+ready = 180
+settle = 120
+# AUTO, unlike kagetora, and for a reason rather than by default. This seat's
+# persistent state is Claude Code's own configuration, in the home directory
+# mounted into it -- nothing there owns a schema or migrates it, so there is no
+# old-code-on-new-data hazard to protect. What there is instead is a seat Scott
+# talks to through a Matrix bridge, so coming back by itself is worth more than
+# being held for a person. The sign-in survives a rollback either way: the credentials live in
+# the mounted state directory, not in the image.
+rollback = "auto"
