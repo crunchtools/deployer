@@ -59,7 +59,7 @@ ExecStart=/usr/bin/podman run --rm --name deployer.crunchtools.com \
     -v /run/podman/podman.sock:/run/podman/podman.sock \
     -v /run/dbus/system_bus_socket:/run/dbus/system_bus_socket \
     --tmpfs /tmp \
-    quay.io/crunchtools/deployer:0.2.0 \
+    quay.io/crunchtools/deployer:0.3.0 \
     run
 ExecStopPost=-/usr/bin/podman rm -f deployer.crunchtools.com
 
