@@ -7,6 +7,26 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- **The Cloudflare Origin CA root ships in the image**, at
+  `/etc/deployer/cloudflare-origin-ca.pem`, so an `https` probe can name it as
+  its `ca_file`. It is a public root rather than a secret, and a trust anchor a
+  probe depends on belongs versioned with the code that verifies against it
+  instead of mounted from a host path that can change under a release.
+
+  This is what makes the reverse proxy probeable at all. Cloudflare terminates
+  TLS publicly and reaches the origin with an Origin CA certificate that is
+  deliberately absent from every public trust store, so without the bundle the
+  only probe expressible against `proxy.crunchtools.com` was a plain `:80`
+  redirect check — one that passes while TLS is entirely broken, which is the
+  single failure that service exists to prevent.
+
+  Verified rather than taken on provenance: the bundle verifies the certificate
+  the live proxy actually serves (`openssl verify -CAfile` returns OK against
+  that leaf, whose issuer is this subject). sha256
+  `91a8a5567efa6bf941162aa806b3ba476aaddf7867640e53053b35fb225a5dae`, valid to
+  2029-08-15.
+
+### Added
 - **`server_name` and `ca_file` on an `https` probe, so a TLS-terminating
   proxy can be verified.** `proxy.crunchtools.com` fronts every site on the
   fleet, and the only probe expressible before this was

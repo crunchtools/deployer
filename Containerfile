@@ -27,6 +27,27 @@ LABEL name="deployer" \
 COPY --from=builder /app/venv /app/venv
 ENV PATH="/app/venv/bin:$PATH"
 
+# THE CLOUDFLARE ORIGIN CA ROOT, for an `https` probe with a `ca_file`.
+#
+# Shipped in the image because it is a public root, not a secret, and because a
+# trust anchor a probe depends on should be versioned with the code that
+# verifies against it rather than mounted from a host path that can change
+# underneath a release.
+#
+# It is here so a reverse proxy can be probed for the certificate it is
+# actually serving. Cloudflare terminates TLS publicly and talks to the origin
+# with an Origin CA certificate, which is deliberately not in any public trust
+# store, so without this bundle the only probe expressible against the proxy is
+# a plain `:80` redirect check that would pass with TLS entirely broken.
+#
+# Verified rather than trusted on provenance: this file verifies the
+# certificate gloval's proxy actually serves. `openssl verify -CAfile` against
+# that live leaf returns OK, the leaf's issuer is this subject, and the subject
+# matches the "CloudFlare Origin SSL Certificate Authority" Cloudflare
+# publishes. sha256 91a8a5567efa6bf941162aa806b3ba476aaddf7867640e53053b35fb225a5dae,
+# valid to 2029-08-15. Re-verify the same way before replacing it.
+COPY trust/cloudflare-origin-ca.pem /etc/deployer/cloudflare-origin-ca.pem
+
 # A oneshot, not a server: nothing is exposed and nothing listens. The unit
 # starts it, it drains the queue, it exits.
 ENTRYPOINT ["python", "-m", "deployer"]
