@@ -243,7 +243,14 @@ class FakePodman:
             raise PodmanError("the image store is unreadable")
         return self.rollback_images
 
-    async def logs(self, name: str, tail: int = 40) -> str:
+    async def logs(
+        self,
+        name: str,
+        tail: int = 40,
+        since: float | None = None,
+        strict: bool = False,
+    ) -> str:
+        del since, strict
         return self.log_text
 
     def latest_points_at(self) -> str:

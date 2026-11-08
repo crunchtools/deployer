@@ -254,7 +254,14 @@ class RollbackPodman:
             return (ImageRef(id="sha256:old", digest=None, tags=(self.rollback_tag,), labels={}),)
         return ()
 
-    async def logs(self, name: str, tail: int = 40) -> str:
+    async def logs(
+        self,
+        name: str,
+        tail: int = 40,
+        since: float | None = None,
+        strict: bool = False,
+    ) -> str:
+        del since, strict
         return ""
 
 

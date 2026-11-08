@@ -226,9 +226,20 @@ class ImageHost(Protocol):
         """Images, newest first, optionally filtered by a reference pattern."""
         ...
 
-    async def logs(self, name: str, tail: int = ...) -> str:
-        """The last ``tail`` lines a container wrote, de-multiplexed. Never
-        raises: a note is returned in place of the output."""
+    async def logs(
+        self,
+        name: str,
+        tail: int = ...,
+        since: float | None = ...,
+        strict: bool = ...,
+    ) -> str:
+        """The last ``tail`` lines a container wrote, de-multiplexed.
+
+        ``since`` is a Unix timestamp floor, which is what makes this usable as
+        a readiness signal rather than only as a failure note. ``strict``
+        re-raises instead of returning a note in its place: a caller deciding
+        on readiness has to tell "the line is not there" from "the log could
+        not be read"."""
         ...
 
 
