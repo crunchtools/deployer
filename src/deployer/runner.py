@@ -897,6 +897,11 @@ def _proof_phrase(service: Service) -> str:
             f"that same container, with no restart, for the whole window "
             f"(no health probe: this service answers nothing over the network)"
         )
+    if service.probe.server_name:
+        return (
+            f"{service.probe.url} answered throughout, with a certificate that "
+            f"verified as {service.probe.server_name}"
+        )
     return f"{service.probe.url} answered throughout"
 
 

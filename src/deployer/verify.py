@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import ssl
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -158,6 +159,42 @@ class Outcome:
         return not self.ok
 
 
+def _client_for(probe: Probe) -> httpx.AsyncClient:
+    """A client of this probe's own, trusting exactly what the row names.
+
+    ``ssl.create_default_context`` and nothing else. ``check_hostname`` stays
+    True, so OpenSSL verifies the chain, the validity dates and the name
+    against ``server_name`` while the socket still goes to the URL's host.
+
+    There is deliberately no ``verify=False`` here, and nothing reads
+    ``getpeercert()`` to compare names by hand. Chain verification is not a
+    MITM defence on a loopback socket -- it *is* the check being performed, and
+    a hand-rolled comparison would be a second, worse implementation of the one
+    thing this probe exists to do.
+    """
+    timeout = httpx.Timeout(PROBE_TIMEOUT_SECONDS)
+    if probe.ca_file is None:
+        return httpx.AsyncClient(timeout=timeout)
+    return httpx.AsyncClient(timeout=timeout, verify=ssl.create_default_context(cafile=probe.ca_file))
+
+
+def _tls_request_parts(probe: Probe) -> tuple[dict[str, str], dict[str, Any]]:
+    """The headers and extensions that put ``server_name`` on the wire.
+
+    One name, two places, because a TLS-terminating proxy needs both: the SNI
+    picks which certificate Apache offers, the ``Host`` header picks which
+    vhost answers, and a probe that set only one of them would be testing a
+    different thing than it reports. httpx passes
+    ``extensions["sni_hostname"]`` through to httpcore, which hands it to the
+    TLS wrap as ``server_hostname`` -- which is also what ``check_hostname``
+    verifies the certificate against. Measured against httpx 0.28.1 and
+    httpcore 1.0.9.
+    """
+    if not probe.server_name:
+        return {}, {}
+    return {"Host": probe.server_name}, {"sni_hostname": probe.server_name}
+
+
 async def probe_once(probe: Probe, client: httpx.AsyncClient | None = None) -> ProbeResult:
     """Ask a service whether it is healthy, once.
 
@@ -165,18 +202,31 @@ async def probe_once(probe: Probe, client: httpx.AsyncClient | None = None) -> P
     asks, a substring of the body. ``mcp`` is a JSON-RPC ``initialize`` POST,
     because several MCP servers in this fleet expose no health route at all and
     a status check against one would pass without testing anything.
+
+    A row that pins the TLS identity is never run on the shared client -- see
+    ``Probe.pins_tls`` for why one client cannot serve both kinds of row.
     """
-    owned = client is None
-    http = client or httpx.AsyncClient(timeout=httpx.Timeout(PROBE_TIMEOUT_SECONDS))
+    shared = None if probe.pins_tls else client
+    owned = shared is None
+    try:
+        http = shared or _client_for(probe)
+    except (OSError, ssl.SSLError) as exc:
+        # The registry loads every ca_file it accepts, so reaching here means
+        # the bundle changed under a running deployer. Still this program's
+        # fault rather than the service's, and it says so rather than arriving
+        # as a traceback in the middle of a maintenance window.
+        return ProbeResult(ok=False, detail=f"{probe.url}: cannot use ca_file {probe.ca_file!r}: {exc}")
+    headers, extensions = _tls_request_parts(probe)
     try:
         if probe.kind == "mcp":
             response = await http.post(
                 probe.url,
                 json=MCP_INITIALIZE,
-                headers={"Accept": "application/json, text/event-stream"},
+                headers={"Accept": "application/json, text/event-stream", **headers},
+                extensions=extensions,
             )
         else:
-            response = await http.get(probe.url)
+            response = await http.get(probe.url, headers=headers, extensions=extensions)
     except httpx.HTTPError as exc:
         return ProbeResult(ok=False, detail=f"{probe.kind} {probe.url}: {exc}")
     finally:

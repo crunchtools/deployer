@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import trustme
 
 from deployer.registry import (
     DEFAULT_BUILD_DEADLINE_SECONDS,
@@ -141,6 +142,20 @@ def test_every_required_key_is_required(tmp_path: Path, missing: str) -> None:
         # And the converse: expect belongs to a log probe only.
         '{ kind = "http", url = "http://x/y", expect = "ready" }',
         '{ kind = "mcp", url = "http://x/y", expect = "ready" }',
+        # The TLS keys describe a handshake. On a plaintext URL no certificate
+        # is ever offered, so a row carrying them there would be claiming a
+        # name was verified against nothing.
+        '{ kind = "http", url = "http://x/y", server_name = "x.crunchtools.com" }',
+        '{ kind = "http", url = "http://x/y", ca_file = "/etc/deployer/origin-ca.pem" }',
+        '{ kind = "mcp", url = "http://x/mcp", ca_file = "/etc/deployer/origin-ca.pem" }',
+        '{ kind = "log", expect = "ready", server_name = "x.crunchtools.com" }',
+        '{ kind = "log", expect = "ready", ca_file = "/etc/deployer/origin-ca.pem" }',
+        # A ca_file naming nothing is refused at load, not at deploy: the
+        # alternative spends a maintenance window learning what one stat knew.
+        '{ kind = "http", url = "https://x/y", ca_file = "/nowhere/origin-ca.pem" }',
+        '{ kind = "http", url = "https://x/y", ca_file = 3 }',
+        '{ kind = "http", url = "https://x/y", server_name = "" }',
+        '{ kind = "http", url = "https://x/y", server_name = 3 }',
     ],
 )
 def test_a_bad_probe_is_refused(tmp_path: Path, probe: str) -> None:
@@ -164,6 +179,105 @@ def test_a_log_probe_loads_and_carries_no_url(tmp_path: Path) -> None:
     assert probe.reads_log
     assert probe.expect == "accepted bypass permissions mode"
     assert probe.url == "", "a log probe must not carry a URL to put on a ticket"
+
+
+def real_bundle(tmp_path: Path) -> Path:
+    """A PEM bundle OpenSSL will actually load.
+
+    A file holding a plausible-looking BEGIN line will not do any more: the
+    registry loads what it accepts, because stat'ing it was the difference
+    between exit 2 and a rolled-back deploy.
+    """
+    bundle = tmp_path / "origin-ca.pem"
+    trustme.CA().cert_pem.write_to_path(bundle)
+    return bundle
+
+
+def one_service(probe: str) -> str:
+    """The fixture's first row, with its probe replaced."""
+    return GOOD.split('[service."mcp-pcloud')[0].replace(
+        'probe = { kind = "http", url = "http://127.0.0.1:8080/api/plugins", expect_status = 200 }',
+        f"probe = {probe}",
+    )
+
+
+def test_a_tls_row_loads_and_carries_the_name_and_the_bundle(tmp_path: Path) -> None:
+    """The row ``proxy.crunchtools.com`` needs: one name, one trust bundle."""
+    bundle = real_bundle(tmp_path)
+    text = one_service(
+        '{ kind = "http", url = "https://127.0.0.1:443/", server_name = "crunchtools.com", '
+        f'ca_file = "{bundle}", expect_status = 200 }}'
+    )
+    probe = load_registry(write(tmp_path, text)).services["acquacotta.crunchtools.com"].probe
+    assert probe.server_name == "crunchtools.com"
+    assert probe.ca_file == str(bundle)
+    assert probe.pins_tls is True
+
+
+def test_a_plain_http_row_pins_nothing(tmp_path: Path) -> None:
+    """So it keeps sharing the fleet's one client, as it always did."""
+    probe = load_registry(write(tmp_path, GOOD)).services["acquacotta.crunchtools.com"].probe
+    assert probe.server_name is None
+    assert probe.ca_file is None
+    assert probe.pins_tls is False
+
+
+def test_the_tls_keys_ride_on_the_scheme_not_on_the_kind(tmp_path: Path) -> None:
+    """An ``mcp`` server behind the same proxy is the same handshake.
+
+    Nothing about these keys is specific to the ``http`` kind -- what decides
+    whether a certificate is offered is the URL, so that is what gates them.
+    """
+    bundle = real_bundle(tmp_path)
+    text = one_service(
+        f'{{ kind = "mcp", url = "https://127.0.0.1:443/mcp", server_name = "mcp.crunchtools.com", '
+        f'ca_file = "{bundle}" }}'
+    )
+    probe = load_registry(write(tmp_path, text)).services["acquacotta.crunchtools.com"].probe
+    assert probe.kind == "mcp"
+    assert probe.pins_tls is True
+
+
+def test_a_tls_key_on_a_plaintext_url_is_refused_by_name_and_reason(tmp_path: Path) -> None:
+    text = one_service('{ kind = "http", url = "http://127.0.0.1:80/", server_name = "crunchtools.com" }')
+    with pytest.raises(RegistryError) as exc:
+        load_registry(write(tmp_path, text))
+    message = str(exc.value)
+    assert "server_name" in message
+    assert "is not https" in message
+    assert "no certificate to verify" in message
+
+
+def test_a_ca_file_that_is_not_there_is_refused_at_load_and_names_the_path(tmp_path: Path) -> None:
+    """A registry that loaded this would fail every probe for the service.
+
+    Later, in a maintenance window, on a ticket -- instead of here, where the
+    answer is one ``stat`` and the message can name the path.
+    """
+    missing = tmp_path / "origin-ca.pem"
+    text = one_service(f'{{ kind = "http", url = "https://127.0.0.1:443/", ca_file = "{missing}" }}')
+    with pytest.raises(RegistryError) as exc:
+        load_registry(write(tmp_path, text))
+    assert str(missing) in str(exc.value)
+    assert "is not a file" in str(exc.value)
+
+
+def test_a_ca_file_that_is_not_a_bundle_is_refused_at_load(tmp_path: Path) -> None:
+    """An unloadable bundle is the registry being wrong, which is exit 2.
+
+    Stat'ing the path was not enough. A file that is there but is not PEM
+    loaded fine here and then failed the probe, which is exit 1 -- a deploy
+    reported as broken, rolled back, on a ticket, in a window it spent. The
+    bundle is therefore loaded while the registry is being read, so the fault
+    is named as what it is.
+    """
+    junk = tmp_path / "origin-ca.pem"
+    junk.write_text("this is not a certificate\n", encoding="utf-8")
+    text = one_service(f'{{ kind = "http", url = "https://127.0.0.1:443/", ca_file = "{junk}" }}')
+    with pytest.raises(RegistryError) as exc:
+        load_registry(write(tmp_path, text))
+    assert str(junk) in str(exc.value)
+    assert "is not a bundle OpenSSL will load" in str(exc.value)
 
 
 @pytest.mark.parametrize("value", ["0", "-1", '"60"', "true"])

@@ -6,6 +6,55 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **`server_name` and `ca_file` on an `https` probe, so a TLS-terminating
+  proxy can be verified.** `proxy.crunchtools.com` fronts every site on the
+  fleet, and the only probe expressible before this was
+  `http://127.0.0.1:80/` expecting a 301 — which is answered just as happily
+  by an Apache serving an expired certificate, or serving the default vhost's
+  certificate to every name. Not a new probe kind: the scheme is already in
+  the URL, so the keys ride on it and work for `mcp` rows behind the same
+  proxy.
+
+  `server_name` goes out as **both** the TLS SNI and the HTTP `Host` header —
+  the SNI decides which certificate Apache offers, the header decides which
+  vhost answers, and a probe that sent one without the other would be
+  reporting on a different request than it made. `ca_file` is used through a
+  plain `ssl.create_default_context(cafile=...)` with `check_hostname` left
+  alone, so OpenSSL checks the chain, the validity dates and the name while
+  the socket still goes to loopback. There is no `verify=False` anywhere and
+  nothing reads `getpeercert()` to compare names by hand: on a loopback socket
+  the verification is not a MITM defence, it *is* the check.
+
+  Both keys are refused on a URL that is not `https`, and a `ca_file` is
+  *loaded* while the registry is read rather than stat'ed — absent or not PEM,
+  either way the registry is wrong, which is exit 2, "could not run". The
+  alternative was a configuration error arriving as exit 1: a deploy reported
+  as broken, rolled back, on a ticket, in a maintenance window it spent.
+
+  Tested against a real TLS listener, with certificates minted in the test by
+  `trustme` (a new dev dependency; it cannot reach the image, which installs
+  only `[project.dependencies]`). A stubbed transport cannot refuse a
+  certificate, so against one the whole feature is a no-op that passes. A
+  matching chain and name verifies; a certificate from another authority, one
+  for another host, and an expired one each fail, with the specific verdict
+  asserted rather than "verify failed".
+
+### Fixed
+- **A row that pins TLS no longer shares the fleet's one HTTP client.**
+  `verify` is a per-client setting, so a `ca_file` row needed its own; but
+  measured against httpx 0.28.1 and httpcore 1.0.9, the pool also keys a
+  keep-alive connection by **origin alone**. Two rows probing
+  `https://127.0.0.1:443/` under different `server_name`s on one client reuse
+  the same handshake, and the second comes back 200 with its own name never
+  offered — a false pass on the one thing the row is buying. So `server_name`
+  alone is enough to earn a client, and the shared client's settings are
+  untouched.
+- The success comment on a pinned row now says which name the certificate
+  verified as. "`https://127.0.0.1:443/` answered throughout" is equally true
+  of a proxy serving the wrong certificate to that port, and the comment is
+  the only receipt a deploy leaves.
+
 ## [0.3.0] - 2026-11-07
 
 ### Added
