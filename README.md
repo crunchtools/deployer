@@ -154,6 +154,20 @@ deploy with the downtime still open.
 
 An unknown key is a load error rather than a value that is ignored.
 
+An `http` or `mcp` probe on an `https` URL may name what the handshake has to
+prove:
+
+```toml
+probe = { kind = "http", url = "https://127.0.0.1:443/", server_name = "crunchtools.com", ca_file = "/etc/deployer/cloudflare-origin-ca.pem", expect_status = 200 }
+```
+
+`server_name` goes out as both the TLS SNI and the `Host` header, and `ca_file`
+is the bundle the chain must verify against; the socket still goes to the URL's
+host. That is the difference between "something is listening on 443" and "the
+proxy is serving a certificate that is valid, in date, and for this name".
+Both keys are refused on a URL that is not `https`, and a `ca_file` that names
+nothing is refused when the registry loads rather than when the deploy runs.
+
 Where things live is a property of the deployment, so it comes from the unit's
 environment and there are no built-in paths — a guessed one would mean acting on
 whatever happened to be there. A missing variable is exit 2, "could not run".
