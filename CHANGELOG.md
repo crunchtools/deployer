@@ -6,6 +6,47 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-07
+
+### Added
+- **A third probe kind, `log`, for services that answer nothing.** The agent
+  seats — Kagetora, Josui and the developer seats — expose no port, and Nagios
+  watches each with a single check that says "the container is running". Both
+  existing probe kinds need something to send a request to, so those services
+  could not be onboarded at all, which left six-plus containers running
+  whatever `:latest` held at their last restart. A `log` row names a line
+  (`probe = { kind = "log", expect = "..." }`); the readiness window waits for
+  it to appear and the settle window then holds on the container's identity.
+
+  It is deliberately not a kind meaning "check nothing". That would pass for a
+  container whose main process is `sleep`, which is roughly what a Claude Code
+  seat looks like from outside, and a check that cannot fail is worse than no
+  check because it gets trusted.
+
+  The log is read **only from `State.StartedAt` onwards**. A unit that
+  `podman start`s an existing container keeps the previous run's output, so a
+  whole-log grep would be answered by the *last* run's startup line and call a
+  service ready before it had done anything — the same family of mistake as
+  reading a restart as finished the moment it was requested. Field names and
+  the `since` behaviour were measured against podman 5.8.2 rather than assumed.
+
+  Keys are refused across kinds: `url`, `expect_status` and `expect_body` on a
+  `log` row, and `expect` on an `http` or `mcp` row. A silently ignored key is
+  how a registry starts claiming a proof it is not performing.
+
+### Changed
+- **The settle window now fails a container that was replaced or restarted
+  inside it**, for every probe kind rather than only `log`. It compares `Id`
+  and `RestartCount` against the values read when the window opened. A
+  crash-looping service answers its probe perfectly well between crashes, so
+  sampling a window without asking whether it is still the same process was
+  measuring the gaps between failures.
+- The success comment on a resolved ticket no longer ends `and <url> answered
+  throughout` unconditionally. On a `log` row there is no URL and nothing
+  answered; that sentence was a fabrication waiting to happen on the one tier
+  that proves least, which is exactly where a reader most needs to know what
+  was actually checked.
+
 ## [0.2.0] - 2026-11-07
 
 ### Added

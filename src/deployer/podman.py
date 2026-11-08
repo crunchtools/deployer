@@ -290,8 +290,30 @@ class PodmanImages:
             )
         return tuple(found)
 
-    async def logs(self, name: str, tail: int = DEFAULT_LOG_LINES) -> str:
+    async def logs(
+        self,
+        name: str,
+        tail: int = DEFAULT_LOG_LINES,
+        since: float | None = None,
+        strict: bool = False,
+    ) -> str:
         """The last ``tail`` lines a container has written. Read-only.
+
+        ``since`` is a Unix timestamp and the endpoint drops everything older.
+        It is what makes this usable as a readiness signal: a unit that
+        ``podman start``s an *existing* container keeps the previous run's
+        output, so a startup line from the last run would otherwise satisfy a
+        check about this one. That is the same mistake as reading a restart as
+        complete the moment it was asked for -- the event is in the log, just
+        not the event being asked about. Measured against the live libpod
+        endpoint: ``since`` in the past returns lines, ``since`` in the future
+        returns nothing.
+
+        ``strict`` re-raises instead of swallowing. A caller writing a comment
+        wants the tail or nothing; a caller *deciding* on readiness must be
+        able to tell "the log does not contain the line" from "the log could
+        not be read", because those two want different words on the ticket and
+        only one of them is the service's fault.
 
         Here because a developer reading a stalled ticket needs to see what the
         service said as it failed, and "the health probe returned 502" is not
@@ -306,13 +328,16 @@ class PodmanImages:
         without its log tail; losing the comment because the log fetch failed
         would be the wrong trade.
         """
+        params = {"stdout": "true", "stderr": "true", "tail": str(max(1, tail))}
+        if since is not None:
+            # Whole seconds: the endpoint takes a Unix timestamp, and a
+            # fractional one is not worth the risk of it being parsed as zero.
+            params["since"] = str(int(since))
         try:
-            response = await self._request(
-                "GET",
-                f"/containers/{name}/logs",
-                {"stdout": "true", "stderr": "true", "tail": str(max(1, tail))},
-            )
+            response = await self._request("GET", f"/containers/{name}/logs", params)
         except PodmanError as exc:
+            if strict:
+                raise
             return f"[no logs: {exc}]"
         return _demultiplex(response.content)
 

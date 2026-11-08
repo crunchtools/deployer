@@ -100,6 +100,22 @@ class FakeContainers:
         del name
         return {"Image": self._image}
 
+    async def logs(
+        self,
+        name: str,
+        tail: int = 100,
+        since: float | None = None,
+        strict: bool = False,
+    ) -> str:
+        """Never consulted here: these rows all use an HTTP probe.
+
+        Present so the fake satisfies the protocol rather than only the tests
+        that happen to run — mypy caught its absence, pytest could not, because
+        a Protocol is not checked at runtime.
+        """
+        del name, tail, since, strict
+        return ""
+
 
 async def nosleep(_seconds: float) -> None:
     return None

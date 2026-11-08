@@ -63,6 +63,22 @@ class FakePodman:
         del name
         return {"Image": self._image}
 
+    async def logs(
+        self,
+        name: str,
+        tail: int = 100,
+        since: float | None = None,
+        strict: bool = False,
+    ) -> str:
+        """Never consulted here: every row in this file uses an HTTP probe.
+
+        The log tier has its own file. This exists so the fake satisfies the
+        protocol — mypy caught its absence, pytest could not, because a
+        Protocol is not checked at runtime.
+        """
+        del name, tail, since, strict
+        return ""
+
 
 async def nosleep(_seconds: float) -> None:
     return None

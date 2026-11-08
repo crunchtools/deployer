@@ -129,6 +129,18 @@ def test_every_required_key_is_required(tmp_path: Path, missing: str) -> None:
         '{ kind = "http", url = "http://x/y", expect_status = "200" }',
         '{ kind = "http", url = "http://x/y", expect_body = 3 }',
         '{ kind = "http", url = "http://x/y", expct_status = 200 }',
+        # A log probe reaches nothing over the network, so every HTTP key on
+        # one is refused by name. Ignoring them would let the row claim a proof
+        # it is not performing, and the ticket comment would then name a URL
+        # that was never requested.
+        '{ kind = "log" }',
+        '{ kind = "log", expect = "" }',
+        '{ kind = "log", expect = "ready", url = "http://x/y" }',
+        '{ kind = "log", expect = "ready", expect_status = 200 }',
+        '{ kind = "log", expect = "ready", expect_body = "ok" }',
+        # And the converse: expect belongs to a log probe only.
+        '{ kind = "http", url = "http://x/y", expect = "ready" }',
+        '{ kind = "mcp", url = "http://x/y", expect = "ready" }',
     ],
 )
 def test_a_bad_probe_is_refused(tmp_path: Path, probe: str) -> None:
@@ -138,6 +150,20 @@ def test_a_bad_probe_is_refused(tmp_path: Path, probe: str) -> None:
     )
     with pytest.raises(RegistryError):
         load_registry(write(tmp_path, text))
+
+
+def test_a_log_probe_loads_and_carries_no_url(tmp_path: Path) -> None:
+    """The row an agent seat uses: a line to wait for and nothing to request."""
+    text = GOOD.split('[service."mcp-pcloud')[0].replace(
+        'probe = { kind = "http", url = "http://127.0.0.1:8080/api/plugins", expect_status = 200 }',
+        'probe = { kind = "log", expect = "accepted bypass permissions mode" }',
+    )
+    registry = load_registry(write(tmp_path, text))
+    probe = registry.services["acquacotta.crunchtools.com"].probe
+    assert probe.kind == "log"
+    assert probe.reads_log
+    assert probe.expect == "accepted bypass permissions mode"
+    assert probe.url == "", "a log probe must not carry a URL to put on a ticket"
 
 
 @pytest.mark.parametrize("value", ["0", "-1", '"60"', "true"])

@@ -44,7 +44,7 @@ PATHS = ["--config", "/nowhere/services.toml", "--state", "/nowhere/state"]
 
 
 def test_version_is_the_package_version() -> None:
-    assert deployer.__version__ == "0.2.0"
+    assert deployer.__version__ == "0.3.0"
 
 
 @pytest.mark.parametrize("verb", ["run", "holds"])
@@ -254,7 +254,14 @@ class RollbackPodman:
             return (ImageRef(id="sha256:old", digest=None, tags=(self.rollback_tag,), labels={}),)
         return ()
 
-    async def logs(self, name: str, tail: int = 40) -> str:
+    async def logs(
+        self,
+        name: str,
+        tail: int = 40,
+        since: float | None = None,
+        strict: bool = False,
+    ) -> str:
+        del since, strict
         return ""
 
 

@@ -39,10 +39,12 @@ import asyncio
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Final, Protocol
 
 import httpx
 
+from .podman import PodmanError
 from .registry import Probe, Service
 from .systemd import UnitState
 
@@ -51,6 +53,10 @@ __all__ = ["Host", "Outcome", "ProbeResult", "probe_once", "verify"]
 #: How often the three checks are repeated inside the settle window.
 SAMPLE_INTERVAL_SECONDS: Final = 5.0
 PROBE_TIMEOUT_SECONDS: Final = 10.0
+#: How much of a container's log a ``log`` probe reads. Generous: a seat can
+#: print a dozen lines before the one being waited for, and the read is
+#: already floored at the container's start time.
+LOG_PROBE_LINES: Final = 200
 #: The JSON-RPC handshake used as an MCP server's health signal.
 MCP_INITIALIZE: Final = {
     "jsonrpc": "2.0",
@@ -71,9 +77,17 @@ class UnitReader(Protocol):
 
 
 class ContainerReader(Protocol):
-    """The container read verification needs."""
+    """The container reads verification needs."""
 
     async def inspect_container(self, name: str) -> dict[str, Any]: ...
+
+    async def logs(
+        self,
+        name: str,
+        tail: int = ...,
+        since: float | None = ...,
+        strict: bool = ...,
+    ) -> str: ...
 
 
 def _is_jsonrpc_answer(body: str) -> bool:
@@ -182,59 +196,191 @@ async def probe_once(probe: Probe, client: httpx.AsyncClient | None = None) -> P
     return ProbeResult(ok=True, detail=f"{probe.url}: {response.status_code}")
 
 
-async def _host_facts(host: Host, service: Service, candidate_image_id: str) -> Outcome | None:
-    """The two checks that need no waiting, or ``None`` if both pass.
+#: The never-started value libpod reports for ``State.StartedAt``. Parsing it
+#: succeeds and yields a timestamp in the year 1, so it has to be recognised
+#: rather than trusted.
+_ZERO_TIME_PREFIX: Final = "0001-01-01"
 
-    Neither answer improves by being asked again. The unit was already seen
-    active by the restart, so an inactive one now is a service that started and
-    stopped; and a container running an image nobody staged is running it as
-    firmly in sixty seconds as it is today. So these are fatal in the readiness
-    phase as well, and only the probe is given time.
+
+@dataclass(frozen=True, slots=True)
+class _Identity:
+    """Which container this is, and how many times it has come back.
+
+    Taken once at the start of the settle window and compared on every sample.
+    A service that was replaced or restarted mid-window has not held, whatever
+    it happens to be answering by the time the next sample lands -- and a
+    crash-loop answers perfectly well between crashes.
+    """
+
+    container_id: str
+    restarts: int
+    #: ``State.StartedAt`` as a Unix timestamp, or ``None`` if the container
+    #: has never run. This is the floor for a log read, so that a startup line
+    #: from a previous run of the same container cannot answer for this one.
+    started_at: float | None
+
+
+def _identity(running: dict[str, Any]) -> _Identity:
+    """Read the identity fields out of a libpod container inspection.
+
+    Field names measured against podman 5.8.2 rather than assumed: ``Id`` and
+    ``RestartCount`` are top level, ``StartedAt`` is under ``State``, and the
+    timestamp carries nanoseconds and an offset.
+    """
+    state = running.get("State")
+    raw_started = str((state or {}).get("StartedAt") or "") if isinstance(state, dict) else ""
+    started: float | None = None
+    if raw_started and not raw_started.startswith(_ZERO_TIME_PREFIX):
+        try:
+            started = datetime.fromisoformat(raw_started).timestamp()
+        except ValueError:
+            started = None
+    restarts_raw = running.get("RestartCount")
+    return _Identity(
+        container_id=str(running.get("Id") or ""),
+        restarts=restarts_raw if isinstance(restarts_raw, int) else 0,
+        started_at=started,
+    )
+
+
+async def _host_facts(
+    host: Host,
+    service: Service,
+    candidate_image_id: str,
+    baseline: _Identity | None = None,
+) -> tuple[Outcome | None, _Identity]:
+    """The checks that need no waiting, or ``None`` if they all pass.
+
+    None of these answers improves by being asked again. The unit was already
+    seen active by the restart, so an inactive one now is a service that
+    started and stopped; and a container running an image nobody staged is
+    running it as firmly in sixty seconds as it is today. So these are fatal in
+    the readiness phase as well, and only the probe is given time.
+
+    With a ``baseline`` -- which the settle window passes and the readiness
+    window does not -- it also fails a container that was replaced or restarted
+    since that baseline was taken. This applies to every probe kind, not just
+    ``log``: an HTTP service that crash-loops answers correctly in the gaps,
+    and sampling a window without asking whether it is still the same process
+    was measuring the gaps.
     """
     state = await host.systemd.state(service.unit)
     if not state.is_active:
-        return Outcome(ok=False, reason=f"{service.unit} is {state.active_state}, not active")
+        return Outcome(ok=False, reason=f"{service.unit} is {state.active_state}, not active"), _Identity(
+            "", 0, None
+        )
     if state.failed:
-        return Outcome(ok=False, reason=f"{service.unit} reports result {state.result!r}")
+        return Outcome(ok=False, reason=f"{service.unit} reports result {state.result!r}"), _Identity(
+            "", 0, None
+        )
 
     running = await host.podman.inspect_container(service.container)
+    here = _identity(running)
     running_image = str(running.get("Image") or "")
     if running_image != candidate_image_id:
         # The deploy "succeeded" onto something other than what was staged.
-        return Outcome(
-            ok=False,
-            reason=(
-                f"{service.container} is running {running_image or 'nothing'}, "
-                f"not the candidate {candidate_image_id}"
+        return (
+            Outcome(
+                ok=False,
+                reason=(
+                    f"{service.container} is running {running_image or 'nothing'}, "
+                    f"not the candidate {candidate_image_id}"
+                ),
+                ran_something_else=True,
             ),
-            ran_something_else=True,
+            here,
         )
-    return None
+
+    if baseline is not None:
+        if here.container_id != baseline.container_id:
+            return (
+                Outcome(
+                    ok=False,
+                    reason=(
+                        f"{service.container} was replaced during the settle window "
+                        f"({baseline.container_id[:12]} -> {here.container_id[:12] or 'nothing'})"
+                    ),
+                ),
+                here,
+            )
+        if here.restarts != baseline.restarts:
+            return (
+                Outcome(
+                    ok=False,
+                    reason=(
+                        f"{service.container} restarted during the settle window "
+                        f"(RestartCount {baseline.restarts} -> {here.restarts})"
+                    ),
+                ),
+                here,
+            )
+    return None, here
 
 
-async def _wait_until_ready(host: Host, service: Service, candidate_image_id: str) -> Outcome:
+async def _log_says_ready(host: Host, service: Service, identity: _Identity) -> ProbeResult:
+    """Whether the container has printed its startup line *since it started*.
+
+    The floor is ``State.StartedAt``, never "the whole log". Without it a unit
+    that starts an existing container rather than creating one would be
+    answered by the previous run's startup line, which is the bug class this
+    program keeps finding: the event is genuinely in the log, it is just not
+    the event being asked about.
+
+    A log that cannot be read is reported as that, not as a missing line. One
+    is the service failing and the other is this program failing, and they do
+    not want the same words on the ticket.
+    """
+    expect = service.probe.expect or ""
+    if identity.started_at is None:
+        return ProbeResult(ok=False, detail=f"{service.container} reports no start time yet")
+    try:
+        # int() truncation in the client floors this to the whole second the
+        # container started in, which can only widen the window, never narrow
+        # it past the startup line.
+        written = await host.podman.logs(
+            service.container, tail=LOG_PROBE_LINES, since=identity.started_at, strict=True
+        )
+    except PodmanError as exc:
+        return ProbeResult(ok=False, detail=f"could not read {service.container}'s log: {exc}")
+    if expect in written:
+        return ProbeResult(ok=True, detail=f"{service.container} logged {expect!r}")
+    return ProbeResult(ok=False, detail=f"{service.container} has not logged {expect!r} since it started")
+
+
+async def _wait_until_ready(
+    host: Host, service: Service, candidate_image_id: str
+) -> tuple[Outcome, _Identity]:
     """Wait up to ``service.ready`` for the probe to answer once.
 
     Retrying is the point here, and it is not the same thing as retrying until
     something passes: the window is bounded, it is spent before the settle
-    window rather than inside it, and the two host facts above still end it
+    window rather than inside it, and the host facts above still end it
     immediately. A service that never answers inside ``ready`` has not started.
     """
     waited = 0.0
     while True:
-        fatal = await _host_facts(host, service, candidate_image_id)
+        fatal, identity = await _host_facts(host, service, candidate_image_id)
         if fatal is not None:
-            return fatal
+            return fatal, identity
 
-        result = await probe_once(service.probe, host.client)
+        if service.probe.reads_log:
+            result = await _log_says_ready(host, service, identity)
+        else:
+            result = await probe_once(service.probe, host.client)
         if result.ok:
-            return Outcome(ok=True, probe_detail=result.detail)
+            return Outcome(ok=True, probe_detail=result.detail), identity
 
         if waited >= service.ready:
-            return Outcome(
-                ok=False,
-                reason=f"health probe never answered within {service.ready}s of the restart",
-                probe_detail=result.detail,
+            missed = (
+                "startup line never appeared" if service.probe.reads_log else "health probe never answered"
+            )
+            return (
+                Outcome(
+                    ok=False,
+                    reason=f"{missed} within {service.ready}s of the restart",
+                    probe_detail=result.detail,
+                ),
+                identity,
             )
 
         wait = min(SAMPLE_INTERVAL_SECONDS, service.ready - waited)
@@ -250,7 +396,7 @@ async def verify(host: Host, service: Service, candidate_image_id: str) -> Outco
     patience rather than health. Before that window there is nothing to measure
     yet -- see the module docstring.
     """
-    ready = await _wait_until_ready(host, service, candidate_image_id)
+    ready, baseline = await _wait_until_ready(host, service, candidate_image_id)
     if ready.failed:
         return ready
 
@@ -262,15 +408,29 @@ async def verify(host: Host, service: Service, candidate_image_id: str) -> Outco
     elapsed = 0.0
 
     while True:
-        fatal = await _host_facts(host, service, candidate_image_id)
+        fatal, _ = await _host_facts(host, service, candidate_image_id, baseline)
         if fatal is not None:
             return fatal
 
-        result = await probe_once(service.probe, host.client)
-        if not result.ok:
-            return Outcome(ok=False, reason="health probe failed", probe_detail=result.detail)
+        # A log probe is NOT re-asked here. The line it waited for is a
+        # one-time event; grepping for it again would pass for the rest of the
+        # window no matter what the service did next, which is a check that
+        # cannot fail. What holds the window open instead is the identity
+        # comparison above: same container, same restart count, still active.
+        if not service.probe.reads_log:
+            result = await probe_once(service.probe, host.client)
+            if not result.ok:
+                return Outcome(ok=False, reason="health probe failed", probe_detail=result.detail)
 
         if elapsed >= service.settle:
+            if service.probe.reads_log:
+                return Outcome(
+                    ok=True,
+                    probe_detail=(
+                        f"no health probe; logged {service.probe.expect!r} then held "
+                        f"{service.settle}s with no restart"
+                    ),
+                )
             return Outcome(ok=True, probe_detail=f"held for {service.settle}s")
 
         wait = min(SAMPLE_INTERVAL_SECONDS, service.settle - elapsed)
