@@ -225,3 +225,55 @@ ready = 180
 # statement is that this window does not prove memory behaviour.
 settle = 120
 rollback = "auto"
+
+[service."kagetora.crunchtools.com"]
+repo = "crunchtools/hermes"
+image = "quay.io/crunchtools/hermes"
+unit = "kagetora.crunchtools.com.service"
+nagios_host = "ctr-kagetora.crunchtools.com"
+requestors = ["scott"]
+# A LOG PROBE, because this seat answers nothing over the network. Nagios
+# monitors it with "Container is running", which is true of a container whose
+# main process is `sleep`. The entrypoint prints `ready: cron list answered
+# after Ns` once the gateway is actually taking commands, and `gave up: ...` on
+# failure -- two lines with no shared substring, so a watcher told to wait for
+# one cannot be satisfied by the other. The deployer reads the log only since
+# this container's own StartedAt, so the previous run's line cannot pass, and
+# then holds on the container's identity and restart count for the settle
+# window rather than re-reading the log.
+probe = { kind = "log", expect = "ready:" }
+ready = 180
+settle = 120
+# MANUAL, and this is a decision rather than caution. Hermes keeps its state in
+# /app/.hermes, and whether it migrates that directory forward on start is NOT
+# known: the Hermes package is upstream and is not vendored in this repo, so
+# there is nothing here to read. Until someone reads it, an automatic rollback
+# could put older code on a data dir a newer version has already written. A
+# failed deploy therefore leaves the new image running and hands it to a
+# person: `deployer rollback kagetora.crunchtools.com`.
+rollback = "manual"
+
+[service."josui.crunchtools.com"]
+repo = "crunchtools/josui"
+image = "quay.io/crunchtools/josui"
+unit = "josui.crunchtools.com.service"
+nagios_host = "ctr-josui.crunchtools.com"
+requestors = ["scott"]
+# A LOG PROBE. Like kagetora this seat answers nothing over the network, and
+# from outside a Claude Code seat looks like a process sitting still. The
+# entrypoint prints `serving: taking commands on <socket> after Ns` once the
+# control socket exists, and `gave up: <socket> never appeared in Ns` when it
+# does not. The two share no substring, so a watcher waiting for one cannot be
+# satisfied by the other -- which was the first draft's bug, and a readiness
+# check that cannot fail is worse than none because it gets trusted.
+probe = { kind = "log", expect = "taking commands" }
+ready = 180
+settle = 120
+# AUTO, unlike kagetora, and for a reason rather than by default. This seat's
+# persistent state is Claude Code's own configuration, in the home directory
+# mounted into it -- nothing there owns a schema or migrates it, so there is no
+# old-code-on-new-data hazard to protect. What there is instead is a seat Scott
+# talks to through a Matrix bridge, so coming back by itself is worth more than
+# being held for a person. The sign-in survives a rollback either way: the credentials live in
+# the mounted state directory, not in the image.
+rollback = "auto"
