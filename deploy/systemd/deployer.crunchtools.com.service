@@ -35,6 +35,8 @@
 # program, the auto-update hold guard and check_deployer.sh all name one place.
 
 [Unit]
+Requires=srv-secrets@deployer.crunchtools.com.service
+After=srv-secrets@deployer.crunchtools.com.service
 Description=Podman container - deployer.crunchtools.com (deploy robot, oneshot)
 Documentation=https://github.com/crunchtools/deployer
 Requires=podman.socket
@@ -52,7 +54,7 @@ ExecStart=/usr/bin/podman run --rm --name deployer.crunchtools.com \
     --security-opt no-new-privileges \
     --memory=512m --memory-swap=512m \
     --user 0 --security-opt label=type:container_runtime_t \
-    --env-file /srv/deployer.crunchtools.com/config/deployer.env \
+    --env-file /run/srv-secrets/deployer.crunchtools.com/deployer.env \
     -e HOME=/tmp \
     -v /srv/deployer.crunchtools.com/config:/config:ro \
     -v /var/lib/deployer:/var/lib/deployer \
