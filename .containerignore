@@ -9,4 +9,3 @@
 .mypy_cache
 .gourmand-cache
 tests
-uv.lock
