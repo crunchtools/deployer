@@ -301,7 +301,7 @@ wheels = [
 
 [[package]]
 name = "deployer"
-version = "0.4.0"
+version = "0.4.1"
 source = { editable = "." }
 dependencies = [
     { name = "dbus-fast" },

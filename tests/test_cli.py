@@ -44,7 +44,7 @@ PATHS = ["--config", "/nowhere/services.toml", "--state", "/nowhere/state"]
 
 
 def test_version_is_the_package_version() -> None:
-    assert deployer.__version__ == "0.4.0"
+    assert deployer.__version__ == "0.4.1"
 
 
 @pytest.mark.parametrize("verb", ["run", "holds"])

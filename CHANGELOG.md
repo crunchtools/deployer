@@ -6,6 +6,18 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-10
+
+### Fixed
+- **Container build now installs dependencies from the committed `uv.lock`**
+  instead of letting `pip install .` resolve them fresh against pyproject's
+  floor-pins. A new `lock` stage runs `uv export --frozen` to produce a
+  requirements file from `uv.lock`, and the builder stage installs it with
+  `--no-deps` before installing the project itself, also with `--no-deps`, so
+  pip cannot re-resolve anything. Closes the gap that let mcp-gemini ship
+  `google-genai` 3.0.0 in production when CI only ever ran against 2.34.0
+  (RT#1564).
+
 ## [0.4.0] - 2026-11-08
 
 ### Added

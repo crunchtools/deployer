@@ -4,19 +4,29 @@
 # output through podman's logs endpoint. That is not a size optimisation, it is
 # the capability boundary -- see src/deployer/__init__.py.
 
+FROM quay.io/hummingbird/python:3.14-fips-builder AS lock
+USER 0
+RUN pip install --no-cache-dir uv==0.13.7
+WORKDIR /lock
+COPY pyproject.toml uv.lock ./
+RUN uv export --frozen --no-dev --no-emit-project \
+      --format requirements-txt -o /requirements.txt
+
 FROM quay.io/hummingbird/python:3.14-fips-builder AS builder
 USER 0
 WORKDIR /app
 RUN python3 -m venv /app/venv
 ENV PATH="/app/venv/bin:$PATH"
+COPY --from=lock /requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir --no-deps -r /tmp/requirements.txt
 COPY pyproject.toml README.md ./
 COPY src/ ./src/
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir --no-deps .
 
 FROM quay.io/hummingbird/python:3.14-fips
 
 LABEL name="deployer" \
-      version="0.4.0" \
+      version="0.4.1" \
       summary="Deterministic deploy robot for the crunchtools fleet" \
       maintainer="fatherlinux <scott.mccarty@crunchtools.com>" \
       description="Drains the RT Deploy queue, deploys by commit, verifies, and rolls back once. No model runs in the deploy path." \
