@@ -45,6 +45,19 @@ pattern = "Hands"
 justification = "instantiated in _restore when no clients are injected, inside an `async with` body which the check does not appear to see; the seam exists so the by-hand rollback path -- which moves :latest and restarts a unit -- can be tested"
 classification = "gourmand_bug"
 
+# parse_status reads grype's `key=value` status format (space-delimited, `CVE
+# ...` lines); rt._parse_fields reads RT's `key: value` show format (colon-
+# delimited, with indented continuation lines). The loop skeleton -- iterate
+# lines, skip/continue, assign into a dict -- is structurally similar, but the
+# two parse different wire formats for different systems. Merging them would
+# couple the CVE scanner's format to RT's for the sake of three shared lines.
+[[exceptions]]
+check = "copy_paste_detection"
+path = "src/deployer/enqueue.py"
+pattern = "parse_status"
+justification = "parse_status parses grype's key=value cve.status format; rt._parse_fields parses RT's key: value show format with continuation lines -- different wire formats for different systems; the shared shape is a line loop, and merging would couple the scanner's format to RT's"
+classification = "gourmand_bug"
+
 # An environment file's values ARE paths. The two the rule objects to are
 # `DEPLOYER_STATE` and `PODMAN_SOCKET`, and their values are the deployment
 # facts the example exists to show someone setting up a second one. Naming them

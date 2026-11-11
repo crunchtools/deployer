@@ -43,21 +43,37 @@ EXIT_CHANGED: Final = 0
 EXIT_COULD_NOT_RUN: Final = 2
 EXIT_STALE: Final = 1
 
-DEFAULT_STATUS: Final = "/var/lib/grype-scan/cve.status"
 DEFAULT_QUEUE: Final = "Rebuild"
 #: One missed 6h scan plus slack; a scan older than this is not acted on.
 DEFAULT_MAX_AGE_SECONDS: Final = 32400
+
+#: Env vars that configure a run. Named (not inlined as string literals) so they
+#: are greppable and documented in --help, and so the program holds NO built-in
+#: cve.status path: a missing CVE_STATUS is exit 2, never a guessed location.
+#: This is the deployer's no-built-in-paths rule (cf. cli.py CONFIG_ENV/STATE_ENV).
+STATUS_ENV: Final = "CVE_STATUS"
+QUEUE_ENV: Final = "REBUILD_QUEUE"
+MAX_AGE_ENV: Final = "CVE_STATUS_MAX_AGE"
+
 _SUBJECT_PREFIX: Final = "CVE bumps:"
 #: Fields entering a ticket come from scanned images, so they are constrained to
 #: a charset that cannot carry an RT control line or a newline into the Subject.
 _SAFE: Final = re.compile(r"[^A-Za-z0-9 ._:/@+,>()\[\]-]")
+#: Per-field display caps for the RT Subject and body: cosmetic truncation only
+#: (the charset filter above is the actual guard against injected control lines).
+_CAP_CVE: Final = 64
+_CAP_PKG: Final = 80
+_CAP_TYPE: Final = 24
+_CAP_VERSION: Final = 48
+_CAP_PATH: Final = 200
+_CAP_REF: Final = 160
 #: Leading non-digits on a version: the ``v`` of ``v1.2.3`` and the ``go`` of
 #: ``go1.25.0``. Stripped before a major is compared, so ``v1 -> 1`` is not a
 #: false cross-major and ``go1.25 -> 1.26`` is a minor, not a major.
 _VER_PREFIX: Final = re.compile(r"^[^0-9]*")
 
 
-def _safe(value: str, limit: int = 160) -> str:
+def _safe(value: str, limit: int = _CAP_REF) -> str:
     """A field reduced to a charset that is safe in an RT Subject or body."""
     return _SAFE.sub("", value).strip()[:limit]
 
@@ -165,10 +181,11 @@ def _bump_lines(findings: Sequence[Finding]) -> list[str]:
     for f in sorted(findings, key=lambda x: (x.cve, x.pkg, x.installed, x.fix)):
         net = " network" if f.net == "1" else ""
         line = (
-            f"  - {_safe(f.cve, 64)}  {_safe(f.pkg, 80)} ({_safe(f.type, 24)})  "
-            f"{_safe(f.installed, 48)} -> {_safe(f.fix, 48)}{net}{_flag(f.installed, f.fix)}"
+            f"  - {_safe(f.cve, _CAP_CVE)}  {_safe(f.pkg, _CAP_PKG)} ({_safe(f.type, _CAP_TYPE)})  "
+            f"{_safe(f.installed, _CAP_VERSION)} -> {_safe(f.fix, _CAP_VERSION)}"
+            f"{net}{_flag(f.installed, f.fix)}"
         )
-        path = _safe(f.path, 200)
+        path = _safe(f.path, _CAP_PATH)
         if path:
             line += f"\n      {path}"
         if line not in seen:
@@ -184,7 +201,7 @@ def digest(findings: Sequence[Finding]) -> str:
 
 def subject_for(ref: str, dig: str) -> str:
     """``CVE bumps: <ref> [<digest>]`` — the image key and the idempotency tag."""
-    return f"{_SUBJECT_PREFIX} {_safe(ref, 160)} [{dig}]"
+    return f"{_SUBJECT_PREFIX} {_safe(ref, _CAP_REF)} [{dig}]"
 
 
 def _parse_subject(subject: str) -> tuple[str, str]:
@@ -202,7 +219,7 @@ def body_for(ref: str, findings: Sequence[Finding]) -> str:
     lines = _bump_lines(findings)
     return "\n".join(
         [
-            _safe(ref, 160),
+            _safe(ref, _CAP_REF),
             "",
             f"{n} fixable Critical CVE(s) need a version bump. grype's suggested fix is",
             "shown; confirm the same-major target before bumping (grype can list a lower",
@@ -317,15 +334,20 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="cve-enqueue", description="File RT Rebuild tickets from the fleet CVE scan."
     )
     parser.add_argument(
-        "--status", default=os.environ.get("CVE_STATUS", DEFAULT_STATUS), help="Path to cve.status"
+        "--status",
+        default=os.environ.get(STATUS_ENV),
+        help=f"Path to cve.status (default: ${STATUS_ENV}; required)",
     )
     parser.add_argument(
-        "--queue", default=os.environ.get("REBUILD_QUEUE", DEFAULT_QUEUE), help="RT queue (not Deploy)"
+        "--queue",
+        default=os.environ.get(QUEUE_ENV, DEFAULT_QUEUE),
+        help=f"RT queue (not Deploy; default: ${QUEUE_ENV} or {DEFAULT_QUEUE})",
     )
     parser.add_argument(
         "--max-age",
         type=int,
-        default=int(os.environ.get("CVE_STATUS_MAX_AGE", DEFAULT_MAX_AGE_SECONDS)),
+        default=int(os.environ.get(MAX_AGE_ENV, DEFAULT_MAX_AGE_SECONDS)),
+        help=f"Max cve.status age in seconds (default: ${MAX_AGE_ENV} or {DEFAULT_MAX_AGE_SECONDS})",
     )
     parser.add_argument("--dry-run", action="store_true", help="Compute the plan, change nothing")
     return parser
@@ -335,6 +357,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.queue.strip().lower() == "deploy":
         print("cve-enqueue: refusing the Deploy queue — this files backlog, never a deploy", file=sys.stderr)
+        return EXIT_COULD_NOT_RUN
+    if not args.status:
+        print(f"cve-enqueue: no cve.status path (set ${STATUS_ENV} or pass --status)", file=sys.stderr)
         return EXIT_COULD_NOT_RUN
     try:
         creds = RtCredentials.from_env(os.environ)

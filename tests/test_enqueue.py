@@ -9,7 +9,9 @@ successful, zero-finding scan — never on a scan error or a stale file, because
 from __future__ import annotations
 
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from pathlib import Path
+from typing import cast
 
 import httpx
 import pytest
@@ -28,7 +30,7 @@ def finding(**over: str) -> Finding:
         "cve": "CVE-1", "pkg": "libx", "type": "deb", "installed": "1.0.0",
         "fix": "1.2.0", "net": "1", "path": "/p",
     }
-    return Finding(**{**base, **over})  # type: ignore[arg-type]
+    return Finding(**{**base, **over})
 
 
 # --------------------------------------------------------------- status parsing
@@ -156,8 +158,11 @@ def _ticket(tid: int, subject: str, status: str = "open") -> Ticket:
 
 
 async def _reconcile(fake: FakeRt, states: dict[str, ImageState]) -> None:
-    plan = await enqueue.plan_run(fake, "Rebuild", states)
-    await enqueue.apply_plan(fake, "Rebuild", states, plan)
+    # FakeRt is a structural stand-in; plan_run/apply_plan only call the methods
+    # it implements. Cast so mypy accepts it in place of the concrete RtClient.
+    client = cast(RtClient, fake)
+    plan = await enqueue.plan_run(client, "Rebuild", states)
+    await enqueue.apply_plan(client, "Rebuild", states, plan)
 
 
 @pytest.mark.asyncio
@@ -217,21 +222,21 @@ async def test_stalled_ticket_is_not_refiled_as_duplicate() -> None:
 # --------------------------------------------------------------- freshness gate
 
 
-def test_read_status_refuses_stale(tmp_path) -> None:
+def test_read_status_refuses_stale(tmp_path: Path) -> None:
     p = tmp_path / "cve.status"
     p.write_text(_status(f"CVE item={REF} seen=1 result=ok fix_crit=0", generated=1))
     usable, _, reason = enqueue._read_status(str(p), max_age=100)
     assert usable is False and "stale" in reason
 
 
-def test_read_status_refuses_truncated(tmp_path) -> None:
+def test_read_status_refuses_truncated(tmp_path: Path) -> None:
     p = tmp_path / "cve.status"
     p.write_text(_status(f"CVE item={REF} seen=1 result=ok fix_crit=0", end=False))
     usable, _, reason = enqueue._read_status(str(p), max_age=10**9)
     assert usable is False and "truncated" in reason
 
 
-def test_read_status_accepts_fresh_complete(tmp_path) -> None:
+def test_read_status_accepts_fresh_complete(tmp_path: Path) -> None:
     p = tmp_path / "cve.status"
     p.write_text(_status(f"CVE item={REF} seen=1 result=ok fix_crit=0"))
     usable, states, _ = enqueue._read_status(str(p), max_age=10**9)
@@ -241,7 +246,7 @@ def test_read_status_accepts_fresh_complete(tmp_path) -> None:
 # --------------------------------------------------------------- queue guard & main
 
 
-def test_main_refuses_the_deploy_queue(capsys) -> None:
+def test_main_refuses_the_deploy_queue(capsys: pytest.CaptureFixture[str]) -> None:
     rc = enqueue.main(["--queue", "Deploy", "--status", "/nonexistent"])
     assert rc == enqueue.EXIT_COULD_NOT_RUN
     assert "Deploy" in capsys.readouterr().err
@@ -254,7 +259,10 @@ CREDS = RtCredentials(
 )
 
 
-def _client(handler) -> RtClient:
+Handler = Callable[[httpx.Request], httpx.Response]
+
+
+def _client(handler: Handler) -> RtClient:
     return RtClient(CREDS, client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
 
 
