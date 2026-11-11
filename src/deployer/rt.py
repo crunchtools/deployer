@@ -57,6 +57,8 @@ _CREATED_FORMAT: Final = "%a %b %d %H:%M:%S %Y"
 #: The first id in RT's ``Attachments: 13583: (Unnamed) (text/plain / 113b),``
 #: listing. First, because that one is the body.
 _ATTACHMENT_ID: Final = re.compile(r"(\d+):")
+#: RT's confirmation line after a create: ``# Ticket 1551 created.``
+_CREATED_ID: Final = re.compile(r"#\s*Ticket\s+(\d+)\s+created", re.IGNORECASE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -248,14 +250,8 @@ class RtClient:
         _parse_status(response.text)
         return response.text
 
-    async def open_tickets(self, queue: str) -> tuple[int, ...]:
-        """Ticket ids in ``queue`` that are new or open, oldest first.
-
-        Stalled tickets are deliberately excluded: a stalled ticket is one a
-        person has been handed, and picking it back up would undo the handing
-        over.
-        """
-        query = f"Queue = '{queue}' AND (Status = 'new' OR Status = 'open')"
+    async def _search(self, query: str) -> tuple[int, ...]:
+        """Ticket ids matching an RT search query, oldest first."""
         text = await self._post("search/ticket", {"query": query, "orderby": "+id", "format": "i"})
         ids: list[int] = []
         for line in text.splitlines():
@@ -268,6 +264,42 @@ class RtClient:
             if number.isdigit():
                 ids.append(int(number))
         return tuple(ids)
+
+    async def open_tickets(self, queue: str) -> tuple[int, ...]:
+        """Ticket ids in ``queue`` that are new or open, oldest first.
+
+        Stalled tickets are deliberately excluded: a stalled ticket is one a
+        person has been handed, and picking it back up would undo the handing
+        over. The enqueue lane needs the opposite — see ``live_tickets`` — so a
+        stalled Rebuild ticket is not refiled as a duplicate.
+        """
+        return await self._search(f"Queue = '{queue}' AND (Status = 'new' OR Status = 'open')")
+
+    async def live_tickets(self, queue: str) -> tuple[int, ...]:
+        """Ticket ids in ``queue`` that are new, open OR stalled, oldest first.
+
+        Includes stalled on purpose: for a backlog queue (Rebuild), a ticket a
+        person has stalled is still the open record for its image, and refiling a
+        duplicate while the first sits stalled is the one thing an idempotent
+        filer must not do.
+        """
+        clause = " OR ".join(f"Status = '{state}'" for state in _OPEN_STATES)
+        return await self._search(f"Queue = '{queue}' AND ({clause})")
+
+    async def create_ticket(self, queue: str, subject: str, text: str) -> int:
+        """File a new ticket in ``queue`` and return its id.
+
+        REST 1.0 create: the body is the ``Text`` field of the Create
+        transaction, which is exactly where ``ticket(...).body`` later reads it
+        from. RT answers ``# Ticket N created.``.
+        """
+        content = f"id: ticket/new\nQueue: {queue}\nSubject: {subject}\nText: {_indent(text)}\n"
+        reply = await self._post("ticket/new", {"content": content})
+        match = _CREATED_ID.search(reply)
+        if not match:
+            head = " | ".join(reply.splitlines()[:3])
+            raise RtError(f"RT did not confirm a ticket was created: {head!r}")
+        return int(match.group(1))
 
     async def ticket(self, ticket_id: int) -> Ticket:
         """One ticket, with its body."""
