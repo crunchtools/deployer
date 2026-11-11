@@ -515,6 +515,26 @@ async def test_a_revision_that_was_rolled_back_is_never_tried_again(tmp_path: Pa
     assert world.rt.said("will not be tried again")
 
 
+async def test_an_errata_rebuild_does_not_launder_a_condemned_commit(tmp_path: Path) -> None:
+    # The fleet CVE lane rebuilds a service on the SAME git commit and files a
+    # Deploy ticket for the new image. If that commit was rolled back before,
+    # the fresh image id must not rescue it: `_gate` condemns by (service,
+    # commit), and it refuses BEFORE staging, so the rebuild is never even
+    # pulled. A new image id laundering a known-bad commit back onto the host
+    # is exactly the mistake this gate exists to stop.
+    world = World(tmp_path, ticket())
+    world.attempts.mark_rolled_back("acquacotta", WANTED)
+    # The candidate is a genuinely different image (the errata rebuild), but the
+    # gate never gets as far as pulling it.
+    report = await world.drain()
+    assert report.outcome == OUTCOME_REFUSED
+    assert world.rt.said("will not be tried again")
+    # Refused before the host was touched: nothing staged, nothing deployed.
+    assert world.systemd.restarts == []
+    assert world.podman.tagged == []
+    assert world.podman.latest_points_at() == OUTGOING_ID
+
+
 async def test_too_many_rollbacks_refuses_the_service(tmp_path: Path) -> None:
     world = World(tmp_path, ticket())
     for _ in range(ROLLBACK_LIMIT):
@@ -822,6 +842,32 @@ async def test_a_revision_already_live_clears_its_hold(tmp_path: Path) -> None:
     world.holds.place(Hold(unit=UNIT, service="acquacotta", ticket=1600, revision=OTHER, at=NOW))
     await world.drain()
     assert not world.holds.held(UNIT)
+
+
+async def test_an_errata_rebuild_at_the_same_commit_deploys_not_skips_as_already_live(
+    tmp_path: Path,
+) -> None:
+    # The fleet CVE lane rebuilds a service on the SAME git commit and files a
+    # Deploy ticket. The rebuild carries the same revision label but a NEW image
+    # id -- that is what an errata rebuild is. The already-live short-circuit
+    # fires only when the revision MATCHES *and* the outgoing and candidate
+    # image ids are equal; a new image id at the same commit must fall through
+    # to `_live` and actually deploy and verify. Otherwise the whole point of
+    # the CVE lane -- shipping a rebuilt image without a code change -- would be
+    # silently skipped as "already deployed".
+    world = World(tmp_path, ticket())
+    # The running container is at the wanted commit already (same git commit),
+    # but it is the pre-errata image id; the candidate pulls to a different one.
+    world.podman.revisions = {OUTGOING_ID: WANTED}
+    report = await world.drain()
+    assert report.outcome == OUTCOME_OK
+    assert "deployed" in report.detail
+    # Not short-circuited: it restarted the unit and moved :latest to the new
+    # image, rather than resolving the ticket untouched as already-live.
+    assert world.systemd.restarts == [UNIT]
+    assert world.podman.latest_points_at() == CANDIDATE_ID
+    assert world.rt.said("Deployed.")
+    assert not world.rt.said("Already deployed.")
 
 
 async def test_a_revision_already_live_but_unhealthy_is_refused_not_restarted(tmp_path: Path) -> None:
