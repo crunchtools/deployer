@@ -31,22 +31,18 @@
 # kagetora, takeda, claude-web and gemini-web). This list is the second line of
 # that, and it becomes worth splitting the day the seats get RT users.
 #
-# On `rebuilder` (RT#1551): the fleet CVE rebuild lane files a Deploy ticket as
-# the `rebuilder` RT user after an errata rebuild, so the new image rolls out
-# through this same deployer. Every seat ticket still arrives as Creator=scott,
-# so the opt-in is per service and the requestor is distinct: `rebuilder` is on
-# every `rollback = "auto"` row and on none of the `rollback = "manual"` ones.
-# A migration-bearing service stays attended -- an unattended rebuild must not
-# auto-deploy it, because old code against a new schema is worse than a rebuild
-# that waits for a person. To let the rebuilder auto-deploy a service, add it
-# here; to keep that service attended, leave it off.
+# On `rebuilder` (RT#1551): the fleet CVE lane was re-scoped (cto 2026-11-11) to
+# detect + file bump tickets, NOT to auto-rebuild/deploy, after a rebuild was
+# proven not to clear pinned-dependency CVEs. So `rebuilder` is intentionally
+# NOT a requestor here: the ticket-filing credential must not be able to trigger
+# a deploy. The errata runner tests stay; they pin real deployer behaviour.
 
 [service."acquacotta.crunchtools.com"]
 repo = "crunchtools/acquacotta"
 image = "quay.io/crunchtools/acquacotta"
 unit = "acquacotta.crunchtools.com.service"
 nagios_host = "ctr-acquacotta.crunchtools.com"
-requestors = ["scott", "rebuilder"]
+requestors = ["scott"]
 # NOT /health -- that route answers 500 on this service today. /api/plugins
 # exercises the app and the database behind it, which is what a probe is for.
 probe = { kind = "http", url = "http://127.0.0.1:8080/api/plugins", expect_status = 200 }
@@ -70,7 +66,7 @@ image = "quay.io/crunchtools/mcp-pcloud"
 # The container is `mcp-pcloud`; the unit carries the full hostname.
 unit = "mcp-pcloud.crunchtools.com.service"
 nagios_host = "ctr-mcp-pcloud.crunchtools.com"
-requestors = ["scott", "rebuilder"]
+requestors = ["scott"]
 # No health route at all: a GET of /mcp answers 400. The `mcp` probe POSTs a
 # JSON-RPC initialize and reads the answer, which is the only check that proves
 # an MCP server is actually serving rather than merely listening.
@@ -87,7 +83,7 @@ repo = "crunchtools/mcp-nagios"
 image = "quay.io/crunchtools/mcp-nagios"
 unit = "mcp-nagios.crunchtools.com.service"
 nagios_host = "ctr-mcp-nagios.crunchtools.com"
-requestors = ["scott", "rebuilder"]
+requestors = ["scott"]
 probe = { kind = "mcp", url = "http://127.0.0.1:8026/mcp" }
 settle = 30
 rollback = "auto"
@@ -98,7 +94,7 @@ image = "quay.io/crunchtools/mcp-cloudflare"
 # The container is `mcp-cloudflare`; the unit carries the full hostname.
 unit = "mcp-cloudflare.crunchtools.com.service"
 nagios_host = "ctr-mcp-cloudflare.crunchtools.com"
-requestors = ["scott", "rebuilder"]
+requestors = ["scott"]
 # Measured 200 against an initialize POST before onboarding. There is no
 # /health route, which is why every MCP server here probes the handshake
 # instead of a status code that would pass without testing anything.
@@ -116,7 +112,7 @@ repo = "crunchtools/rotv"
 image = "quay.io/crunchtools/images-rotv"
 unit = "images.rootsofthevalley.org.service"
 nagios_host = "ctr-images.rootsofthevalley.org"
-requestors = ["scott", "rebuilder"]
+requestors = ["scott"]
 # Measured 200 before onboarding. /health is 404 on this one -- the route is
 # under /api.
 probe = { kind = "http", url = "http://127.0.0.1:8094/api/health", expect_status = 200 }
@@ -164,7 +160,7 @@ repo = "crunchtools/postiz"
 image = "quay.io/crunchtools/postiz"
 unit = "postiz.crunchtools.com.service"
 nagios_host = "ctr-postiz.crunchtools.com"
-requestors = ["scott", "rebuilder"]
+requestors = ["scott"]
 # Measured before onboarding. NOT "/" -- that is a 307 to /auth, which proves
 # only that something is routing. NOT /api/health -- 404 here. /p/health is a
 # real health route and answers 200.
@@ -181,7 +177,7 @@ repo = "crunchtools/proxy"
 image = "quay.io/crunchtools/proxy"
 unit = "proxy.crunchtools.com.service"
 nagios_host = "ctr-proxy.crunchtools.com"
-requestors = ["scott", "rebuilder"]
+requestors = ["scott"]
 # THIS PROBE CHECKS THE CERTIFICATE, NOT JUST A STATUS CODE, and that is the
 # whole reason this service could not be onboarded until 0.4.0.
 #
@@ -214,7 +210,7 @@ image = "quay.io/crunchtools/trentina"
 # The container is `trentina`; the unit carries the full hostname.
 unit = "trentina.crunchtools.com.service"
 nagios_host = "ctr-trentina.crunchtools.com"
-requestors = ["scott", "rebuilder"]
+requestors = ["scott"]
 # This is the gateway every seat and every MCP backend talks through, so the
 # probe asserts more than "something answered on 8019". /health returns
 # {"status":"ok","classifier":"loaded",...}, and `classifier":"loaded"` is the
@@ -268,7 +264,7 @@ repo = "crunchtools/josui"
 image = "quay.io/crunchtools/josui"
 unit = "josui.crunchtools.com.service"
 nagios_host = "ctr-josui.crunchtools.com"
-requestors = ["scott", "rebuilder"]
+requestors = ["scott"]
 # A LOG PROBE. Like kagetora this seat answers nothing over the network, and
 # from outside a Claude Code seat looks like a process sitting still. The
 # entrypoint prints `serving: taking commands on <socket> after Ns` once the
