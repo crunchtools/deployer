@@ -8,17 +8,20 @@ successful, zero-finding scan — never on a scan error or a stale file, because
 
 from __future__ import annotations
 
+import subprocess
+import sys
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import cast
+from urllib.parse import parse_qs
 
 import httpx
 import pytest
 
 from deployer import enqueue
 from deployer.enqueue import Finding, ImageState, digest, parse_status, subject_for
-from deployer.rt import RtClient, RtCredentials, Ticket
+from deployer.rt import RtClient, RtCredentials, RtError, Ticket
 
 REF = "quay.io/crunchtools/tig:latest"
 NEW_TICKET_ID = 1551
@@ -252,6 +255,27 @@ def test_main_refuses_the_deploy_queue(capsys: pytest.CaptureFixture[str]) -> No
     assert "Deploy" in capsys.readouterr().err
 
 
+def test_main_refuses_any_non_rebuild_queue(capsys: pytest.CaptureFixture[str]) -> None:
+    # The guard is an allowlist: only the Rebuild queue is accepted, so a queue
+    # that is neither Deploy nor Rebuild is still refused (not an auth boundary
+    # that only blocks Deploy).
+    rc = enqueue.main(["--queue", "Incoming", "--status", "/nonexistent"])
+    assert rc == enqueue.EXIT_COULD_NOT_RUN
+    assert "Incoming" in capsys.readouterr().err
+
+
+def test_main_refuses_when_no_status_path(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Neither --status nor $CVE_STATUS: exit 2 before any credential or file
+    # access, naming the env var. (The Rebuild queue is accepted so the status
+    # guard, not the queue guard, is what fires.)
+    monkeypatch.delenv("CVE_STATUS", raising=False)
+    rc = enqueue.main(["--queue", "Rebuild"])
+    assert rc == enqueue.EXIT_COULD_NOT_RUN
+    assert "CVE_STATUS" in capsys.readouterr().err
+
+
 # ------------------------------------------- rt.py additions (real client, mock transport)
 
 CREDS = RtCredentials(
@@ -267,12 +291,58 @@ def _client(handler: Handler) -> RtClient:
 
 
 @pytest.mark.asyncio
-async def test_create_ticket_parses_the_new_id() -> None:
+async def test_create_ticket_posts_the_create_transaction_and_parses_the_id() -> None:
+    seen: dict[str, str] = {}
+
     def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["path"] = request.url.path
+        seen["content"] = parse_qs(request.content.decode())["content"][0]
         return httpx.Response(200, text="RT/6.0.2 200 Ok\n\n# Ticket 1551 created.\n")
 
     async with _client(handler) as client:
-        assert await client.create_ticket("Rebuild", "CVE bumps: x [abc]", "body") == NEW_TICKET_ID
+        tid = await client.create_ticket("Rebuild", "CVE bumps: x [abc]", "body")
+    assert tid == NEW_TICKET_ID
+    assert seen["method"] == "POST"
+    assert seen["path"].endswith("/REST/1.0/ticket/new")
+    # The create transaction carries the queue, subject and body we passed, so a
+    # wrong endpoint or a mis-sent field would fail this, not slip through.
+    assert "id: ticket/new" in seen["content"]
+    assert "Queue: Rebuild" in seen["content"]
+    assert "Subject: CVE bumps: x [abc]" in seen["content"]
+    assert "Text: body" in seen["content"]
+
+
+# ------------------------------------------- the import clause the constitution names
+
+
+def test_enqueue_imports_only_the_rt_client_from_the_package() -> None:
+    # The deployer constitution (0.3.0) admits cve-enqueue into this package ONLY
+    # while it imports nothing from the package but the RT client — no module that
+    # can touch a container, a unit or the registry. A fresh interpreter imports
+    # enqueue and fails if any capability-bearing module loaded with it. (A
+    # subprocess, because this test process has already imported them.)
+    forbidden = ["deployer.podman", "deployer.systemd", "deployer.runner", "deployer.cli"]
+    code = (
+        "import importlib, sys\n"
+        "importlib.import_module('deployer.enqueue')\n"
+        f"bad = [m for m in {forbidden!r} if m in sys.modules]\n"
+        "assert not bad, 'enqueue pulled in capability-bearing modules: ' + repr(bad)\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+
+
+@pytest.mark.asyncio
+async def test_create_ticket_raises_when_rt_does_not_confirm() -> None:
+    # RT answered 200 but without the `# Ticket N created` line: creation is not
+    # confirmed, so this must raise rather than return a bogus id.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="RT/6.0.2 200 Ok\n\nno ticket line here\n")
+
+    async with _client(handler) as client:
+        with pytest.raises(RtError):
+            await client.create_ticket("Rebuild", "CVE bumps: x [abc]", "body")
 
 
 @pytest.mark.asyncio

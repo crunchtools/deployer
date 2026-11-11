@@ -178,6 +178,7 @@ def parse_status(text: str) -> tuple[bool, dict[str, ImageState]]:
 def _bump_lines(findings: Sequence[Finding]) -> list[str]:
     """The per-finding lines, deduped and sorted, for body and digest."""
     seen: list[str] = []
+    emitted: set[str] = set()  # O(1) membership; `seen` keeps output order
     for f in sorted(findings, key=lambda x: (x.cve, x.pkg, x.installed, x.fix)):
         net = " network" if f.net == "1" else ""
         line = (
@@ -188,14 +189,22 @@ def _bump_lines(findings: Sequence[Finding]) -> list[str]:
         path = _safe(f.path, _CAP_PATH)
         if path:
             line += f"\n      {path}"
-        if line not in seen:
+        if line not in emitted:
             seen.append(line)
+            emitted.add(line)
     return seen
 
 
 def digest(findings: Sequence[Finding]) -> str:
-    """A short, stable digest of the bump list, carried in the Subject."""
-    joined = "\n".join(sorted({f"{f.cve}|{f.pkg}|{f.installed}|{f.fix}" for f in findings}))
+    """A short, stable digest of the bump list, carried in the Subject.
+
+    Every field the ticket body renders (type, net and path as well as cve,
+    pkg, installed and fix) feeds the digest: if the body would change, the
+    digest must change, or plan_run would leave a stale body as "unchanged".
+    """
+    joined = "\n".join(
+        sorted(f"{f.cve}|{f.pkg}|{f.type}|{f.installed}|{f.fix}|{f.net}|{f.path}" for f in findings)
+    )
     return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:12]
 
 
@@ -354,9 +363,24 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """Run one enqueue pass and return the process exit status.
+
+    Reconciles the fleet CVE scan against the live Rebuild tickets and files,
+    updates or resolves them. Returns EXIT_OK (0) on a completed pass (including
+    --dry-run), EXIT_STALE (1) when the scan is missing/truncated/stale, and
+    EXIT_COULD_NOT_RUN (2) on a bad queue, a missing cve.status path, missing RT
+    credentials, or an RT error.
+    """
     args = _build_parser().parse_args(argv)
-    if args.queue.strip().lower() == "deploy":
-        print("cve-enqueue: refusing the Deploy queue — this files backlog, never a deploy", file=sys.stderr)
+    # Allowlist, not a Deploy-blocklist: this RT credential may file backlog in
+    # the Rebuild queue and nothing else. Rejecting only "deploy" would let any
+    # other queue name through, which is not an authorization boundary.
+    if args.queue.strip().lower() != DEFAULT_QUEUE.lower():
+        print(
+            f"cve-enqueue: refusing queue {args.queue!r} — this files backlog in the "
+            f"{DEFAULT_QUEUE} queue only, never a deploy or any other queue",
+            file=sys.stderr,
+        )
         return EXIT_COULD_NOT_RUN
     if not args.status:
         print(f"cve-enqueue: no cve.status path (set ${STATUS_ENV} or pass --status)", file=sys.stderr)
@@ -371,7 +395,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"cve-enqueue: {reason}", file=sys.stderr)
         return EXIT_STALE
     try:
-        return asyncio.run(_run(creds, args.queue, states, args.dry_run))
+        # Canonical casing: the guard above accepted a case-insensitive match.
+        return asyncio.run(_run(creds, DEFAULT_QUEUE, states, args.dry_run))
     except RtError as exc:
         print(f"cve-enqueue: RT error: {exc}", file=sys.stderr)
         return EXIT_COULD_NOT_RUN

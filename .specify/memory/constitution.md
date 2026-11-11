@@ -1,8 +1,8 @@
 # deployer Constitution
 
-> **Version:** 0.2.0
+> **Version:** 0.3.0
 > **Ratified:** 2026-11-07
-> **Amended:** 2026-11-07
+> **Amended:** 2026-11-11
 > **Status:** Active
 > **Inherits:** [crunchtools/constitution](https://github.com/crunchtools/constitution) v1.39.4
 > **Profile:** CLI Tool
@@ -18,6 +18,16 @@ ticket names, verify it, and roll back once if it does not hold.
 
 Anything that is not that is out of scope, including deciding *whether* a
 deploy should happen. That decision belongs to whoever files the ticket.
+
+Amended at 0.3.0 (RT #1551): this repository ships a second tool, `cve-enqueue`,
+whose one sentence is to keep one open RT `Rebuild` ticket per image listing the
+version bumps the fleet CVE scan says it needs. It is here because it needs this
+package's RT client and nothing else, and a repo of its own would be a copy of
+that client. It is not a deployer verb and is admitted only while all of these
+hold: it imports nothing from this package but the RT client; it runs from its
+own unit with no podman or D-Bus socket, no state directory and no registry; and
+it holds no credential that can file an accepted Deploy ticket. The day it needs
+a second credential or a second dependency, it moves out.
 
 ## The Capability Boundary
 

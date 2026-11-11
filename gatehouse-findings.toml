@@ -57,3 +57,21 @@ file = "src/deployer/nagios.py"
 evidence = "for entry_id, is_service in wanted:"
 status = "not-a-bug"
 reason = "cmd.cgi is a CGI process per request reading the whole status file; mcp-nagios cancels serially for that reason and documents the failures that come of leaning on it, and the count here is a handful at the end of a deploy that just spent a minute settling"
+
+# Gatehouse's constitution agent read "deployer may not create, start, run or
+# exec a container" as forbidding the `podman run` in this systemd unit. But the
+# rule's subject is the deployer PROCESS and package — "no module in the package
+# exposes such a verb" — so that a compromised deployer cannot mount a live
+# volume and relabel it. This `podman run` is systemd's ExecStart launching the
+# oneshot on the host, the same line deployer.crunchtools.com.service uses to
+# start the robot and every containerized service on gloval uses to start. Read
+# Gatehouse's way, the rule would forbid deployer's own unit. The cve-enqueue
+# PROCESS inside holds no podman or D-Bus socket, drops all caps, is read-only
+# and no-new-privileges — it cannot touch a container. (cto ruling, 2026-11-11.)
+[[findings]]
+agent = "constitution"
+category = "constitution"
+file = "deploy/systemd/cve-enqueue.crunchtools.com.service"
+evidence = "ExecStart=/usr/bin/podman run --rm --name cve-enqueue.crunchtools.com"
+status = "not-a-bug"
+reason = "the capability boundary binds the deployer process and package ('no module exposes such a verb'), not systemd's ExecStart; this podman run is the host launching the oneshot, as deployer's own unit does, and the process inside holds no socket and no caps so it cannot touch a container"

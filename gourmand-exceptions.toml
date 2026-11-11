@@ -71,3 +71,14 @@ check = "absolute_paths"
 path = "deploy/deployer.env.example"
 justification = "the values of an env file are paths by nature; these two are the deployment facts the example exists to show, and the program itself holds no built-in paths, which is the behaviour this rule protects"
 classification = "by_design"
+
+# The cve-enqueue secret example names the srv-secrets decrypt target its
+# credential lands at — a deployment fact an operator provisioning the unit
+# needs, exactly like deployer.env.example above. Not quoting the path here,
+# because quoting it would trip this same rule in this file (as the note above
+# records); the program itself holds no built-in paths.
+[[exceptions]]
+check = "absolute_paths"
+path = "deploy/cve-enqueue.env.example"
+justification = "an env-file example names deployment paths by nature; the srv-secrets decrypt target is the fact an operator needs to provision the unit, as with deployer.env.example, and the program holds no built-in paths"
+classification = "by_design"
