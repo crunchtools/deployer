@@ -321,3 +321,39 @@ async def test_without_a_gated_tag_staging_takes_the_latest_path() -> None:
     assert podman.pulls == [GATED, f"{IMAGE}:latest"]
     assert podman.tags[-1] == (OLD, f"{IMAGE}:latest")
     assert not podman.untags
+
+
+async def test_the_pulled_refs_are_untagged_when_tagging_the_candidate_fails() -> None:
+    class FailsToTag(FakePodman):
+        async def tag(self, name: str, reference: str) -> None:
+            if "candidate-" in reference:
+                raise PodmanError("no space left on device")
+            await super().tag(name, reference)
+
+    podman = FailsToTag(labels={OLD: OLD_REV, NEW: PR_HEAD}, registry={GATED: NEW, MAIN: NEW})
+    with pytest.raises(PodmanError, match="no space left"):
+        await stage(podman, FakeSystemd(f"run -d {IMAGE}:latest"), service(), NEW_REV)
+    assert set(podman.untags) == {(NEW, GATED), (NEW, MAIN)}
+    assert all(ref != f"{IMAGE}:latest" for _, ref in podman.tags)
+
+
+async def test_a_missing_main_still_untags_the_gated_ref_and_is_not_a_match() -> None:
+    podman = FakePodman(labels={OLD: OLD_REV, NEW: PR_HEAD}, registry={GATED: NEW})
+    staged = await stage(podman, FakeSystemd(f"run -d {IMAGE}:latest"), service(), NEW_REV)
+    assert not staged.candidate_gated
+    assert podman.untags == [(NEW, GATED)]
+
+
+async def test_a_pull_failure_that_is_not_an_absent_tag_stops_staging() -> None:
+    """Auth or network trouble must not read as "no gated tag" and fall back."""
+
+    class Unauthorized(FakePodman):
+        async def pull(self, reference: str) -> str:
+            if ":gated-" in reference:
+                raise PodmanError("unauthorized: access to the requested resource is not authorized")
+            return await super().pull(reference)
+
+    podman = Unauthorized()
+    with pytest.raises(StageError, match="could not pull .*unauthorized"):
+        await stage(podman, FakeSystemd(f"run -d {IMAGE}:latest"), service(), NEW_REV)
+    assert f"{IMAGE}:latest" not in podman.pulls

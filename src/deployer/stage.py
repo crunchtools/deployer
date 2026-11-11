@@ -263,6 +263,12 @@ async def _restore_latest(podman: ImageOps, outgoing_id: str, latest: str) -> No
         ) from exc
 
 
+#: How a registry says a tag does not exist, as podman relays it. Any other
+#: pull failure (auth, network, a full disk) stops staging rather than being
+#: read as "no gated tag", which would quietly fall back to the label path.
+_ABSENT_RE: Final = re.compile(r"manifest unknown|not found|name unknown", re.IGNORECASE)
+
+
 async def _pull_or_none(podman: ImageOps, reference: str) -> str | None:
     """The image ``reference`` names in the registry, or None if it cannot be had.
 
@@ -272,8 +278,10 @@ async def _pull_or_none(podman: ImageOps, reference: str) -> str | None:
     """
     try:
         return await podman.pull(reference)
-    except PodmanError:
-        return None
+    except PodmanError as exc:
+        if _ABSENT_RE.search(str(exc)):
+            return None
+        raise StageError(f"could not pull {reference}: {exc}") from exc
 
 
 async def _untag(podman: ImageOps, image_id: str, reference: str) -> None:
