@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-11
+
 ### Changed
 - Container builds go through constitution v1.39.4's `container-release.yml`:
   built once per pull request, gated by `--version` and `--help` against the
