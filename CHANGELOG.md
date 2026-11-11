@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- Container builds go through constitution v1.39.4's `container-release.yml`:
+  built once per pull request, gated by `--version` and `--help` against the
+  pushed digest, promoted by digest copy (`:main` on merge, `:latest` and the
+  version tags on a `v*` tag). The rebuild-only-to-scan job is gone (Trivy
+  scans the gated digest). GHCR dropped; Quay.io is the only registry
+  (RT#1550). Inherits constitution v1.39.4.
+
 ## [0.5.0] - 2026-11-11
 
 ### Changed
