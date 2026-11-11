@@ -172,6 +172,10 @@ class FakePodman:
             "sha256:0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0"
         )
         self.revisions = {OUTGOING_ID: OTHER}
+        #: Whether the registry holds gated-<commit> for the wanted commit
+        #: (a repository on constitution's container-release). Off by
+        #: default, so the label path stays the one most tests exercise.
+        self.gated = False
         self.tagged: list[tuple[str, str]] = []
         self.untagged: list[tuple[str, str]] = []
         self.removed: list[str] = []
@@ -239,6 +243,8 @@ class FakePodman:
         )
 
     async def pull(self, reference: str) -> str:
+        if (":gated-" in reference or reference.endswith(":main")) and not self.gated:
+            raise PodmanError(f"{reference}: manifest unknown")
         self.by_ref[reference] = CANDIDATE_ID
         return CANDIDATE_ID
 
@@ -1273,3 +1279,21 @@ async def test_a_missing_label_says_so_rather_than_printing_none(
     assert f"version {version or 'unlabelled'}" in published
     assert f"digest {digest or 'none reported'}" in published
     assert "None" not in published
+
+
+async def test_a_gated_digest_deploys_although_its_label_names_the_pr_head(tmp_path: Path) -> None:
+    """Build once per PR (RT#1550): the label is the PR head, the ticket the merge."""
+    world = World(tmp_path, ticket())
+    world.podman.gated = True
+    world.podman.candidate_revision = OTHER
+    await world.drain()
+    assert (CANDIDATE_ID, f"{IMAGE}:gated-{WANTED}") in world.podman.untagged
+    assert world.systemd.restarts
+    assert world.rt.said(f"is running {WANTED[:7]} (built from {OTHER[:12]}")
+
+
+async def test_without_a_gated_tag_a_label_mismatch_still_waits(tmp_path: Path) -> None:
+    world = World(tmp_path, ticket())
+    world.podman.candidate_revision = OTHER
+    await world.drain()
+    assert not world.systemd.restarts

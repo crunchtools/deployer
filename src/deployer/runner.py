@@ -446,7 +446,9 @@ class Runner:
             return await self._refuse(ticket, why)
 
         age = max(0, int(self.now() - ticket.created))
-        verdict = classify_revision(staged.candidate_revision, request.commit, age, service)
+        verdict = classify_revision(
+            staged.candidate_revision, request.commit, age, service, gated=staged.candidate_gated
+        )
         if verdict is Verdict.MATCH and staged.outgoing_image_id == staged.candidate_image_id:
             return await self._already_live(ticket, request, service, staged)
         if verdict is Verdict.WAITING:
@@ -455,11 +457,12 @@ class Runner:
             await self._untag_candidate(staged)
             return await self._refuse(
                 ticket,
-                f"no image carrying {request.short_commit} was pushed for {service.name} within "
-                f"{service.build_deadline // 60} minutes; the ticket is {age // 60} minutes old and "
-                f"{service.image}:latest carries "
-                f"{(staged.candidate_revision or 'no revision label')[:12]}. "
-                "The build did not produce this commit -- check the repository's actions.",
+                f"no image for {request.short_commit} reached {service.name} within "
+                f"{service.build_deadline // 60} minutes; the ticket is {age // 60} minutes old. "
+                f"Neither is {service.image}:gated-{request.short_commit} what :main holds, nor does "
+                f"the candidate's revision label match (it is built from "
+                f"{(staged.candidate_revision or 'no revision label')[:12]}). "
+                "Main did not promote this commit -- check the repository's actions.",
             )
         return await self._live(ticket, request, service, staged)
 
@@ -582,11 +585,12 @@ class Runner:
         rotated, rotation = await self._rotate(service)
 
         cleared = self.holds.clear(service.unit)
-        version = staged.candidate_revision or "no revision label"
+        built = staged.candidate_revision or "no revision label"
         await self.clients.rt.comment(
             ticket.id,
-            f"Deployed. {service.unit} is running {version[:12]} "
-            f"(version {staged.candidate_version or 'unlabelled'}, "
+            f"Deployed. {service.unit} is running {request.short_commit} "
+            f"(built from {built[:12]}, "
+            f"version {staged.candidate_version or 'unlabelled'}, "
             f"digest {staged.candidate_digest or 'none reported'}, "
             f"image {staged.candidate_image_id[:19]}), verified for {service.settle}s: the unit is "
             f"active, the container is running that exact image, and {_proof_phrase(service)}.\n"
@@ -961,7 +965,7 @@ def _failure_report(failure: _Failure) -> str:
         f"Deploy failed and was rolled back.\n\n"
         f"service:  {service.name} ({service.unit})\n"
         f"wanted:   {request.commit}\n"
-        f"ran:      image {staged.candidate_image_id[:19]}, revision "
+        f"ran:      image {staged.candidate_image_id[:19]}, built from "
         f"{(staged.candidate_revision or 'none')[:12]}\n"
         f"failed:   {outcome.reason or 'health probe failed'}\n"
         f"probe:    {outcome.probe_detail or service.probe.url}\n\n"
