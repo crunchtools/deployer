@@ -6,6 +6,24 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-11
+
+### Changed
+- **Deploys the digest main promoted for the ticket's commit.** Under
+  constitution's container-release (RT#1550) an image is built once per pull
+  request, so its revision label names the pull request's head, not the merge
+  commit a ticket carries, and Quay's `:latest` moves only on a release. Every
+  converted service's deploy ticket would have gone STALE. Staging now pulls
+  `<image>:gated-<commit>` and `<image>:main`: when they are the same image,
+  main promoted that commit's tested digest and the candidate matches whatever
+  its label says. A gated tag alone is not enough (it also exists for a pull
+  request head that never merged): one that `:main` does not hold waits, then
+  goes stale. Both refs are untagged locally once the candidate tag is on. A
+  repository with no gated tags keeps the old path (`:latest` plus the label).
+  Units keep running `<image>:latest`; the local tag is still the lever.
+- RT comments name the ticket's commit and say which commit the image was
+  built from.
+
 ## [0.4.1] - 2026-11-10
 
 ### Fixed

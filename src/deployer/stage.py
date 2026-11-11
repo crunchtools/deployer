@@ -17,9 +17,18 @@ something quietly.
    differ, and that gap is exactly how a surprise gets deployed. The gateway
    once ran 6.8.0 while ``:latest`` had been 6.11.0 for eight hours; a restart
    for an unrelated reason shipped it and it was OOM-killed (RT#1559).
-2. Pull ``:latest``.
+2. Pull ``<image>:gated-<commit>`` and ``<image>:main``. Images are built
+   once per pull request (constitution container-release, RT#1550), so the
+   revision label names the pull request's head, not the merge commit the
+   ticket carries. ``gated-<commit>`` is the digest whose gates passed for
+   that commit, and ``:main`` equal to it says main promoted it: a gated tag
+   alone also exists for a pull request head that never merged. Both refs
+   are untagged locally once the candidate tag is on. A repository that
+   publishes no gated tags falls back to pulling ``:latest`` and comparing
+   the label, as before.
 3. Tag what arrived as ``candidate-<revision>``.
-4. Put ``:latest`` straight back on the outgoing image.
+4. Put ``:latest`` straight back on the outgoing image (it moved only if the
+   fallback pulled it).
 
 After step 4 the local ``:latest`` is where it started, so a ticket that is
 refused, waiting, or abandoned half-way cannot turn an unrelated
@@ -65,6 +74,7 @@ class ImageOps(Protocol):
     async def inspect_image(self, name: str) -> ImageRef: ...
     async def pull(self, reference: str) -> str: ...
     async def tag(self, name: str, reference: str) -> None: ...
+    async def untag(self, name: str, reference: str) -> None: ...
 
 
 class UnitOps(Protocol):
@@ -120,6 +130,10 @@ class Staged:
     candidate_digest: str | None
     candidate_tag: str
     latest_tag: str
+    #: The candidate is ``gated-<ticket commit>`` and ``:main`` resolves to the
+    #: same image: main promoted that commit's tested digest, whatever the
+    #: label (the pull request head) says.
+    candidate_gated: bool = False
 
 
 def _exec_lines(value: Any) -> tuple[str, ...]:
@@ -214,15 +228,18 @@ def classify_revision(
     wanted: str,
     ticket_age_seconds: int,
     service: Service,
+    *,
+    gated: bool = False,
 ) -> Verdict:
     """Whether the candidate is the commit the ticket asked for.
 
-    A mismatch is not automatically a failure. A seat files its ticket the
-    moment it merges, and the image is built by CI afterwards, so for the first
-    ``build_deadline`` a mismatch means *not yet*. After that it means the build
-    is not coming and a person should look.
+    A candidate pulled by ``gated-<wanted>`` is that commit by construction.
+    Otherwise a mismatch is not automatically a failure. A seat files its
+    ticket the moment it merges, and the image is promoted by CI afterwards,
+    so for the first ``build_deadline`` a mismatch means *not yet*. After that
+    it means the image is not coming and a person should look.
     """
-    if candidate_revision and candidate_revision.lower() == wanted.lower():
+    if gated or (candidate_revision and candidate_revision.lower() == wanted.lower()):
         return Verdict.MATCH
     if ticket_age_seconds < service.build_deadline:
         return Verdict.WAITING
@@ -244,6 +261,35 @@ async def _restore_latest(podman: ImageOps, outgoing_id: str, latest: str) -> No
             f"could not put {latest} back on the outgoing image {outgoing_id}: {exc}. "
             "The local tag may point at an unverified image; check before restarting anything."
         ) from exc
+
+
+#: How a registry says a tag does not exist, as podman relays it. Any other
+#: pull failure (auth, network, a full disk) stops staging rather than being
+#: read as "no gated tag", which would quietly fall back to the label path.
+_ABSENT_RE: Final = re.compile(r"manifest unknown|not found|name unknown", re.IGNORECASE)
+
+
+async def _pull_or_none(podman: ImageOps, reference: str) -> str | None:
+    """The image ``reference`` names in the registry, or None if it cannot be had.
+
+    For ``gated-<commit>``, None covers a repository that publishes no gated
+    tags and a commit not yet gated; the caller then falls back to ``:latest``
+    and the revision label, which says *waiting* until the build deadline.
+    """
+    try:
+        return await podman.pull(reference)
+    except PodmanError as exc:
+        if _ABSENT_RE.search(str(exc)):
+            return None
+        raise StageError(f"could not pull {reference}: {exc}") from exc
+
+
+async def _untag(podman: ImageOps, image_id: str, reference: str) -> None:
+    """Drop a ref staging pulled only to compare, so it pins nothing."""
+    try:
+        await podman.untag(image_id, reference)
+    except PodmanError as exc:
+        raise StageError(f"could not untag {reference} from {image_id}: {exc}") from exc
 
 
 async def stage(podman: ImageOps, systemd: UnitOps, service: Service, wanted: str) -> Staged:
@@ -273,17 +319,36 @@ async def stage(podman: ImageOps, systemd: UnitOps, service: Service, wanted: st
     rollback_tag = f"localhost/{basename}:rollback-{tag_suffix(outgoing_revision, outgoing_id)}"
     await podman.tag(outgoing_id, rollback_tag)
 
-    # The pull moves the local :latest the moment it lands, so from here on
-    # restoring it has to happen on every path out -- including a failure
-    # between the pull and the candidate tag. Leaving :latest on an unverified
-    # image is the exact hazard this sequence exists to prevent.
-    try:
-        candidate_id = await podman.pull(latest)
-        candidate = await podman.inspect_image(candidate_id)
-        candidate_tag = f"localhost/{basename}:candidate-{tag_suffix(candidate.revision, candidate_id)}"
-        await podman.tag(candidate_id, candidate_tag)
-    finally:
-        await _restore_latest(podman, outgoing_id, latest)
+    gated_ref = f"{service.image}:gated-{wanted.lower()}"
+    gated_id = await _pull_or_none(podman, gated_ref)
+    gated = False
+    if gated_id is not None:
+        # Pulled by tags of their own: the local :latest has not moved.
+        main_ref = f"{service.image}:main"
+        main_id: str | None = None
+        try:
+            main_id = await _pull_or_none(podman, main_ref)
+            candidate = await podman.inspect_image(gated_id)
+            candidate_tag = f"localhost/{basename}:candidate-{tag_suffix(candidate.revision, gated_id)}"
+            await podman.tag(gated_id, candidate_tag)
+        finally:
+            await _untag(podman, gated_id, gated_ref)
+            if main_id is not None:
+                await _untag(podman, main_id, main_ref)
+        candidate_id = gated_id
+        gated = main_id == gated_id
+    else:
+        # The pull moves the local :latest the moment it lands, so from here on
+        # restoring it has to happen on every path out -- including a failure
+        # between the pull and the candidate tag. Leaving :latest on an
+        # unverified image is the exact hazard this sequence exists to prevent.
+        try:
+            candidate_id = await podman.pull(latest)
+            candidate = await podman.inspect_image(candidate_id)
+            candidate_tag = f"localhost/{basename}:candidate-{tag_suffix(candidate.revision, candidate_id)}"
+            await podman.tag(candidate_id, candidate_tag)
+        finally:
+            await _restore_latest(podman, outgoing_id, latest)
 
     return Staged(
         outgoing_image_id=outgoing_id,
@@ -295,4 +360,5 @@ async def stage(podman: ImageOps, systemd: UnitOps, service: Service, wanted: st
         candidate_digest=candidate.digest,
         candidate_tag=candidate_tag,
         latest_tag=latest,
+        candidate_gated=gated,
     )

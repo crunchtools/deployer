@@ -54,8 +54,19 @@ class FakeSystemd:
 class FakePodman:
     """Records every tag call, which is how the ordering is asserted."""
 
-    def __init__(self, running_image: str = OLD, pulled: str = NEW, labels: dict[str, str] | None = None):
+    def __init__(
+        self,
+        running_image: str = OLD,
+        pulled: str = NEW,
+        labels: dict[str, str] | None = None,
+        registry: dict[str, str] | None = None,
+    ):
         self.tags: list[tuple[str, str]] = []
+        self.untags: list[tuple[str, str]] = []
+        self.pulls: list[str] = []
+        #: Refs other than :latest the registry holds (gated-<sha>, main). A
+        #: ref missing here fails to pull, as an absent tag does.
+        self._registry = registry or {}
         #: What podman says the container was created from. The gate reads this
         #: rather than guessing which word of `podman run` is the image.
         self.reference = f"{IMAGE}:latest"
@@ -76,11 +87,18 @@ class FakePodman:
         return ImageRef(id=name, digest=None, tags=(), labels={REVISION_LABEL: rev} if rev else {})
 
     async def pull(self, reference: str) -> str:
-        del reference
-        return self._pulled
+        self.pulls.append(reference)
+        if reference.endswith(":latest"):
+            return self._pulled
+        if reference not in self._registry:
+            raise PodmanError(f"{reference}: manifest unknown")
+        return self._registry[reference]
 
     async def tag(self, name: str, reference: str) -> None:
         self.tags.append((name, reference))
+
+    async def untag(self, name: str, reference: str) -> None:
+        self.untags.append((name, reference))
 
 
 def container(reference: str = f"{IMAGE}:latest") -> dict[str, Any]:
@@ -265,3 +283,77 @@ def test_a_tag_suffix_never_contains_a_colon(revision: str | None, image_id: str
     suffix = tag_suffix(revision, image_id)
     assert suffix == expected
     assert ":" not in suffix
+
+
+# Build once per PR (constitution container-release, RT#1550): the label names
+# the PR head; gated-<merge sha> equal to :main says main promoted that commit.
+PR_HEAD = "9999888877776666555544443333222211110000"
+GATED = f"{IMAGE}:gated-{NEW_REV}"
+MAIN = f"{IMAGE}:main"
+
+
+async def test_a_gated_digest_main_promoted_is_a_match_whatever_its_label() -> None:
+    podman = FakePodman(labels={OLD: OLD_REV, NEW: PR_HEAD}, registry={GATED: NEW, MAIN: NEW})
+    staged = await stage(podman, FakeSystemd(f"run -d {IMAGE}:latest"), service(), NEW_REV)
+    assert staged.candidate_gated and staged.candidate_image_id == NEW
+    assert classify_revision(staged.candidate_revision, NEW_REV, 10, service(), gated=True) is Verdict.MATCH
+    assert f"{IMAGE}:latest" not in podman.pulls
+    assert all(ref != f"{IMAGE}:latest" for _, ref in podman.tags)
+    assert set(podman.untags) == {(NEW, GATED), (NEW, MAIN)}
+
+
+@pytest.mark.parametrize(("age", "expected"), [(10, Verdict.WAITING), (BUILD_DEADLINE, Verdict.STALE)])
+async def test_a_gated_digest_main_does_not_hold_is_not_deployed(age: int, expected: Verdict) -> None:
+    """A gated tag alone also exists for a PR head that never merged."""
+    podman = FakePodman(labels={OLD: OLD_REV, NEW: PR_HEAD}, registry={GATED: NEW, MAIN: OLD})
+    staged = await stage(podman, FakeSystemd(f"run -d {IMAGE}:latest"), service(), NEW_REV)
+    assert not staged.candidate_gated
+    verdict = classify_revision(staged.candidate_revision, NEW_REV, age, service(), gated=False)
+    assert verdict is expected
+    assert all(ref != f"{IMAGE}:latest" for _, ref in podman.tags)
+    assert set(podman.untags) == {(NEW, GATED), (OLD, MAIN)}
+
+
+async def test_without_a_gated_tag_staging_takes_the_latest_path() -> None:
+    podman = FakePodman()
+    staged = await stage(podman, FakeSystemd(f"run -d {IMAGE}:latest"), service(), NEW_REV)
+    assert not staged.candidate_gated
+    assert podman.pulls == [GATED, f"{IMAGE}:latest"]
+    assert podman.tags[-1] == (OLD, f"{IMAGE}:latest")
+    assert not podman.untags
+
+
+async def test_the_pulled_refs_are_untagged_when_tagging_the_candidate_fails() -> None:
+    class FailsToTag(FakePodman):
+        async def tag(self, name: str, reference: str) -> None:
+            if "candidate-" in reference:
+                raise PodmanError("no space left on device")
+            await super().tag(name, reference)
+
+    podman = FailsToTag(labels={OLD: OLD_REV, NEW: PR_HEAD}, registry={GATED: NEW, MAIN: NEW})
+    with pytest.raises(PodmanError, match="no space left"):
+        await stage(podman, FakeSystemd(f"run -d {IMAGE}:latest"), service(), NEW_REV)
+    assert set(podman.untags) == {(NEW, GATED), (NEW, MAIN)}
+    assert all(ref != f"{IMAGE}:latest" for _, ref in podman.tags)
+
+
+async def test_a_missing_main_still_untags_the_gated_ref_and_is_not_a_match() -> None:
+    podman = FakePodman(labels={OLD: OLD_REV, NEW: PR_HEAD}, registry={GATED: NEW})
+    staged = await stage(podman, FakeSystemd(f"run -d {IMAGE}:latest"), service(), NEW_REV)
+    assert not staged.candidate_gated
+    assert podman.untags == [(NEW, GATED)]
+
+
+async def test_a_pull_failure_that_is_not_an_absent_tag_stops_staging() -> None:
+    """Auth or network trouble must not read as "no gated tag" and fall back."""
+
+    class Unauthorized(FakePodman):
+        async def pull(self, reference: str) -> str:
+            if ":gated-" in reference:
+                raise PodmanError("unauthorized: access to the requested resource is not authorized")
+            return await super().pull(reference)
+
+    podman = Unauthorized()
+    with pytest.raises(StageError, match="could not pull .*unauthorized"):
+        await stage(podman, FakeSystemd(f"run -d {IMAGE}:latest"), service(), NEW_REV)
+    assert f"{IMAGE}:latest" not in podman.pulls
