@@ -4,7 +4,7 @@
 > **Ratified:** 2026-11-07
 > **Amended:** 2026-11-11
 > **Status:** Active
-> **Inherits:** [crunchtools/constitution](https://github.com/crunchtools/constitution) v1.40.0
+> **Inherits:** [crunchtools/constitution](https://github.com/crunchtools/constitution) v1.41.0
 > **Profile:** CLI Tool
 
 This file holds what is specific to `deployer`. The fleet rules and the CLI
