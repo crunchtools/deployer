@@ -6,6 +6,19 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-12
+
+### Added
+- `release-follow` judges every registry row, not only the ones that list
+  `follower`. A row that did not opt in is never filed for; when it runs an image
+  older than `:latest` its status line reads `result=behind`. Each `service`
+  line gains `followed=yes|no` and `since=<epoch>|-`, where `since` is the build
+  time of `:latest` on every line that is behind (`filed`, `pending`, `answered`,
+  `would-file`, `behind`). nagios-agent's deploy drift check measures its 24h
+  grace from it, statelessly, and so sees a release that never went live on a
+  service deployed by hand (rotv drifted 37 releases and is not followed). The
+  summary reads `N followed of M, F filed, B behind, U unjudged, S stalled`; an
+  unjudged row of either kind makes the pass `degraded`.
 ## [0.8.1] - 2026-11-12
 
 ### Security
