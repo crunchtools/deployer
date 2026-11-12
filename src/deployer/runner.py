@@ -459,8 +459,8 @@ class Runner:
                 ticket,
                 f"no image for {request.short_commit} reached {service.name} within "
                 f"{service.build_deadline // 60} minutes; the ticket is {age // 60} minutes old. "
-                f"Neither is {service.image}:gated-{request.short_commit} what :main holds, nor does "
-                f"the candidate's revision label match (it is built from "
+                f"Neither is {service.image}:gated-{request.short_commit} what :main or :latest "
+                f"holds, nor does the candidate's revision label match (it is built from "
                 f"{(staged.candidate_revision or 'no revision label')[:12]}). "
                 "Main did not promote this commit -- check the repository's actions.",
             )

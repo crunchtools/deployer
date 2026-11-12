@@ -56,7 +56,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import httpx
 
 from .hold import Hold
-from .statefile import write_whole
+from .statefile import frame_field
+from .statefile import write_frame
 
 __all__ = [
     "STATUS_PREFIX",
@@ -252,14 +253,13 @@ def write_status(
     of nothing wrong.
     """
     stamp = time.time() if now is None else now
-    lines = [f"{STATUS_PREFIX} generated={stamp:.0f} outcome={_clean(outcome)} detail={_clean(detail)}"]
+    lines = [f"generated={stamp:.0f} outcome={frame_field(outcome)} detail={frame_field(detail)}"]
     lines.extend(
-        f"{STATUS_PREFIX} hold unit={_clean(hold.unit)} ticket={hold.ticket} "
-        f"revision={_clean(hold.revision[:12])} since={hold.at:.0f}"
+        f"hold unit={frame_field(hold.unit)} ticket={hold.ticket} "
+        f"revision={frame_field(hold.revision[:12])} since={hold.at:.0f}"
         for hold in holds
     )
-    lines.append(f"{STATUS_PREFIX} end=1")
-    return write_whole(Path(path), "\n".join(lines) + "\n")
+    return write_frame(Path(path), STATUS_PREFIX, lines)
 
 
 def _require_mapping(value: object) -> Mapping[str, object]:
@@ -299,13 +299,3 @@ def my_windows(
         if matches and isinstance(entry_id, int) and (service is None or on_service == service):
             wanted.append((entry_id, on_service is not None))
     return wanted
-
-
-def _clean(text: str) -> str:
-    """Printable ASCII, no spaces or pipes, at most 80 characters.
-
-    The same shape as ``cl_clean`` in collector-lib.sh: these go into
-    space-separated lines, so a space in a value would be read as a new field.
-    """
-    kept = "".join(char for char in text if "\040" <= char <= "\176")
-    return kept.replace(" ", "_").replace("|", "/")[:80] or "-"

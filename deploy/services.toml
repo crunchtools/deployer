@@ -36,13 +36,20 @@
 # proven not to clear pinned-dependency CVEs. So `rebuilder` is intentionally
 # NOT a requestor here: the ticket-filing credential must not be able to trigger
 # a deploy. The errata runner tests stay; they pin real deployer behaviour.
+#
+# On `follower`: the RT user `release-follow` files as. Listing it is the
+# opt-in -- release-follow files a Deploy ticket for a row only when the row
+# lists it, and the runner accepts the ticket for the same reason -- so a row
+# is followed exactly when its deploys are allowed to arrive unattended. It is
+# a LOAD ERROR on a `rollback = "manual"` row and on trentina and
+# josui.crunchtools.com (registry.NEVER_FOLLOWED): those need a person.
 
 [service."acquacotta.crunchtools.com"]
 repo = "crunchtools/acquacotta"
 image = "quay.io/crunchtools/acquacotta"
 unit = "acquacotta.crunchtools.com.service"
 nagios_host = "ctr-acquacotta.crunchtools.com"
-requestors = ["scott"]
+requestors = ["scott", "follower"]
 # NOT /health -- that route answers 500 on this service today. /api/plugins
 # exercises the app and the database behind it, which is what a probe is for.
 probe = { kind = "http", url = "http://127.0.0.1:8080/api/plugins", expect_status = 200 }
@@ -66,7 +73,7 @@ image = "quay.io/crunchtools/mcp-pcloud"
 # The container is `mcp-pcloud`; the unit carries the full hostname.
 unit = "mcp-pcloud.crunchtools.com.service"
 nagios_host = "ctr-mcp-pcloud.crunchtools.com"
-requestors = ["scott"]
+requestors = ["scott", "follower"]
 # No health route at all: a GET of /mcp answers 400. The `mcp` probe POSTs a
 # JSON-RPC initialize and reads the answer, which is the only check that proves
 # an MCP server is actually serving rather than merely listening.
@@ -83,7 +90,7 @@ repo = "crunchtools/mcp-nagios"
 image = "quay.io/crunchtools/mcp-nagios"
 unit = "mcp-nagios.crunchtools.com.service"
 nagios_host = "ctr-mcp-nagios.crunchtools.com"
-requestors = ["scott"]
+requestors = ["scott", "follower"]
 probe = { kind = "mcp", url = "http://127.0.0.1:8026/mcp" }
 settle = 30
 rollback = "auto"
@@ -94,7 +101,7 @@ image = "quay.io/crunchtools/mcp-cloudflare"
 # The container is `mcp-cloudflare`; the unit carries the full hostname.
 unit = "mcp-cloudflare.crunchtools.com.service"
 nagios_host = "ctr-mcp-cloudflare.crunchtools.com"
-requestors = ["scott"]
+requestors = ["scott", "follower"]
 # Measured 200 against an initialize POST before onboarding. There is no
 # /health route, which is why every MCP server here probes the handshake
 # instead of a status code that would pass without testing anything.

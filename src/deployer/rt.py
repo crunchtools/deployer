@@ -265,6 +265,14 @@ class RtClient:
                 ids.append(int(number))
         return tuple(ids)
 
+    async def search(self, query: str) -> tuple[int, ...]:
+        """Ticket ids matching a TicketSQL ``query``, oldest first, any status.
+
+        The caller builds the query and owns its quoting: every value it
+        interpolates must already be checked to a charset with no quote in it.
+        """
+        return await self._search(query)
+
     async def open_tickets(self, queue: str) -> tuple[int, ...]:
         """Ticket ids in ``queue`` that are new or open, oldest first.
 

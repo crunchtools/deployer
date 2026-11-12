@@ -1,8 +1,8 @@
 # deployer Constitution
 
-> **Version:** 0.3.0
+> **Version:** 0.4.0
 > **Ratified:** 2026-11-07
-> **Amended:** 2026-11-11
+> **Amended:** 2026-11-12
 > **Status:** Active
 > **Inherits:** [crunchtools/constitution](https://github.com/crunchtools/constitution) v1.41.0
 > **Profile:** CLI Tool
@@ -28,6 +28,23 @@ hold: it imports nothing from this package but the RT client; it runs from its
 own unit with no podman or D-Bus socket, no state directory and no registry; and
 it holds no credential that can file an accepted Deploy ticket. The day it needs
 a second credential or a second dependency, it moves out.
+
+Amended at 0.4.0 (release-follow, CTO ruling 2026-11-12): a third tool,
+`release-follow`, whose one sentence is to file a Deploy ticket when a service
+that opted in is running something older than its registry `:latest`. It is
+here because its whole input is this package's registry and its whole output is
+this package's ticket format, and a copy of either in another repo would drift.
+Unlike `cve-enqueue` it DOES hold a credential that files an accepted Deploy
+ticket — that is its purpose — so it is admitted only while all of these hold:
+it files as its own RT user `follower` and refuses to run as any other; a row is
+followed only when it lists `follower` in `requestors`, which is the same fact
+that makes the runner accept the ticket; the registry refuses `follower` at load
+on a `rollback = "manual"` row and on `trentina` and `josui.crunchtools.com`;
+it runs from its own unit with no podman or D-Bus socket (the running side comes
+from a snapshot the host writes) and writes only its own status file; it never
+files a downgrade; and it decides only that a ticket should exist — every deploy
+it causes goes through the runner, the registry's probe and the rollback exactly
+as a seat's would.
 
 ## The Capability Boundary
 
@@ -104,6 +121,7 @@ delete:
 | `hold/<unit>` | A rolled-back service. Carries ticket, revision, time. **Never expires.** |
 | `rolled-back/<service>/<rev>` | A revision that was started and failed to verify. Never deployed **automatically** again. |
 | `tickets/<id>` | What has already been said on a ticket, so a waiting one is not commented on every run. |
+| `follower/release-follow.status` | `release-follow`'s last pass, for Nagios. Its only writable path. |
 
 A hold has no expiry because expiry means a known-bad image going live when
 nobody got to the alert in time. A red check is the better failure.

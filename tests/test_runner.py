@@ -500,6 +500,24 @@ async def test_a_creator_who_is_not_a_requestor_is_refused(tmp_path: Path) -> No
     assert world.rt.said("developer1")
 
 
+async def test_a_follower_ticket_deploys_a_row_that_lists_the_follower(tmp_path: Path) -> None:
+    # release-follow's tickets are accepted by the same requestors check as a
+    # seat's: the opt-in IS the authorisation, so there is nothing extra here.
+    registry = Registry({"acquacotta": replace(SERVICE, requestors=("developer1", "follower"))})
+    world = World(tmp_path, ticket(creator="follower"), registry=registry)
+    report = await world.drain()
+    assert report.outcome == OUTCOME_OK
+    assert world.systemd.restarts == [UNIT]
+
+
+async def test_a_follower_ticket_is_refused_for_a_row_that_does_not_list_it(tmp_path: Path) -> None:
+    world = World(tmp_path, ticket(creator="follower"))
+    report = await world.drain()
+    assert report.outcome == OUTCOME_REFUSED
+    assert world.systemd.restarts == []
+    assert world.rt.said("'follower' may not request a deploy")
+
+
 async def test_a_ticket_from_another_queue_is_refused(tmp_path: Path) -> None:
     world = World(tmp_path, ticket(queue="Professional"))
     report = await world.drain()

@@ -7,6 +7,7 @@ refuse a deploy later for a reason nobody can see from the config.
 
 from __future__ import annotations
 
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,8 @@ from deployer.registry import (
     DEFAULT_BUILD_DEADLINE_SECONDS,
     DEFAULT_READY_SECONDS,
     DEFAULT_SETTLE_SECONDS,
+    FOLLOWER,
+    NEVER_FOLLOWED,
     RegistryError,
     load_registry,
 )
@@ -322,3 +325,60 @@ def test_a_stray_top_level_table_is_refused(tmp_path: Path) -> None:
 def test_ready_must_be_a_positive_integer(tmp_path: Path, value: str) -> None:
     with pytest.raises(RegistryError, match="ready must be a positive integer"):
         load_registry(write(tmp_path, GOOD.replace("ready = 20", f"ready = {value}")))
+
+
+# ------------------------------------------------------------- release-follow
+
+FOLLOWED_ROW = """
+[service."{name}"]
+repo = "crunchtools/x"
+image = "quay.io/crunchtools/x"
+unit = "x.service"
+nagios_host = "ctr-x"
+requestors = ["scott", "{who}"]
+rollback = "{rollback}"
+probe = {{ kind = "mcp", url = "http://127.0.0.1:8026/mcp" }}
+"""
+
+
+def followed(name: str = "mcp-nagios", who: str = "follower", rollback: str = "auto") -> str:
+    return FOLLOWED_ROW.format(name=name, who=who, rollback=rollback)
+
+
+def test_an_auto_rollback_row_may_list_the_follower(tmp_path: Path) -> None:
+    svc = load_registry(write(tmp_path, followed())).get("mcp-nagios")
+    assert FOLLOWER in svc.requestors
+
+
+@pytest.mark.parametrize("name", sorted(NEVER_FOLLOWED))
+def test_the_gateway_and_its_seat_may_never_list_the_follower(tmp_path: Path, name: str) -> None:
+    with pytest.raises(RegistryError, match="is never followed"):
+        load_registry(write(tmp_path, followed(name=name)))
+
+
+def test_a_manual_rollback_row_may_not_list_the_follower(tmp_path: Path) -> None:
+    with pytest.raises(RegistryError, match="rollback is 'manual'"):
+        load_registry(write(tmp_path, followed(name="rootsofthevalley.org", rollback="manual")))
+
+
+def test_the_follower_check_ignores_case_and_spacing(tmp_path: Path) -> None:
+    # The runner compares requestors case-insensitively, so the guard must too:
+    # otherwise " Follower" would slip past here and still be accepted there.
+    with pytest.raises(RegistryError, match="is never followed"):
+        load_registry(write(tmp_path, followed(name="trentina", who=" Follower")))
+
+
+@pytest.mark.parametrize("name", sorted(NEVER_FOLLOWED))
+def test_a_never_followed_row_without_the_follower_loads(tmp_path: Path, name: str) -> None:
+    assert load_registry(write(tmp_path, followed(name=name, who="developer1"))).get(name)
+
+
+def test_the_shipped_registry_follows_exactly_the_pr1_rows() -> None:
+    """The rollout is a reviewed list, not whatever a row happens to say."""
+    shipped = Path(__file__).resolve().parent.parent / "deploy" / "services.toml"
+    rows = tomllib.loads(shipped.read_text(encoding="utf-8"))["service"]
+    listed = {name for name, row in rows.items() if FOLLOWER in row["requestors"]}
+    assert listed == {"acquacotta.crunchtools.com", "mcp-pcloud", "mcp-nagios", "mcp-cloudflare"}
+    for name in listed:
+        assert name not in NEVER_FOLLOWED
+        assert rows[name].get("rollback", "auto") == "auto"

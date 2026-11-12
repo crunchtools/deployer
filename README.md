@@ -214,6 +214,28 @@ round again two minutes later, and without this would restart a healthy service
 to arrive exactly where it already was. It also covers the case where something
 else — an auto-update, a person — put that image live first.
 
+## Following releases
+
+Ashigaru cuts releases on its own, and nothing it runs may hold an RT
+credential, so a release nobody filed a ticket for used to sit undeployed.
+`release-follow` is the filer for those. Hourly, for each row that lists
+`follower` in `requestors`, it compares the registry's `:latest` with what the
+container runs and, when `:latest` is newer, files an ordinary Deploy ticket as
+RT user `follower`. The deploy then goes exactly as a seat's would.
+
+Listing `follower` is the opt-in and the authorisation at once: the runner
+accepts the ticket because the row lists the creator. The registry refuses it
+on a `rollback = "manual"` row and on `trentina` and `josui.crunchtools.com`.
+It never files a downgrade, never files while a live ticket covers the same
+commit, and never refiles a commit it already filed. A follower ticket the
+runner hands back is stalled and owned by `follower`, which nobody reads, so
+each one is listed in `/var/lib/deployer/follower/release-follow.status` for
+the Nagios check to warn on.
+
+```
+release-follow --dry-run     # say what would be filed, file nothing
+```
+
 ## Licence
 
 AGPL-3.0-or-later.
