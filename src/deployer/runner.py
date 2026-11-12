@@ -447,23 +447,15 @@ class Runner:
 
         age = max(0, int(self.now() - ticket.created))
         verdict = classify_revision(
-            staged.candidate_revision, request.commit, age, service, gated=staged.candidate_gated
+            staged.candidate_revision, request.commit, age, service, proof=staged.proof
         )
         if verdict is Verdict.MATCH and staged.outgoing_image_id == staged.candidate_image_id:
             return await self._already_live(ticket, request, service, staged)
         if verdict is Verdict.WAITING:
             return await self._waiting(ticket, request, service, age)
-        if verdict is Verdict.STALE:
+        if verdict is not Verdict.MATCH:
             await self._untag_candidate(staged)
-            return await self._refuse(
-                ticket,
-                f"no image for {request.short_commit} reached {service.name} within "
-                f"{service.build_deadline // 60} minutes; the ticket is {age // 60} minutes old. "
-                f"Neither is {service.image}:gated-{request.short_commit} what :main or :latest "
-                f"holds, nor does the candidate's revision label match (it is built from "
-                f"{(staged.candidate_revision or 'no revision label')[:12]}). "
-                "Main did not promote this commit -- check the repository's actions.",
-            )
+            return await self._refuse(ticket, _not_deployable_why(request, service, staged, verdict, age))
         return await self._live(ticket, request, service, staged)
 
     async def _dry(self, ticket: Ticket, request: Request, service: Service) -> TicketResult:
@@ -540,7 +532,8 @@ class Runner:
             ticket,
             f"waiting:{request.commit}",
             f"Waiting for a build. No image carrying {request.short_commit} has been pushed to "
-            f"{service.image} yet; {left} minutes of the {service.build_deadline // 60}-minute build "
+            f"{service.image} and promoted by main or a release yet; "
+            f"{left} minutes of the {service.build_deadline // 60}-minute build "
             f"deadline are left. This is said once, not every time the queue is checked.",
         )
         return TicketResult(OUTCOME_OK, f"t{ticket.id} waiting for {request.short_commit}")
@@ -907,6 +900,29 @@ def _proof_phrase(service: Service) -> str:
             f"verified as {service.probe.server_name}"
         )
     return f"{service.probe.url} answered throughout"
+
+
+def _not_deployable_why(
+    request: Request, service: Service, staged: Staged, verdict: Verdict, age: int
+) -> str:
+    """Why a ticket past its build deadline is refused, naming the missing proof."""
+    if verdict is Verdict.STALE:
+        return (
+            f"no image for {request.short_commit} reached {service.name} within "
+            f"{service.build_deadline // 60} minutes; the ticket is {age // 60} minutes old. "
+            f"Neither is {service.image}:gated-{request.short_commit} what :main or :latest "
+            f"holds, nor does the candidate's revision label match (it is built from "
+            f"{(staged.candidate_revision or 'no revision label')[:12]}). "
+            "Main did not promote this commit -- check the repository's actions."
+        )
+    return (
+        f"not deploying {request.short_commit} to {service.name}: an image built from it "
+        f"exists, but neither {service.image}:main nor :latest holds it, so neither main "
+        "nor a release promoted it. That is what the head of a pull request that never "
+        "merged looks like (or a merged commit main has moved past and no release "
+        "carried). Only promoted images are deployed: file a ticket for the merge "
+        "commit, or for the released commit, instead."
+    )
 
 
 def _as_notes(reasons: Iterable[str]) -> str:

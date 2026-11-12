@@ -14,7 +14,7 @@ import pytest
 
 from deployer.podman import REVISION_LABEL, ImageRef, PodmanError
 from deployer.registry import Probe, Service
-from deployer.stage import StageError, Verdict, classify_revision, stage, tag_suffix, unit_shape_ok
+from deployer.stage import Proof, StageError, Verdict, classify_revision, stage, tag_suffix, unit_shape_ok
 
 OLD = "sha256:0000old"
 NEW = "sha256:1111new"
@@ -267,7 +267,13 @@ def test_a_mismatch_is_waiting_until_the_build_deadline(
     # A seat files the ticket when it merges; CI builds afterwards. For the
     # first build_deadline a mismatch means "not yet", after it means "not
     # coming".
-    assert classify_revision(revision, NEW_REV, age, service()) is expected
+    assert classify_revision(revision, NEW_REV, age, service(), proof=Proof.PROMOTED) is expected
+
+
+@pytest.mark.parametrize(("age", "expected"), [(10, Verdict.WAITING), (BUILD_DEADLINE, Verdict.UNPROMOTED)])
+def test_a_matching_label_without_promotion_is_never_a_match(age: int, expected: Verdict) -> None:
+    # The label says which code, not that main or a release carried it.
+    assert classify_revision(NEW_REV, NEW_REV, age, service()) is expected
 
 
 @pytest.mark.parametrize(
@@ -296,7 +302,10 @@ async def test_a_gated_digest_main_promoted_is_a_match_whatever_its_label() -> N
     podman = FakePodman(labels={OLD: OLD_REV, NEW: PR_HEAD}, registry={GATED: NEW, MAIN: NEW})
     staged = await stage(podman, FakeSystemd(f"run -d {IMAGE}:latest"), service(), NEW_REV)
     assert staged.candidate_gated and staged.candidate_image_id == NEW
-    assert classify_revision(staged.candidate_revision, NEW_REV, 10, service(), gated=True) is Verdict.MATCH
+    assert (
+        classify_revision(staged.candidate_revision, NEW_REV, 10, service(), proof=staged.proof)
+        is Verdict.MATCH
+    )
     assert f"{IMAGE}:latest" not in podman.pulls
     assert all(ref != f"{IMAGE}:latest" for _, ref in podman.tags)
     assert set(podman.untags) == {(NEW, GATED), (NEW, MAIN)}
@@ -305,12 +314,10 @@ async def test_a_gated_digest_main_promoted_is_a_match_whatever_its_label() -> N
 @pytest.mark.parametrize(("age", "expected"), [(10, Verdict.WAITING), (BUILD_DEADLINE, Verdict.STALE)])
 async def test_a_gated_digest_main_does_not_hold_is_not_deployed(age: int, expected: Verdict) -> None:
     """A gated tag alone also exists for a PR head that never merged."""
-    podman = FakePodman(
-        pulled=OLD, labels={OLD: OLD_REV, NEW: PR_HEAD}, registry={GATED: NEW, MAIN: OLD}
-    )
+    podman = FakePodman(pulled=OLD, labels={OLD: OLD_REV, NEW: PR_HEAD}, registry={GATED: NEW, MAIN: OLD})
     staged = await stage(podman, FakeSystemd(f"run -d {IMAGE}:latest"), service(), NEW_REV)
     assert not staged.candidate_gated
-    verdict = classify_revision(staged.candidate_revision, NEW_REV, age, service(), gated=False)
+    verdict = classify_revision(staged.candidate_revision, NEW_REV, age, service(), proof=staged.proof)
     assert verdict is expected
     assert latest_ends_on(podman) == OLD
     assert set(podman.untags) == {(NEW, GATED), (OLD, MAIN)}
@@ -373,6 +380,8 @@ async def test_without_a_gated_tag_staging_takes_the_latest_path() -> None:
     podman = FakePodman()
     staged = await stage(podman, FakeSystemd(f"run -d {IMAGE}:latest"), service(), NEW_REV)
     assert not staged.candidate_gated
+    # The candidate IS the registry's :latest: a release promoted it.
+    assert staged.candidate_promoted
     assert podman.pulls == [GATED, f"{IMAGE}:latest"]
     assert podman.tags[-1] == (OLD, f"{IMAGE}:latest")
     assert not podman.untags
@@ -412,3 +421,47 @@ async def test_a_pull_failure_that_is_not_an_absent_tag_stops_staging() -> None:
     with pytest.raises(StageError, match="could not pull .*unauthorized"):
         await stage(podman, FakeSystemd(f"run -d {IMAGE}:latest"), service(), NEW_REV)
     assert f"{IMAGE}:latest" not in podman.pulls
+
+
+# A ticket naming a pull request's HEAD commit: gated-<head> exists and its
+# label matches whether or not the pull request ever merged, so only :main or
+# :latest holding that digest may make it deployable.
+HEAD_GATED = f"{IMAGE}:gated-{PR_HEAD}"
+HEAD_LABELS = {OLD: OLD_REV, NEW: PR_HEAD}
+
+
+def head_verdict(staged: Any, age: int = 10) -> Verdict:
+    return classify_revision(
+        staged.candidate_revision,
+        PR_HEAD,
+        age,
+        service(),
+        proof=staged.proof,
+    )
+
+
+@pytest.mark.parametrize(("age", "expected"), [(10, Verdict.WAITING), (BUILD_DEADLINE, Verdict.UNPROMOTED)])
+async def test_an_unmerged_pull_request_head_is_not_deployable(age: int, expected: Verdict) -> None:
+    podman = FakePodman(pulled=OLD, labels=HEAD_LABELS, registry={HEAD_GATED: NEW, MAIN: OLD})
+    staged = await stage(podman, FakeSystemd(f"run -d {IMAGE}:latest"), service(), PR_HEAD)
+    assert staged.candidate_revision == PR_HEAD  # the label matches the ticket ...
+    assert not staged.candidate_promoted  # ... but nothing promoted it
+    assert head_verdict(staged, age) is expected
+    assert latest_ends_on(podman) == OLD
+    assert set(podman.untags) == {(NEW, HEAD_GATED), (OLD, MAIN)}
+
+
+async def test_a_merged_head_main_holds_is_a_match() -> None:
+    podman = FakePodman(labels=HEAD_LABELS, registry={HEAD_GATED: NEW, MAIN: NEW})
+    staged = await stage(podman, FakeSystemd(f"run -d {IMAGE}:latest"), service(), PR_HEAD)
+    assert staged.candidate_promoted
+    assert head_verdict(staged) is Verdict.MATCH
+    assert latest_ends_on(podman) is None
+
+
+async def test_a_released_head_with_merges_on_top_is_a_match() -> None:
+    podman = FakePodman(pulled=NEW, labels=HEAD_LABELS, registry={HEAD_GATED: NEW, MAIN: "sha256:2222main"})
+    staged = await stage(podman, FakeSystemd(f"run -d {IMAGE}:latest"), service(), PR_HEAD)
+    assert staged.candidate_promoted
+    assert head_verdict(staged) is Verdict.MATCH
+    assert latest_ends_on(podman) == OLD

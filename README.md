@@ -44,13 +44,18 @@ For each ticket:
 - Tag the image the service is *running now* as `rollback-<revision>` — read
   from the running container, not from the local `:latest`, because those two
   can differ and that gap is how a surprise gets deployed.
-- Pull `:latest`, tag it `candidate-<revision>`, and immediately put `:latest`
-  back where it was. The local tag never moves before the deploy step, so a
-  ticket that is refused or waiting cannot turn an unrelated crash-restart into
-  a deploy.
-- Only deploy if the candidate's `org.opencontainers.image.revision` is the
-  commit the ticket named. If no such image exists yet and the ticket is young,
-  wait and say so once; if it is old, stall it.
+- Pull `gated-<commit>` and `:main` (and, only if `:main` has moved on, the
+  registry's `:latest`), or just `:latest` for a repository that publishes no
+  gated tags; tag the candidate `candidate-<revision>`, and immediately put
+  `:latest` back where it was. The local tag never moves before the deploy step,
+  so a ticket that is refused or waiting cannot turn an unrelated crash-restart
+  into a deploy.
+- Only deploy a candidate that is the commit the ticket named — its
+  `org.opencontainers.image.revision`, or the `gated-<commit>` tag — **and** that
+  main or a release promoted: `:main` or the registry's `:latest` holds that
+  image. A pull request's head is built and labelled whether or not it merges,
+  so a matching label alone is refused. If no such image exists yet and the
+  ticket is young, wait and say so once; if it is old, stall it with the reason.
 - Verify: the unit is active, the running container's image ID *is* the
   candidate, and the health probe — given up to `ready` seconds to answer at
   all — then holds continuously for the settle window. Checking the image ID

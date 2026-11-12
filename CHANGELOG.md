@@ -6,6 +6,20 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-11-12
+
+### Security
+- **Promotion is mandatory in stage().** A Deploy ticket naming the head commit
+  of a pull request that never merged deployed it: `gated-<head>` exists and its
+  revision label matches for every gated pull request head, and the label check
+  matched before the promotion check (`:main` or, since 0.8.0, the registry's
+  `:latest` holding that digest) was consulted. A candidate now matches only when
+  its revision is the ticket's commit **and** main or a release promoted it; a
+  repository without gated tags is unchanged, because its candidate is the
+  registry's `:latest`. An unpromoted match waits out the build deadline like any
+  other miss, then is refused and stalled with a comment saying neither main nor a
+  release promoted it. The local `:latest` is still restored on every path.
+
 ## [0.8.0] - 2026-11-12
 
 ### Added
