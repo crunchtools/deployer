@@ -24,7 +24,7 @@ from typing import Any, Final, Literal
 from . import validate
 from .validate import ValidationError
 
-__all__ = ["Probe", "RegistryError", "Service", "load_registry"]
+__all__ = ["FOLLOWER", "NEVER_FOLLOWED", "Probe", "RegistryError", "Service", "load_registry"]
 
 ProbeKind = Literal["http", "mcp", "log"]
 RollbackMode = Literal["auto", "manual"]
@@ -32,6 +32,16 @@ RollbackMode = Literal["auto", "manual"]
 DEFAULT_SETTLE_SECONDS: Final = 60
 DEFAULT_BUILD_DEADLINE_SECONDS: Final = 30 * 60
 DEFAULT_READY_SECONDS: Final = 60
+
+#: The RT user ``release-follow`` files as. A row opts in to being followed by
+#: listing it in ``requestors`` -- which is also what lets the runner accept the
+#: ticket, so the opt-in and the authorisation cannot drift apart.
+FOLLOWER: Final = "follower"
+#: Services nothing may follow, whatever their row says. ``trentina`` is the
+#: gateway every seat talks through and ``josui.crunchtools.com`` is the seat
+#: that would be deploying it; neither should move because a timer noticed a
+#: release. A ``rollback = "manual"`` row is refused too (see ``_check_follower``).
+NEVER_FOLLOWED: Final = frozenset({"trentina", "josui.crunchtools.com"})
 
 _SERVICE_KEYS: Final = frozenset(
     {
@@ -304,6 +314,29 @@ def _parse_probe(raw: Any, where: str) -> Probe:
     )
 
 
+def _check_follower(name: str, requestors: tuple[str, ...], rollback: RollbackMode, where: str) -> None:
+    """Refuse ``follower`` on a row that must never deploy unattended.
+
+    A load error rather than a skip inside ``release-follow``: the runner reads
+    the same file, and a row that lists ``follower`` is a row whose follower
+    tickets the runner would ACCEPT. Refusing the whole registry stops both
+    halves -- the filer and the deployer -- until the row is fixed.
+
+    ``rollback = "manual"`` is the registry's own word for "a failed deploy
+    needs a person" (migrations, state a newer version may have written), and a
+    deploy nobody asked for is exactly the one nobody is watching.
+    """
+    if FOLLOWER not in {who.strip().lower() for who in requestors}:
+        return
+    if name in NEVER_FOLLOWED:
+        raise ValidationError(f"{where}.requestors lists {FOLLOWER!r}, but {name} is never followed")
+    if rollback != "auto":
+        raise ValidationError(
+            f"{where}.requestors lists {FOLLOWER!r}, but rollback is {rollback!r}: a service whose "
+            "failed deploy needs a person is not deployed by a timer"
+        )
+
+
 def _parse_service(name: str, raw: Any) -> Service:
     where = f"service.{name}"
     table = validate.mapping(raw, where)
@@ -315,6 +348,8 @@ def _parse_service(name: str, raw: Any) -> Service:
 
     mode = validate.one_of(table.get("rollback", "auto"), ("auto", "manual"), f"{where}.rollback")
     rollback: RollbackMode = "auto" if mode == "auto" else "manual"
+    requestors = validate.str_list(table.get("requestors"), f"{where}.requestors")
+    _check_follower(name, requestors, rollback, where)
     return Service(
         name=name,
         repo=validate.non_empty_str(table["repo"], f"{where}.repo"),
@@ -322,7 +357,7 @@ def _parse_service(name: str, raw: Any) -> Service:
         unit=validate.non_empty_str(table["unit"], f"{where}.unit"),
         probe=_parse_probe(table["probe"], where),
         nagios_host=validate.non_empty_str(table["nagios_host"], f"{where}.nagios_host"),
-        requestors=validate.str_list(table.get("requestors"), f"{where}.requestors"),
+        requestors=requestors,
         ready=validate.positive_int(table.get("ready", DEFAULT_READY_SECONDS), f"{where}.ready"),
         settle=validate.positive_int(table.get("settle", DEFAULT_SETTLE_SECONDS), f"{where}.settle"),
         build_deadline=validate.positive_int(

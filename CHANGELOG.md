@@ -6,6 +6,52 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-12
+
+### Added
+- `release-follow` console script: Ashigaru cuts releases automatically and
+  holds no RT credential, so nothing filed the Deploy ticket that puts a release
+  live and services drifted (rotv was 37 releases behind). Hourly, for every
+  registry row that lists `follower` in `requestors`, it reads the registry's
+  `:latest` (image id, `org.opencontainers.image.revision`, build time) over the
+  registry's HTTP API without pulling, compares it with what the container is
+  running, and files a Deploy ticket in the ordinary body format as RT user
+  `follower` when `:latest` is newer. Never files a downgrade (a running image
+  built after `:latest` is left alone — the runner can deploy a merged commit
+  before a release carries it), never files while a live Deploy ticket from
+  anyone covers the same service and commit, and never refiles a commit it has
+  already filed for that service. Refuses to run as any RT user but `follower`.
+  Model-free.
+- Its own hardened oneshot unit and hourly timer
+  (`release-follow.crunchtools.com.service`/`.timer`): non-root, read-only, all
+  capabilities dropped, no podman or D-Bus socket — the host writes a
+  `podman ps`/`podman images` snapshot before it starts and mounts it read-only —
+  its own RT credential (`deploy/release-follow.env.example`), and only
+  `/var/lib/deployer/follower` writable.
+- A status file for Nagios, `/var/lib/deployer/follower/release-follow.status`,
+  in the collector frame (`FOLLOWER ... end=1`), listing every stalled follower
+  ticket. The check that turns it WARNING belongs to nagios-agent.
+- `RtClient.search`, and `deployer.oci`, an anonymous read-only registry reader
+  that resolves a multi-arch index to the host's platform.
+- `follower` added to `requestors` for acquacotta.crunchtools.com, mcp-pcloud,
+  mcp-nagios and mcp-cloudflare.
+
+### Changed
+- **stage() accepts a gated digest that `:latest` holds**, not only one `:main`
+  holds. Main moves on every merge, so a released commit with another merge on
+  top no longer matched `:main` and its ticket went stale; a `v*` release only
+  ever promotes a gated digest of a commit on the default branch, so `:latest`
+  equal to `gated-<commit>` is the same "main carried and tested this" proof.
+  `:latest` is pulled only when `:main` did not already answer, and put straight
+  back on the outgoing image on every path out.
+- The registry refuses `follower` in `requestors` on a `rollback = "manual"`
+  row and on `trentina` and `josui.crunchtools.com` — a load error, so neither
+  the follower nor the runner acts on such a row.
+- The status-file frame writer moved to `statefile.write_frame` and is shared by
+  the deployer's and the follower's status files.
+- Constitution amended to 0.4.0 to admit `release-follow`, with the conditions
+  it holds under.
+
 ## [0.7.0] - 2026-11-11
 
 ### Added

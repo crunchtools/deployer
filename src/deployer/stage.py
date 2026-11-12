@@ -22,8 +22,10 @@ something quietly.
    revision label names the pull request's head, not the merge commit the
    ticket carries. ``gated-<commit>`` is the digest whose gates passed for
    that commit, and ``:main`` equal to it says main promoted it: a gated tag
-   alone also exists for a pull request head that never merged. Both refs
-   are untagged locally once the candidate tag is on. A repository that
+   alone also exists for a pull request head that never merged. When ``:main``
+   has moved on, ``:latest`` equal to it says a release promoted it (pulled
+   only then, and ``:latest`` put straight back). Both refs are untagged
+   locally once the candidate tag is on. A repository that
    publishes no gated tags falls back to pulling ``:latest`` and comparing
    the label, as before.
 3. Tag what arrived as ``candidate-<revision>``.
@@ -130,9 +132,9 @@ class Staged:
     candidate_digest: str | None
     candidate_tag: str
     latest_tag: str
-    #: The candidate is ``gated-<ticket commit>`` and ``:main`` resolves to the
-    #: same image: main promoted that commit's tested digest, whatever the
-    #: label (the pull request head) says.
+    #: The candidate is ``gated-<ticket commit>`` and ``:main`` or ``:latest``
+    #: resolves to the same image: main or a release promoted that commit's
+    #: tested digest, whatever the label (the pull request head) says.
     candidate_gated: bool = False
 
 
@@ -292,6 +294,26 @@ async def _untag(podman: ImageOps, image_id: str, reference: str) -> None:
         raise StageError(f"could not untag {reference} from {image_id}: {exc}") from exc
 
 
+async def _latest_is(podman: ImageOps, latest: str, gated_id: str, outgoing_id: str) -> bool:
+    """Whether the registry's ``:latest`` is the gated image -- a RELEASE promoted it.
+
+    The second promotion witness beside ``:main``. Main moves on every merge, so
+    a commit that was released and then had another merge land on top no longer
+    matches ``:main``; its release still put that gated digest on ``:latest``,
+    which is just as much "only tested bytes that main carried" (a ``v*`` tag
+    off the default branch is refused upstream). ``release-follow`` files for
+    the ``:latest`` revision, so this is the path its tickets take.
+
+    Asked only when ``:main`` did not already answer, because pulling
+    ``:latest`` moves the local tag: it is put straight back on the outgoing
+    image on every path out, exactly as the fallback below does.
+    """
+    try:
+        return await _pull_or_none(podman, latest) == gated_id
+    finally:
+        await _restore_latest(podman, outgoing_id, latest)
+
+
 async def stage(podman: ImageOps, systemd: UnitOps, service: Service, wanted: str) -> Staged:
     """Tag the outgoing image, pull, tag the candidate, and restore ``:latest``.
 
@@ -328,6 +350,7 @@ async def stage(podman: ImageOps, systemd: UnitOps, service: Service, wanted: st
         main_id: str | None = None
         try:
             main_id = await _pull_or_none(podman, main_ref)
+            gated = main_id == gated_id or await _latest_is(podman, latest, gated_id, outgoing_id)
             candidate = await podman.inspect_image(gated_id)
             candidate_tag = f"localhost/{basename}:candidate-{tag_suffix(candidate.revision, gated_id)}"
             await podman.tag(gated_id, candidate_tag)
@@ -336,7 +359,6 @@ async def stage(podman: ImageOps, systemd: UnitOps, service: Service, wanted: st
             if main_id is not None:
                 await _untag(podman, main_id, main_ref)
         candidate_id = gated_id
-        gated = main_id == gated_id
     else:
         # The pull moves the local :latest the moment it lands, so from here on
         # restoring it has to happen on every path out -- including a failure

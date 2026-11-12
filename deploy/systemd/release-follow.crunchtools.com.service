@@ -1,0 +1,68 @@
+# release-follow — file RT Deploy tickets for services behind their release.
+#
+# Ashigaru cuts releases on its own and holds no RT credential, so nothing was
+# filing the Deploy ticket that puts a release live. This oneshot does, hourly
+# (release-follow.crunchtools.com.timer), for registry rows that list
+# `follower` in `requestors`. The deployer then handles the ticket exactly as
+# it handles a seat's: same registry, same probe, same rollback.
+#
+# The SAME deployer image, the cve-enqueue blast radius. No podman socket, no
+# D-Bus socket, non-root, read-only, every capability dropped. What it needs to
+# know about the RUNNING side is written by the host before it starts:
+# ExecStartPre runs `podman ps` and `podman images` as root into
+# /run/release-follow, mounted read-only. The podman socket is root-equivalent,
+# and a ticket filer must not hold it.
+#
+# Its own RT credential: the `follower` RT user, from its own secret file (not
+# deployer.env, not cve-enqueue.env). The program refuses any other RT_USER,
+# because the requestors opt-in in services.toml is only as good as the name
+# the tickets arrive under.
+#
+# Its own state: /var/lib/deployer/follower, writable, and NOTHING ELSE of
+# /var/lib/deployer -- holds and attempts stay out of its reach. The status file
+# there is what nagios-agent's check reads; a stalled follower ticket makes it
+# WARNING. 65532 is the image's non-root user.
+#
+# Entry point: the image's ENTRYPOINT is `python -m deployer`, which has no
+# such verb, so the unit overrides it (`--entrypoint release-follow`) and passes
+# `--config` as the command, which also overrides the image's `CMD ["run"]`.
+#
+# Deploy to: /etc/systemd/system/ (+ /srv/release-follow.crunchtools.com/config copy).
+
+[Unit]
+Description=Podman container - release-follow (Deploy ticket filer for released images, oneshot)
+Documentation=https://github.com/crunchtools/deployer
+Requires=srv-secrets@release-follow.crunchtools.com.service
+After=network-online.target srv-secrets@release-follow.crunchtools.com.service rt.fatherlinux.com.service
+
+[Service]
+Type=oneshot
+TimeoutStartSec=300
+# Only RT_URL, RT_USER (= follower), RT_PASSWORD and RT_TIMEZONE.
+EnvironmentFile=/run/srv-secrets/release-follow.crunchtools.com/release-follow.env
+RuntimeDirectory=release-follow
+RuntimeDirectoryMode=0755
+ExecStartPre=-/usr/bin/podman rm -f release-follow.crunchtools.com
+ExecStartPre=/usr/bin/install -d -m 0755 -o 65532 -g 65532 /var/lib/deployer/follower
+ExecStartPre=/bin/sh -c '/usr/bin/podman ps --format json > /run/release-follow/containers.json'
+ExecStartPre=/bin/sh -c '/usr/bin/podman images --format json > /run/release-follow/images.json'
+ExecStart=/usr/bin/podman run --rm --name release-follow.crunchtools.com \
+    --label PODMAN_SYSTEMD_UNIT=release-follow.crunchtools.com.service \
+    --network host \
+    --read-only \
+    --cap-drop=all \
+    --security-opt no-new-privileges \
+    --memory=256m --memory-swap=256m \
+    --user 65532:65532 \
+    --entrypoint release-follow \
+    -e HOME=/tmp \
+    -e FOLLOW_SNAPSHOT=/snapshot \
+    -e FOLLOW_STATUS=/var/lib/deployer/follower/release-follow.status \
+    -e RT_URL -e RT_USER -e RT_PASSWORD -e RT_TIMEZONE \
+    -v /srv/deployer.crunchtools.com/config:/config:ro \
+    -v /run/release-follow:/snapshot:ro,z \
+    -v /var/lib/deployer/follower:/var/lib/deployer/follower \
+    --tmpfs /tmp \
+    quay.io/crunchtools/deployer:0.8.0 \
+    --config /config/services.toml
+ExecStopPost=-/usr/bin/podman rm -f release-follow.crunchtools.com

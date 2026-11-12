@@ -305,12 +305,67 @@ async def test_a_gated_digest_main_promoted_is_a_match_whatever_its_label() -> N
 @pytest.mark.parametrize(("age", "expected"), [(10, Verdict.WAITING), (BUILD_DEADLINE, Verdict.STALE)])
 async def test_a_gated_digest_main_does_not_hold_is_not_deployed(age: int, expected: Verdict) -> None:
     """A gated tag alone also exists for a PR head that never merged."""
-    podman = FakePodman(labels={OLD: OLD_REV, NEW: PR_HEAD}, registry={GATED: NEW, MAIN: OLD})
+    podman = FakePodman(
+        pulled=OLD, labels={OLD: OLD_REV, NEW: PR_HEAD}, registry={GATED: NEW, MAIN: OLD}
+    )
     staged = await stage(podman, FakeSystemd(f"run -d {IMAGE}:latest"), service(), NEW_REV)
     assert not staged.candidate_gated
     verdict = classify_revision(staged.candidate_revision, NEW_REV, age, service(), gated=False)
     assert verdict is expected
-    assert all(ref != f"{IMAGE}:latest" for _, ref in podman.tags)
+    assert latest_ends_on(podman) == OLD
+    assert set(podman.untags) == {(NEW, GATED), (OLD, MAIN)}
+
+
+def latest_ends_on(podman: FakePodman) -> str | None:
+    """Where the local :latest was last tagged, or None if staging never moved it."""
+    moves = [name for name, ref in podman.tags if ref == f"{IMAGE}:latest"]
+    return moves[-1] if moves else None
+
+
+async def test_a_gated_digest_a_release_promoted_is_a_match_after_main_moved_on() -> None:
+    """release-follow's path: the ticket names the :latest revision, main is ahead."""
+    podman = FakePodman(
+        pulled=NEW, labels={OLD: OLD_REV, NEW: PR_HEAD}, registry={GATED: NEW, MAIN: "sha256:2222main"}
+    )
+    staged = await stage(podman, FakeSystemd(f"run -d {IMAGE}:latest"), service(), NEW_REV)
+    assert staged.candidate_gated and staged.candidate_image_id == NEW
+    assert podman.pulls == [GATED, MAIN, f"{IMAGE}:latest"]
+    # :latest moved with the pull and was put straight back.
+    assert latest_ends_on(podman) == OLD
+
+
+async def test_latest_is_not_asked_when_main_already_promoted() -> None:
+    podman = FakePodman(labels={OLD: OLD_REV, NEW: PR_HEAD}, registry={GATED: NEW, MAIN: NEW})
+    await stage(podman, FakeSystemd(f"run -d {IMAGE}:latest"), service(), NEW_REV)
+    assert f"{IMAGE}:latest" not in podman.pulls
+    assert latest_ends_on(podman) is None
+
+
+async def test_an_absent_latest_is_not_a_promotion() -> None:
+    class NoLatest(FakePodman):
+        async def pull(self, reference: str) -> str:
+            if reference.endswith(":latest"):
+                self.pulls.append(reference)
+                raise PodmanError(f"{reference}: manifest unknown")
+            return await super().pull(reference)
+
+    podman = NoLatest(labels={OLD: OLD_REV, NEW: PR_HEAD}, registry={GATED: NEW, MAIN: OLD})
+    staged = await stage(podman, FakeSystemd(f"run -d {IMAGE}:latest"), service(), NEW_REV)
+    assert not staged.candidate_gated
+    assert latest_ends_on(podman) == OLD
+
+
+async def test_a_latest_pull_that_fails_stops_staging_and_restores_everything() -> None:
+    class LatestUnauthorized(FakePodman):
+        async def pull(self, reference: str) -> str:
+            if reference.endswith(":latest"):
+                raise PodmanError("unauthorized: access to the requested resource is not authorized")
+            return await super().pull(reference)
+
+    podman = LatestUnauthorized(labels={OLD: OLD_REV, NEW: PR_HEAD}, registry={GATED: NEW, MAIN: OLD})
+    with pytest.raises(StageError, match="could not pull .*:latest"):
+        await stage(podman, FakeSystemd(f"run -d {IMAGE}:latest"), service(), NEW_REV)
+    assert latest_ends_on(podman) == OLD
     assert set(podman.untags) == {(NEW, GATED), (OLD, MAIN)}
 
 
@@ -338,7 +393,7 @@ async def test_the_pulled_refs_are_untagged_when_tagging_the_candidate_fails() -
 
 
 async def test_a_missing_main_still_untags_the_gated_ref_and_is_not_a_match() -> None:
-    podman = FakePodman(labels={OLD: OLD_REV, NEW: PR_HEAD}, registry={GATED: NEW})
+    podman = FakePodman(pulled=OLD, labels={OLD: OLD_REV, NEW: PR_HEAD}, registry={GATED: NEW})
     staged = await stage(podman, FakeSystemd(f"run -d {IMAGE}:latest"), service(), NEW_REV)
     assert not staged.candidate_gated
     assert podman.untags == [(NEW, GATED)]

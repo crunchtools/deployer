@@ -16,7 +16,9 @@ check doing its job.
 | `systemd/deployer.crunchtools.com.service` | `/etc/systemd/system/`, with the `/srv` copy beside the config |
 | `systemd/50-deployer-hold.conf` | `/etc/systemd/system/podman-auto-update.service.d/` |
 | `services.toml` | `/srv/deployer.crunchtools.com/config/` |
+| `systemd/release-follow.crunchtools.com.service`, `.timer` | `/etc/systemd/system/`, with the `/srv/release-follow.crunchtools.com/config` copy |
 | `deployer.env.example` | nothing — the real `deployer.env` is 0600 and holds passwords |
+| `release-follow.env.example` | nothing — the real one is 0600 and holds the `follower` RT password |
 
 The Nagios service definition for this program is **not** here. It belongs to
 the check that reads it, which is `nagios-agent`, and it lives in that repo's

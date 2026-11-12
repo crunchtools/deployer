@@ -14,7 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Final
 
-__all__ = ["safe_component", "write_whole"]
+__all__ = ["frame_field", "safe_component", "write_frame", "write_whole"]
 
 #: What may appear in a path component this program builds.
 _SAFE: Final = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
@@ -45,3 +45,25 @@ def write_whole(path: Path, text: str) -> Path:
     scratch.write_text(text, encoding="utf-8")
     scratch.replace(path)
     return path
+
+
+def frame_field(text: str) -> str:
+    """Printable ASCII, no spaces or pipes, at most 80 characters.
+
+    The same shape as ``cl_clean`` in nagios-agent's collector-lib.sh: status
+    files are space-separated lines, so a space in a value would be read as a
+    new field.
+    """
+    kept = "".join(char for char in text if "\040" <= char <= "\176")
+    return kept.replace(" ", "_").replace("|", "/")[:80] or "-"
+
+
+def write_frame(path: Path, prefix: str, lines: list[str]) -> Path:
+    """A status file in nagios-agent's collector frame, written whole.
+
+    Every line carries ``prefix``, and the last is ``<prefix> end=1``: a reader
+    that does not find it treats the file as unusable rather than as a report
+    of nothing wrong.
+    """
+    framed = [f"{prefix} {line}" for line in lines] + [f"{prefix} end=1"]
+    return write_whole(path, "\n".join(framed) + "\n")

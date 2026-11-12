@@ -1,0 +1,18 @@
+# Hourly. Releases are cut by CI minutes after a merge, and the deployer drains
+# the queue every two minutes, so an hour is the whole of the lag this adds --
+# against the days a release used to sit undeployed. Persistent so a pass missed
+# while the host was down runs on boot rather than an hour later.
+#
+# Deploy to: /etc/systemd/system/ (+ /srv/release-follow.crunchtools.com/config copy).
+
+[Unit]
+Description=Run release-follow hourly
+Documentation=https://github.com/crunchtools/deployer
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target
