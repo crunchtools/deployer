@@ -57,7 +57,7 @@ import re
 import sys
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any, Final, Protocol
@@ -367,26 +367,25 @@ async def _one(
     if not opted_in:
         # Judged for the status file, never filed for: the row did not opt in.
         return ServiceResult(service.name, "behind", decision.detail, since=decision.since, followed=False)
-    return await _file(service, decision, rt, live, dry_run)
+    # Every outcome of _file is still behind :latest, so each carries since.
+    return replace(await _file(service, decision.commit, rt, live, dry_run), since=decision.since)
 
 
 async def _file(
-    service: Service, decision: Decision, rt: Tickets, live: Mapping[tuple[str, str], int], dry_run: bool
+    service: Service, commit: str, rt: Tickets, live: Mapping[tuple[str, str], int], dry_run: bool
 ) -> ServiceResult:
     """File the ticket, unless one already covers this commit or once did."""
-    commit, since = decision.commit or "", decision.since
     existing = live.get((service.name, commit))
     if existing is not None:
-        covers = f"ticket {existing} covers {commit[:12]}"
-        return ServiceResult(service.name, "pending", covers, existing, since)
+        return ServiceResult(service.name, "pending", f"ticket {existing} covers {commit[:12]}", existing)
     subject = subject_for(service.name, commit)
     earlier = await rt.search(f"Queue = '{QUEUE}' AND Creator = '{FOLLOWER}' AND Subject = '{subject}'")
     if earlier:
-        return ServiceResult(service.name, "answered", f"already filed {commit[:12]}", earlier[-1], since)
+        return ServiceResult(service.name, "answered", f"already filed {commit[:12]}", earlier[-1])
     if dry_run:
-        return ServiceResult(service.name, "would-file", f":latest is {commit[:12]}", since=since)
+        return ServiceResult(service.name, "would-file", f":latest is {commit[:12]}")
     filed = await rt.create_ticket(QUEUE, subject, body_for(service, commit))
-    return ServiceResult(service.name, "filed", f":latest is {commit[:12]}", filed, since)
+    return ServiceResult(service.name, "filed", f":latest is {commit[:12]}", filed)
 
 
 async def follow(
