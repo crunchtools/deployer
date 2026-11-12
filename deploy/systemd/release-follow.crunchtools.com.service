@@ -46,6 +46,11 @@ RuntimeDirectory=release-follow
 RuntimeDirectoryMode=0755
 ExecStartPre=-/usr/bin/podman rm -f release-follow.crunchtools.com
 ExecStartPre=/usr/bin/install -d -m 0755 -o 65532 -g 65532 /var/lib/deployer/follower
+# The registry is COPIED into the snapshot dir, not bind-mounted from /srv: this
+# container runs confined (container_t) and /srv/deployer.crunchtools.com/config
+# is var_t, so a direct mount reads as EACCES. The deployer itself reads it only
+# because it runs as container_runtime_t. Copying avoids relabelling /srv.
+ExecStartPre=/usr/bin/install -m 0644 /srv/deployer.crunchtools.com/config/services.toml /run/release-follow/services.toml
 ExecStartPre=/bin/sh -c '/usr/bin/podman ps --format json > /run/release-follow/containers.json'
 ExecStartPre=/bin/sh -c '/usr/bin/podman images --format json > /run/release-follow/images.json'
 ExecStart=/usr/bin/podman run --rm --name release-follow.crunchtools.com \
@@ -61,10 +66,9 @@ ExecStart=/usr/bin/podman run --rm --name release-follow.crunchtools.com \
     -e FOLLOW_SNAPSHOT=/snapshot \
     -e FOLLOW_STATUS=/var/lib/deployer/follower/release-follow.status \
     -e RT_URL -e RT_USER -e RT_PASSWORD -e RT_TIMEZONE \
-    -v /srv/deployer.crunchtools.com/config:/config:ro \
     -v /run/release-follow:/snapshot:ro,z \
     -v /var/lib/deployer/follower:/var/lib/deployer/follower \
     --tmpfs /tmp \
-    quay.io/crunchtools/deployer:0.8.1 \
-    --config /config/services.toml
+    quay.io/crunchtools/deployer:0.9.0 \
+    --config /snapshot/services.toml
 ExecStopPost=-/usr/bin/podman rm -f release-follow.crunchtools.com
