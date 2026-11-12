@@ -588,7 +588,11 @@ def test_the_unit_holds_no_socket_and_files_as_follower() -> None:
     assert "EnvironmentFile=/run/srv-secrets/release-follow.crunchtools.com/release-follow.env" in text
     assert "--env-file" not in text
     # The command after the image overrides the image's CMD ["run"].
-    assert "--config /config/services.toml" in text.split("quay.io/crunchtools/deployer:", 1)[1]
+    assert "--config /snapshot/services.toml" in text.split("quay.io/crunchtools/deployer:", 1)[1]
+    # The registry is copied into the :z snapshot dir; a confined container cannot
+    # read /srv/deployer.crunchtools.com/config (var_t) through a bind mount.
+    assert "/srv/deployer.crunchtools.com/config:/config" not in text
+    assert "/srv/deployer.crunchtools.com/config/services.toml /run/release-follow/services.toml" in text
 
 
 def test_the_timer_is_hourly() -> None:
