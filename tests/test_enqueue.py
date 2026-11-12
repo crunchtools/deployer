@@ -123,6 +123,33 @@ def test_digest_is_stable_regardless_of_finding_order() -> None:
     assert digest(a) == digest(list(reversed(a)))
 
 
+def test_digest_is_identical_for_identical_findings() -> None:
+    assert digest([finding()]) == digest([finding()])
+
+
+@pytest.mark.parametrize("field", ["cve", "pkg", "type", "installed", "fix", "net", "path"])
+def test_digest_changes_when_any_rendered_field_changes(field: str) -> None:
+    # Every field the ticket body renders must move the digest, or a changed
+    # body would read as unchanged. type, net and path are the ones the earlier
+    # digest missed; cve/pkg/installed/fix are covered here too so no field
+    # silently drops out of the digest later.
+    assert digest([finding()]) != digest([finding(**{field: "X-DIFFERENT"})])
+
+
+def test_cve_enqueue_unit_overrides_entrypoint_and_passes_the_rebuild_queue() -> None:
+    # The deployer image ENTRYPOINT is `python -m deployer`, which has no
+    # cve-enqueue verb, so the unit must override the entrypoint and pass a
+    # command (--queue Rebuild) that also overrides the image's CMD ["run"].
+    # This guards the production startup wiring that enqueue.main tests cannot.
+    unit = Path(__file__).resolve().parent.parent / "deploy/systemd/cve-enqueue.crunchtools.com.service"
+    text = unit.read_text()
+    assert "--entrypoint cve-enqueue" in text
+    # The command after the image reference is --queue Rebuild (not a bare
+    # `cve-enqueue`, which the entrypoint `python -m deployer` would reject).
+    after_image = text.split("quay.io/crunchtools/deployer", 1)[1]
+    assert "--queue Rebuild" in after_image
+
+
 # --------------------------------------------------------------- reconcile
 
 
