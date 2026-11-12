@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-11-12
+
 ### Fixed
 - release-follow unit: the registry is copied into the snapshot directory instead of
   bind-mounted from `/srv`, which a confined container cannot read (EACCES on first
