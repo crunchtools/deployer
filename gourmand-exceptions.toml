@@ -45,6 +45,19 @@ pattern = "Hands"
 justification = "instantiated in _restore when no clients are injected, inside an `async with` body which the check does not appear to see; the seam exists so the by-hand rollback path -- which moves :latest and restarts a unit -- can be tested"
 classification = "gourmand_bug"
 
+# parse_status reads grype's `key=value` status format (space-delimited, `CVE
+# ...` lines); rt._parse_fields reads RT's `key: value` show format (colon-
+# delimited, with indented continuation lines). The loop skeleton -- iterate
+# lines, skip/continue, assign into a dict -- is structurally similar, but the
+# two parse different wire formats for different systems. Merging them would
+# couple the CVE scanner's format to RT's for the sake of three shared lines.
+[[exceptions]]
+check = "copy_paste_detection"
+path = "src/deployer/enqueue.py"
+pattern = "parse_status"
+justification = "parse_status parses grype's key=value cve.status format; rt._parse_fields parses RT's key: value show format with continuation lines -- different wire formats for different systems; the shared shape is a line loop, and merging would couple the scanner's format to RT's"
+classification = "gourmand_bug"
+
 # An environment file's values ARE paths. The two the rule objects to are
 # `DEPLOYER_STATE` and `PODMAN_SOCKET`, and their values are the deployment
 # facts the example exists to show someone setting up a second one. Naming them
@@ -57,4 +70,15 @@ classification = "gourmand_bug"
 check = "absolute_paths"
 path = "deploy/deployer.env.example"
 justification = "the values of an env file are paths by nature; these two are the deployment facts the example exists to show, and the program itself holds no built-in paths, which is the behaviour this rule protects"
+classification = "by_design"
+
+# The cve-enqueue secret example names the srv-secrets decrypt target its
+# credential lands at — a deployment fact an operator provisioning the unit
+# needs, exactly like deployer.env.example above. Not quoting the path here,
+# because quoting it would trip this same rule in this file (as the note above
+# records); the program itself holds no built-in paths.
+[[exceptions]]
+check = "absolute_paths"
+path = "deploy/cve-enqueue.env.example"
+justification = "an env-file example names deployment paths by nature; the srv-secrets decrypt target is the fact an operator needs to provision the unit, as with deployer.env.example, and the program holds no built-in paths"
 classification = "by_design"

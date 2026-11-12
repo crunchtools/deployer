@@ -6,6 +6,43 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-11
+
+### Added
+- `cve-enqueue` console script (RT #1551): files one RT **Rebuild** ticket per
+  fleet image with fixable Criticals, listing the exact bumps (package,
+  installed version, grype's fixed version, network flag, path), updated when the
+  findings change and resolved when the image's scan is clean. Model-free and
+  idempotent — the bump-list digest rides in the ticket Subject, so an unchanged
+  run writes nothing, and a ticket is resolved only on a fresh, successful,
+  zero-finding scan (never on a scan error or a stale file). The bump-list
+  digest covers every field the ticket renders, so a changed body cannot read as
+  unchanged. Holds no GitHub token. Authenticates as its OWN `rebuilder` RT user
+  (deliberately absent from every `requestors` row in `services.toml`, so this
+  credential can file Rebuild backlog but never a ticket that triggers a deploy),
+  from its own secret file — not `deployer.env`. The queue is allowlisted to
+  Rebuild (any other queue is refused, not only Deploy). grype's suggested fix is
+  shown but flagged when it crosses a major or lists a lower version — the filer
+  does not guess the target. Its own hardened oneshot unit
+  (`cve-enqueue.crunchtools.com.service`): non-root, read-only, all capabilities
+  dropped, no podman/D-Bus socket, only `/var/lib/grype-scan` read-only and the
+  RT variables, and `--entrypoint cve-enqueue` (the image entrypoint is
+  `python -m deployer`, which has no such verb).
+- `RtClient.create_ticket` and `RtClient.live_tickets` (a search that includes
+  stalled tickets, so a stalled Rebuild ticket is not refiled as a duplicate).
+
+### Changed
+- The fleet CVE rebuild lane is re-scoped to detect and file bump tickets, NOT to
+  auto-rebuild/deploy (#36, #37): a same-commit rebuild does not clear a
+  pinned-dependency Critical. The errata runner tests stay (they pin real
+  deployer behaviour); `rebuilder` is removed from every `requestors` row in
+  `services.toml`, so the ticket-filing identity can never trigger a deploy.
+- Constitution amended to 0.3.0 (cto ruling, RT #1551): the Single Responsibility
+  section now admits `cve-enqueue` as a second tool that shares the package's RT
+  client and nothing else, runs from its own capability-free unit, and holds no
+  deploy-capable credential — with a named trigger to move it out if it ever
+  needs a second dependency or credential.
+
 ## [0.6.0] - 2026-11-11
 
 ### Changed
