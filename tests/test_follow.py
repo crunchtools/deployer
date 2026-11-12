@@ -242,13 +242,64 @@ async def test_a_service_behind_its_release_gets_one_ticket_in_the_ordinary_form
     assert creator_may_request("follower", service().requestors)
 
 
-async def test_only_rows_that_list_the_follower_are_followed() -> None:
+async def test_only_rows_that_list_the_follower_are_filed_for() -> None:
     rt = FakeRt()
     report = await follow.follow(
-        registry(service(), service(name="mcp-pcloud", requestors=("scott",))), FakeImages(), rt, snapshot()
+        registry(service(), service(name="mcp-pcloud", requestors=("scott",))),
+        FakeImages(),
+        rt,
+        snapshot(**{NAME: running(), "mcp-pcloud": running()}),
     )
-    assert [r.service for r in report.services] == [NAME]
-    assert len(rt.created) == 1
+    assert [(r.service, r.result, r.followed) for r in report.services] == [
+        (NAME, "filed", True),
+        ("mcp-pcloud", "behind", False),
+    ]
+    ((_, subject, _),) = rt.created
+    assert subject == subject_for(NAME, LATEST)
+
+
+async def test_an_unfollowed_row_behind_its_release_is_reported_with_since_and_never_filed() -> None:
+    # rotv drifted 37 releases and is not followed: deploy drift has to see it.
+    rt = FakeRt()
+    row = service(requestors=("scott",))
+    report = await follow.follow(registry(row), FakeImages(), rt, snapshot())
+    (result,) = report.services
+    assert (result.result, result.since, result.followed) == ("behind", BUILT + 60, False)
+    assert result.ticket is None
+    assert rt.created == [] and not any("Subject" in q for q in rt.queries)
+    assert report.outcome == follow.OUTCOME_OK
+    assert report.detail == "0 followed of 1, 0 filed, 1 behind, 0 unjudged, 0 stalled"
+
+
+@pytest.mark.parametrize(
+    ("images", "result"),
+    [
+        (FakeImages(**{NAME: remote(image_id=OLD_ID)}), "current"),
+        (FakeImages(**{NAME: remote(created=BUILT - 1)}), "ahead"),
+        (FakeImages(**{NAME: OciError("registry down")}), "error"),
+    ],
+)
+async def test_an_unfollowed_row_that_is_not_behind_carries_no_since(images: FakeImages, result: str) -> None:
+    report = await follow.follow(registry(service(requestors=("scott",))), images, FakeRt(), snapshot())
+    (only,) = report.services
+    assert (only.result, only.since, only.followed) == (result, None, False)
+
+
+@pytest.mark.parametrize(
+    ("rt", "dry_run", "result"),
+    [
+        (FakeRt(), False, "filed"),
+        (FakeRt(), True, "would-file"),
+        (FakeRt(ticket(SEAT_TICKET, body())), False, "pending"),
+        (FakeRt(answered=(1650,)), False, "answered"),
+    ],
+)
+async def test_every_behind_result_carries_the_release_build_time(
+    rt: FakeRt, dry_run: bool, result: str
+) -> None:
+    # Nagios measures drift grace from this, statelessly.
+    report = await follow.follow(registry(), FakeImages(), rt, snapshot(), dry_run=dry_run)
+    assert (report.services[0].result, report.services[0].since) == (result, BUILT + 60)
 
 
 async def test_the_follower_opt_in_ignores_case() -> None:
@@ -325,7 +376,7 @@ async def test_stalled_follower_tickets_are_reported() -> None:
     assert report.stalled == (Stalled(1800, NAME, LATEST), Stalled(1801, "?", "?"))
     # The stalled one is live and names the same commit, so it is not refiled.
     assert report.services[0].result == "pending"
-    assert "1 followed, 0 filed, 0 unjudged, 2 stalled" == report.detail
+    assert "1 followed of 1, 0 filed, 1 behind, 0 unjudged, 2 stalled" == report.detail
 
 
 # ------------------------------------------------------------- status file
@@ -335,14 +386,23 @@ def test_the_status_file_is_one_fact_per_line_and_ends_whole(tmp_path: Path) -> 
     report = FollowReport(
         follow.OUTCOME_OK,
         "1 followed",
-        (follow.ServiceResult(NAME, "filed", ":latest is 635cdda3c863", 9001),),
+        (
+            follow.ServiceResult(NAME, "filed", ":latest is 635cdda3c863", 9001, BUILT - 7200),
+            follow.ServiceResult("rotv", "current", "running_x", followed=False),
+        ),
         (Stalled(1800, NAME, LATEST),),
     )
     path = write_status(tmp_path / "f" / "release-follow.status", report, now=BUILT)
     lines = path.read_text().splitlines()
     assert lines[0] == f"FOLLOWER generated={BUILT:.0f} outcome=ok detail=1_followed"
-    assert lines[1] == f"FOLLOWER service name={NAME} result=filed ticket=9001 detail=:latest_is_635cdda3c863"
-    assert lines[2] == f"FOLLOWER stalled ticket=1800 service={NAME} commit={LATEST[:12]}"
+    assert lines[1] == (
+        f"FOLLOWER service name={NAME} result=filed ticket=9001 followed=yes "
+        f"since={BUILT - 7200:.0f} detail=:latest_is_635cdda3c863"
+    )
+    assert lines[2] == (
+        "FOLLOWER service name=rotv result=current ticket=- followed=no since=- detail=running_x"
+    )
+    assert lines[3] == f"FOLLOWER stalled ticket=1800 service={NAME} commit={LATEST[:12]}"
     assert lines[-1] == "FOLLOWER end=1"
 
 

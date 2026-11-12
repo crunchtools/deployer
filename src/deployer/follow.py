@@ -37,6 +37,14 @@ person resolved or rejected stays answered until the next release.
 A follower ticket the runner hands back is stalled and owned by ``follower``,
 which no person reads. So every stalled follower ticket is written to the status
 file, and the Nagios check that reads it turns WARNING (see ``write_status``).
+
+**Every row is judged; only followed rows are filed for.** A row that does not
+list ``follower`` is still compared with its ``:latest`` and written to the
+status file as ``behind`` when it is, so nagios-agent's deploy drift check can
+see a release that never went live on a service deployed by hand -- rotv, the
+37-release case, is one of those. Each line that is behind carries ``since``,
+the build time of ``:latest``: the drift is at least that old, and Nagios
+measures its grace from it without keeping state of its own.
 """
 
 from __future__ import annotations
@@ -78,7 +86,7 @@ __all__ = [
 ]
 
 EXIT_OK: Final = 0
-#: The pass ran, but at least one followed service could not be judged.
+#: The pass ran, but at least one registry row could not be judged.
 EXIT_DEGRADED: Final = 1
 EXIT_COULD_NOT_RUN: Final = 2
 
@@ -205,6 +213,9 @@ class Decision:
     action: Action
     detail: str
     commit: str | None = None
+    #: When ``:latest`` was built, set with ``commit``: the running image has
+    #: been behind the release at least since then.
+    since: float | None = None
 
 
 def decide(remote: RemoteImage, running: Running | None) -> Decision:
@@ -222,7 +233,7 @@ def decide(remote: RemoteImage, running: Running | None) -> Decision:
         return Decision(Action.ERROR, "cannot tell which build is newer: a build time is missing")
     if remote.created <= running.created:
         return Decision(Action.AHEAD, f"running is newer than :latest {revision[:12]}")
-    return Decision(Action.FILE, f":latest is {revision[:12]}", commit=revision)
+    return Decision(Action.FILE, f":latest is {revision[:12]}", commit=revision, since=remote.created)
 
 
 def subject_for(service: str, commit: str) -> str:
@@ -254,12 +265,20 @@ class Images(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class ServiceResult:
-    """One followed service's result: filed, pending, answered, would-file, or a Decision's action."""
+    """One row's result: filed, pending, answered, would-file, behind, or a Decision's action.
+
+    ``since`` is set whenever the row is behind its ``:latest`` (every result
+    but current, ahead and error), and ``followed`` says whether the row opted
+    in to tickets; an unfollowed row that is behind is ``behind`` and nothing
+    is filed for it.
+    """
 
     service: str
     result: str
     detail: str
     ticket: int | None = None
+    since: float | None = None
+    followed: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,9 +294,9 @@ class Stalled:
 class FollowReport:
     """One pass.
 
-    ``outcome`` is ``ok`` (every followed row judged), ``degraded`` (at least one
+    ``outcome`` is ``ok`` (every registry row judged), ``degraded`` (at least one
     could not be) or ``could-not-run``; ``detail`` is a one-line summary;
-    ``services`` holds one result per followed row and ``stalled`` every
+    ``services`` holds one result per registry row and ``stalled`` every
     follower ticket the runner handed back.
     """
 
@@ -287,13 +306,13 @@ class FollowReport:
     stalled: tuple[Stalled, ...] = ()
 
 
+def _opted_in(service: Service) -> bool:
+    return FOLLOWER in {who.strip().lower() for who in service.requestors}
+
+
 def followed(registry: Registry) -> tuple[Service, ...]:
     """The rows that opted in, by listing ``follower`` as a requestor."""
-    return tuple(
-        registry.services[name]
-        for name in registry.names
-        if FOLLOWER in {who.strip().lower() for who in registry.services[name].requestors}
-    )
+    return tuple(registry.services[name] for name in registry.names if _opted_in(registry.services[name]))
 
 
 async def _live_requests(rt: Tickets) -> dict[tuple[str, str], int]:
@@ -334,61 +353,75 @@ async def _one(
     context: tuple[Snapshot, Mapping[tuple[str, str], int], bool],
 ) -> ServiceResult:
     snapshot, live, dry_run = context
+    opted_in = _opted_in(service)
     if not _NAME_RE.match(service.name):
-        return ServiceResult(service.name, Action.ERROR.value, "service name is not safe to put in a query")
+        why = "service name is not safe to put in a query"
+        return ServiceResult(service.name, Action.ERROR.value, why, followed=opted_in)
     try:
         remote = await images.image(service.image)
     except OciError as exc:
-        return ServiceResult(service.name, Action.ERROR.value, str(exc))
+        return ServiceResult(service.name, Action.ERROR.value, str(exc), followed=opted_in)
     decision = decide(remote, snapshot.running(service.container))
     if decision.action is not Action.FILE or decision.commit is None:
-        return ServiceResult(service.name, decision.action.value, decision.detail)
-    return await _file(service, decision.commit, rt, live, dry_run)
+        return ServiceResult(service.name, decision.action.value, decision.detail, followed=opted_in)
+    if not opted_in:
+        # Judged for the status file, never filed for: the row did not opt in.
+        return ServiceResult(service.name, "behind", decision.detail, since=decision.since, followed=False)
+    return await _file(service, decision, rt, live, dry_run)
 
 
 async def _file(
-    service: Service, commit: str, rt: Tickets, live: Mapping[tuple[str, str], int], dry_run: bool
+    service: Service, decision: Decision, rt: Tickets, live: Mapping[tuple[str, str], int], dry_run: bool
 ) -> ServiceResult:
     """File the ticket, unless one already covers this commit or once did."""
+    commit, since = decision.commit or "", decision.since
     existing = live.get((service.name, commit))
     if existing is not None:
-        return ServiceResult(service.name, "pending", f"ticket {existing} covers {commit[:12]}", existing)
+        covers = f"ticket {existing} covers {commit[:12]}"
+        return ServiceResult(service.name, "pending", covers, existing, since)
     subject = subject_for(service.name, commit)
     earlier = await rt.search(f"Queue = '{QUEUE}' AND Creator = '{FOLLOWER}' AND Subject = '{subject}'")
     if earlier:
-        return ServiceResult(service.name, "answered", f"already filed {commit[:12]}", earlier[-1])
+        return ServiceResult(service.name, "answered", f"already filed {commit[:12]}", earlier[-1], since)
     if dry_run:
-        return ServiceResult(service.name, "would-file", f":latest is {commit[:12]}")
+        return ServiceResult(service.name, "would-file", f":latest is {commit[:12]}", since=since)
     filed = await rt.create_ticket(QUEUE, subject, body_for(service, commit))
-    return ServiceResult(service.name, "filed", f":latest is {commit[:12]}", filed)
+    return ServiceResult(service.name, "filed", f":latest is {commit[:12]}", filed, since)
 
 
 async def follow(
     registry: Registry, images: Images, rt: Tickets, snapshot: Snapshot, dry_run: bool = False
 ) -> FollowReport:
-    """One pass over every followed row. RT errors propagate: they are "could not run"."""
-    rows = followed(registry)
+    """One pass over every registry row, filing only for followed ones. RT errors propagate."""
+    rows = tuple(registry.services[name] for name in registry.names)
     live = await _live_requests(rt)
     results = [await _one(row, images, rt, (snapshot, live, dry_run)) for row in rows]
     stalled = await _stalled(rt)
     errors = [result for result in results if result.result == Action.ERROR.value]
     filed = sum(1 for result in results if result.result == "filed")
-    detail = f"{len(rows)} followed, {filed} filed, {len(errors)} unjudged, {len(stalled)} stalled"
+    behind = sum(1 for result in results if result.since is not None)
+    detail = (
+        f"{len(followed(registry))} followed of {len(rows)}, {filed} filed, {behind} behind, "
+        f"{len(errors)} unjudged, {len(stalled)} stalled"
+    )
     return FollowReport(OUTCOME_DEGRADED if errors else OUTCOME_OK, detail, tuple(results), stalled)
 
 
 def write_status(path: str | Path, report: FollowReport, now: float | None = None) -> Path:
     """The last pass, in nagios-agent's collector frame.
 
-    For the Nagios check (nagios-agent, not this repo): WARNING on any
+    For the Nagios checks (nagios-agent, not this repo): WARNING on any
     ``stalled`` line, on an outcome other than ``ok``, on a ``generated`` older
-    than three passes, or on a file without ``end=1``.
+    than three passes, or on a file without ``end=1``; and deploy drift on a
+    ``service`` line whose ``since`` (epoch, or ``-`` when not behind) is older
+    than its grace. ``followed`` is ``yes`` or ``no``.
     """
     stamp = time.time() if now is None else now
     head = f"generated={stamp:.0f} outcome={frame_field(report.outcome)} detail={frame_field(report.detail)}"
     services = [
         f"service name={frame_field(r.service)} result={frame_field(r.result)} "
-        f"ticket={r.ticket or '-'} detail={frame_field(r.detail)}"
+        f"ticket={r.ticket or '-'} followed={'yes' if r.followed else 'no'} "
+        f"since={'-' if r.since is None else f'{r.since:.0f}'} detail={frame_field(r.detail)}"
         for r in report.services
     ]
     stalled = [
@@ -463,7 +496,7 @@ def _record(status: str | None, report: FollowReport) -> bool:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """One follow pass. 0 every followed row judged; 1 some could not be; 2 could not run."""
+    """One follow pass. 0 every row judged; 1 some could not be; 2 could not run."""
     args = _build_parser().parse_args(argv)
     missing = _missing(args)
     if missing:

@@ -4,7 +4,9 @@
 # filing the Deploy ticket that puts a release live. This oneshot does, hourly
 # (release-follow.crunchtools.com.timer), for registry rows that list
 # `follower` in `requestors`. The deployer then handles the ticket exactly as
-# it handles a seat's: same registry, same probe, same rollback.
+# it handles a seat's: same registry, same probe, same rollback. Every other
+# row is compared too and written to the status file, never filed for, so
+# nagios-agent's deploy drift check sees releases nobody put live.
 #
 # The SAME deployer image, the cve-enqueue blast radius. No podman socket, no
 # D-Bus socket, non-root, read-only, every capability dropped. What it needs to

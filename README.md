@@ -237,6 +237,13 @@ runner hands back is stalled and owned by `follower`, which nobody reads, so
 each one is listed in `/var/lib/deployer/follower/release-follow.status` for
 the Nagios check to warn on.
 
+Every registry row is compared, not only the followed ones; a row that does not
+list `follower` is never filed for, but when it runs an image older than
+`:latest` its status line says `behind`. Each line that is behind carries
+`since=`, the build time of `:latest`, which nagios-agent's deploy drift check
+measures its 24-hour grace from. rotv, the service that drifted 37 releases,
+deploys by hand and is one of those rows.
+
 ```
 release-follow --dry-run     # say what would be filed, file nothing
 ```
