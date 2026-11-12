@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- release-follow unit: the registry is copied into the snapshot directory instead of
+  bind-mounted from `/srv`, which a confined container cannot read (EACCES on first
+  install). Both units now pin `deployer:0.9.0`.
+
 ## [0.9.0] - 2026-11-12
 
 ### Added
