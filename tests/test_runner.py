@@ -176,6 +176,10 @@ class FakePodman:
         #: (a repository on constitution's container-release). Off by
         #: default, so the label path stays the one most tests exercise.
         self.gated = False
+        #: What the registry's :main and :latest resolve to when gated. None is
+        #: the candidate itself (promoted); anything else is another image.
+        self.main_id: str | None = None
+        self.latest_id: str | None = None
         self.tagged: list[tuple[str, str]] = []
         self.untagged: list[tuple[str, str]] = []
         self.removed: list[str] = []
@@ -245,8 +249,9 @@ class FakePodman:
     async def pull(self, reference: str) -> str:
         if (":gated-" in reference or reference.endswith(":main")) and not self.gated:
             raise PodmanError(f"{reference}: manifest unknown")
-        self.by_ref[reference] = CANDIDATE_ID
-        return CANDIDATE_ID
+        moved = {f"{IMAGE}:main": self.main_id, f"{IMAGE}:latest": self.latest_id}.get(reference)
+        self.by_ref[reference] = moved or CANDIDATE_ID
+        return moved or CANDIDATE_ID
 
     async def tag(self, name: str, reference: str) -> None:
         if self.fail_tag_on and self.fail_tag_on in reference:
@@ -1354,6 +1359,40 @@ async def test_a_gated_digest_deploys_although_its_label_names_the_pr_head(tmp_p
     assert (CANDIDATE_ID, f"{IMAGE}:gated-{WANTED}") in world.podman.untagged
     assert world.systemd.restarts
     assert world.rt.said(f"is running {WANTED[:7]} (built from {OTHER[:12]}")
+
+
+async def test_an_unmerged_pull_request_head_is_refused(tmp_path: Path) -> None:
+    """gated-<head> exists and its label matches, but nothing promoted it."""
+    world = World(tmp_path, ticket(age_seconds=SERVICE.build_deadline + 60))
+    world.podman.gated = True
+    world.podman.main_id = "sha256:main-elsewhere"
+    world.podman.latest_id = "sha256:latest-elsewhere"
+    report = await world.drain()
+    assert report.outcome == OUTCOME_REFUSED
+    assert not world.systemd.restarts
+    assert world.rt.said("neither main nor a release promoted it")
+    assert world.rt.said("pull request that never merged")
+    assert world.rt.status() == ["stalled"]
+    assert world.podman.latest_points_at() == OUTGOING_ID
+
+
+async def test_an_unmerged_pull_request_head_waits_while_young(tmp_path: Path) -> None:
+    world = World(tmp_path, ticket(age_seconds=120))
+    world.podman.gated = True
+    world.podman.main_id = "sha256:main-elsewhere"
+    world.podman.latest_id = "sha256:latest-elsewhere"
+    await world.drain()
+    assert not world.systemd.restarts
+    assert world.rt.said("Waiting for a build")
+    assert world.podman.latest_points_at() == OUTGOING_ID
+
+
+async def test_a_released_commit_deploys_after_main_moved_on(tmp_path: Path) -> None:
+    world = World(tmp_path, ticket())
+    world.podman.gated = True
+    world.podman.main_id = "sha256:main-elsewhere"
+    await world.drain()
+    assert world.systemd.restarts
 
 
 async def test_without_a_gated_tag_a_label_mismatch_still_waits(tmp_path: Path) -> None:

@@ -27,7 +27,15 @@ something quietly.
    only then, and ``:latest`` put straight back). Both refs are untagged
    locally once the candidate tag is on. A repository that
    publishes no gated tags falls back to pulling ``:latest`` and comparing
-   the label, as before.
+   the label, as before: there the candidate *is* the registry's ``:latest``,
+   so a release promoted it by construction.
+
+   Promotion is mandatory, not one witness among several. A pull request's
+   head is built, gated and labelled with its own commit whether or not it
+   ever merges, so a ticket naming that head finds ``gated-<head>`` with a
+   label that matches. The label says which code; only ``:main`` or
+   ``:latest`` holding the digest says main or a release carried it.
+   ``classify_revision`` therefore matches only a promoted candidate.
 3. Tag what arrived as ``candidate-<revision>``.
 4. Put ``:latest`` straight back on the outgoing image (it moved only if the
    fallback pulled it).
@@ -53,6 +61,7 @@ from .systemd import SERVICE_IFACE
 
 __all__ = [
     "ImageOps",
+    "Proof",
     "Staged",
     "StageError",
     "UnitOps",
@@ -113,6 +122,24 @@ class Verdict(Enum):
     MATCH = "match"
     WAITING = "waiting"
     STALE = "stale"
+    #: The image for the commit exists and its label matches, but neither
+    #: ``:main`` nor ``:latest`` holds it: a pull request head that never
+    #: merged, or a merged commit main has moved past and no release carried.
+    UNPROMOTED = "unpromoted"
+
+
+class Proof(Enum):
+    """What says main or a release carried the candidate."""
+
+    #: Nothing: at most a revision label, which an unmerged pull request's
+    #: head carries too.
+    NONE = "none"
+    #: ``:main`` or the registry's ``:latest`` holds the candidate, so its
+    #: revision label must still name the ticket's commit.
+    PROMOTED = "promoted"
+    #: ``gated-<ticket commit>`` and promoted: the commit by construction,
+    #: whatever the label (the pull request head) says.
+    GATED = "gated"
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +163,17 @@ class Staged:
     #: resolves to the same image: main or a release promoted that commit's
     #: tested digest, whatever the label (the pull request head) says.
     candidate_gated: bool = False
+    #: Main or a release promoted the candidate: ``candidate_gated``, or the
+    #: candidate is the registry's ``:latest`` (the fallback path). Without
+    #: it a matching revision label is not enough to deploy.
+    candidate_promoted: bool = False
+
+    @property
+    def proof(self) -> Proof:
+        """The promotion proof :func:`classify_revision` judges by."""
+        if self.candidate_gated:
+            return Proof.GATED
+        return Proof.PROMOTED if self.candidate_promoted else Proof.NONE
 
 
 def _exec_lines(value: Any) -> tuple[str, ...]:
@@ -231,21 +269,28 @@ def classify_revision(
     ticket_age_seconds: int,
     service: Service,
     *,
-    gated: bool = False,
+    proof: Proof = Proof.NONE,
 ) -> Verdict:
-    """Whether the candidate is the commit the ticket asked for.
+    """Whether the candidate is the commit the ticket asked for, and promoted.
 
-    A candidate pulled by ``gated-<wanted>`` is that commit by construction.
-    Otherwise a mismatch is not automatically a failure. A seat files its
-    ticket the moment it merges, and the image is promoted by CI afterwards,
-    so for the first ``build_deadline`` a mismatch means *not yet*. After that
-    it means the image is not coming and a person should look.
+    A candidate pulled by ``gated-<wanted>`` that ``:main`` or ``:latest``
+    holds (``Proof.GATED``) is that commit by construction. Otherwise the
+    revision label must match **and** the candidate must be promoted
+    (``Proof.PROMOTED``): a label match alone is also what an unmerged pull
+    request's head looks like.
+
+    Anything else is not automatically a failure. A seat files its ticket the
+    moment it merges, and the image is promoted by CI afterwards, so for the
+    first ``build_deadline`` it means *not yet*. After that it means the image
+    is not coming (``STALE``) or was built but never promoted
+    (``UNPROMOTED``), and a person should look.
     """
-    if gated or (candidate_revision and candidate_revision.lower() == wanted.lower()):
+    label_match = bool(candidate_revision and candidate_revision.lower() == wanted.lower())
+    if proof is Proof.GATED or (label_match and proof is Proof.PROMOTED):
         return Verdict.MATCH
     if ticket_age_seconds < service.build_deadline:
         return Verdict.WAITING
-    return Verdict.STALE
+    return Verdict.UNPROMOTED if label_match else Verdict.STALE
 
 
 async def _restore_latest(podman: ImageOps, outgoing_id: str, latest: str) -> None:
@@ -343,14 +388,14 @@ async def stage(podman: ImageOps, systemd: UnitOps, service: Service, wanted: st
 
     gated_ref = f"{service.image}:gated-{wanted.lower()}"
     gated_id = await _pull_or_none(podman, gated_ref)
-    gated = False
+    gated = promoted = False
     if gated_id is not None:
         # Pulled by tags of their own: the local :latest has not moved.
         main_ref = f"{service.image}:main"
         main_id: str | None = None
         try:
             main_id = await _pull_or_none(podman, main_ref)
-            gated = main_id == gated_id or await _latest_is(podman, latest, gated_id, outgoing_id)
+            gated = promoted = main_id == gated_id or await _latest_is(podman, latest, gated_id, outgoing_id)
             candidate = await podman.inspect_image(gated_id)
             candidate_tag = f"localhost/{basename}:candidate-{tag_suffix(candidate.revision, gated_id)}"
             await podman.tag(gated_id, candidate_tag)
@@ -371,6 +416,8 @@ async def stage(podman: ImageOps, systemd: UnitOps, service: Service, wanted: st
             await podman.tag(candidate_id, candidate_tag)
         finally:
             await _restore_latest(podman, outgoing_id, latest)
+        # The registry's :latest is a release: promoted by construction.
+        promoted = True
 
     return Staged(
         outgoing_image_id=outgoing_id,
@@ -383,4 +430,5 @@ async def stage(podman: ImageOps, systemd: UnitOps, service: Service, wanted: st
         candidate_tag=candidate_tag,
         latest_tag=latest,
         candidate_gated=gated,
+        candidate_promoted=promoted,
     )

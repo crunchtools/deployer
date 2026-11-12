@@ -63,6 +63,6 @@ ExecStart=/usr/bin/podman run --rm --name release-follow.crunchtools.com \
     -v /run/release-follow:/snapshot:ro,z \
     -v /var/lib/deployer/follower:/var/lib/deployer/follower \
     --tmpfs /tmp \
-    quay.io/crunchtools/deployer:0.8.0 \
+    quay.io/crunchtools/deployer:0.8.1 \
     --config /config/services.toml
 ExecStopPost=-/usr/bin/podman rm -f release-follow.crunchtools.com
