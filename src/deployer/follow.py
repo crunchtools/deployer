@@ -121,6 +121,15 @@ class Snapshot:
     """``podman ps --format json`` and ``podman images --format json``, joined."""
 
     def __init__(self, containers: Sequence[Any], images: Sequence[Any]) -> None:
+        """Join running containers to the images they run.
+
+        ``containers`` is podman's ``ps`` JSON: entries with ``Names`` (a list),
+        ``ImageID`` and ``State``; only ``running`` ones count. ``images`` is
+        podman's ``images`` JSON: entries with ``Id``, ``Created`` (epoch
+        seconds) and ``Labels``. The two are matched on the image id with any
+        ``sha256:`` prefix removed, because podman writes it both ways. An entry
+        of any other shape is skipped rather than guessed at.
+        """
         by_id: dict[str, Mapping[str, Any]] = {}
         for image in images:
             if isinstance(image, dict) and isinstance(image.get("Id"), str):
@@ -146,10 +155,15 @@ class Snapshot:
 
     @classmethod
     def load(cls, directory: str | Path) -> Snapshot:
+        """Read ``containers.json`` and ``images.json`` from ``directory``.
+
+        Raises :class:`SnapshotError` if either is missing, not JSON, or not a list.
+        """
         root = Path(directory)
         return cls(_read_list(root / CONTAINERS_FILE), _read_list(root / IMAGES_FILE))
 
     def running(self, container: str) -> Running | None:
+        """What the container of that name runs, or None if it is not running."""
         return self._running.get(container)
 
 
@@ -181,6 +195,13 @@ class Action(Enum):
 
 @dataclass(frozen=True, slots=True)
 class Decision:
+    """What :func:`decide` concluded for one service.
+
+    ``action`` is what to do, ``detail`` a short reason for the status file,
+    and ``commit`` the full revision to file a ticket for -- set only when
+    ``action`` is :attr:`Action.FILE`.
+    """
+
     action: Action
     detail: str
     commit: str | None = None
@@ -205,6 +226,11 @@ def decide(remote: RemoteImage, running: Running | None) -> Decision:
 
 
 def subject_for(service: str, commit: str) -> str:
+    """The Subject of a follower ticket: ``release-follow: <service> <full commit>``.
+
+    Exact and deterministic, because it is also the key that finds a ticket this
+    follower filed before, whatever its status.
+    """
     return f"{SUBJECT_PREFIX} {service} {commit}"
 
 
@@ -228,6 +254,8 @@ class Images(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class ServiceResult:
+    """One followed service's result: filed, pending, answered, would-file, or a Decision's action."""
+
     service: str
     result: str
     detail: str
@@ -236,6 +264,8 @@ class ServiceResult:
 
 @dataclass(frozen=True, slots=True)
 class Stalled:
+    """A follower ticket the runner handed back. ``?`` where its body did not parse."""
+
     ticket: int
     service: str
     commit: str
@@ -243,6 +273,14 @@ class Stalled:
 
 @dataclass(frozen=True, slots=True)
 class FollowReport:
+    """One pass.
+
+    ``outcome`` is ``ok`` (every followed row judged), ``degraded`` (at least one
+    could not be) or ``could-not-run``; ``detail`` is a one-line summary;
+    ``services`` holds one result per followed row and ``stalled`` every
+    follower ticket the runner handed back.
+    """
+
     outcome: str
     detail: str
     services: tuple[ServiceResult, ...] = ()
@@ -441,7 +479,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     # The credential is the boundary the registry's opt-in leans on: these
     # tickets must arrive as `follower`, or the requestors check means nothing.
     if creds.username.strip().lower() != FOLLOWER:
-        return _complain(f"RT_USER must be {FOLLOWER!r}; this files as nobody else")
+        why = f"RT_USER must be {FOLLOWER!r}; this files as nobody else"
+        _record(None if args.dry_run else args.status, FollowReport(OUTCOME_COULD_NOT_RUN, why))
+        return _complain(why)
     try:
         report = asyncio.run(_run(registry, creds, snapshot, args.dry_run))
     except RtError as exc:

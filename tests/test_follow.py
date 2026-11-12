@@ -434,7 +434,8 @@ def test_any_rt_user_but_follower_is_refused(setup: Path, monkeypatch: pytest.Mo
     monkeypatch.setenv("RT_USER", "scott")
     monkeypatch.setattr(follow, "_run", fake_run(AssertionError("must not run")))
     assert follow.main([]) == follow.EXIT_COULD_NOT_RUN
-    assert not (setup / "out").exists()
+    status = (setup / "out" / "release-follow.status").read_text()
+    assert "outcome=could-not-run" in status and "RT_USER_must_be" in status
 
 
 @pytest.mark.parametrize(

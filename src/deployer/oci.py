@@ -77,9 +77,12 @@ def parse_created(value: object) -> float | None:
         return None
     text = _FRACTION_RE.sub(r"\1", value.strip()).replace("Z", "+00:00")
     try:
-        return datetime.fromisoformat(text).timestamp()
+        parsed = datetime.fromisoformat(text)
     except ValueError:
         return None
+    # RFC 3339 requires a zone. Without one the instant depends on this
+    # process's clock zone, so it is no build time at all.
+    return parsed.timestamp() if parsed.tzinfo is not None else None
 
 
 class RegistryReader:
@@ -90,6 +93,12 @@ class RegistryReader:
         client: httpx.AsyncClient | None = None,
         platform: tuple[str, str] = DEFAULT_PLATFORM,
     ) -> None:
+        """``client`` is the HTTP client to use, for tests; by default one is made.
+
+        Either way the reader owns it and closes it when its ``async with``
+        exits. ``platform`` is the ``(os, architecture)`` a multi-arch index is
+        resolved to.
+        """
         self._client = client or httpx.AsyncClient(
             timeout=httpx.Timeout(DEFAULT_TIMEOUT_SECONDS), follow_redirects=True
         )
@@ -149,7 +158,7 @@ class RegistryReader:
         headers = {"Accept": accept} if accept else {}
         response = await self._get(url, headers, repo)
         if response.status_code == httpx.codes.UNAUTHORIZED:
-            token = await self._token(response.headers.get("www-authenticate", ""), repo)
+            token = await self._token(response.headers.get("www-authenticate", ""), repo, httpx.URL(url).host)
             response = await self._get(url, {**headers, "Authorization": f"Bearer {token}"}, repo)
         if response.status_code != httpx.codes.OK:
             raise OciError(f"{url} answered HTTP {response.status_code}")
@@ -169,7 +178,7 @@ class RegistryReader:
         except httpx.HTTPError as exc:
             raise OciError(f"cannot reach the registry for {repo}: {exc}") from None
 
-    async def _token(self, challenge: str, repo: str) -> str:
+    async def _token(self, challenge: str, repo: str, host: str) -> str:
         """The anonymous pull token a ``Bearer`` challenge offers. Cached per repo."""
         if repo in self._tokens:
             return self._tokens[repo]
@@ -178,6 +187,10 @@ class RegistryReader:
         realm = fields.get("realm", "")
         if scheme.lower() != "bearer" or not realm.startswith("https://"):
             raise OciError(f"{repo}: the registry asked for {scheme or 'nothing'}, not an anonymous token")
+        if httpx.URL(realm).host != host:
+            # The realm comes from the registry's answer. Followed anywhere, it
+            # would let that answer point this host at another service.
+            raise OciError(f"{repo}: the token realm {realm!r} is not on {host}")
         query = {"service": fields.get("service", ""), "scope": f"repository:{repo}:pull"}
         try:
             response = await self._client.get(realm, params=query)

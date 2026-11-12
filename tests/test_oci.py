@@ -219,6 +219,8 @@ async def test_a_reference_that_is_not_registry_and_repository_is_refused(refere
     [
         ("2026-11-11T01:31:38Z", STAMP),
         ("2026-11-11T01:31:38.123456789Z", STAMP + 0.123456),
+        ("2026-11-11T03:31:38+02:00", STAMP),
+        ("2026-11-11T01:31:38", None),
         ("", None),
         (None, None),
         (42, None),
@@ -232,3 +234,19 @@ def test_parse_created(value: object, expected: float | None) -> None:
 def test_the_documents_are_plain_json() -> None:
     # The fixtures above are what a registry sends; keep them serialisable.
     assert json.loads(json.dumps(index(("linux", "amd64", AMD))))["manifests"][0]["digest"] == AMD
+
+
+async def test_a_token_realm_on_another_host_is_refused() -> None:
+    seen: list[str] = []
+    challenge = httpx.Response(
+        401, headers={"WWW-Authenticate": 'Bearer realm="https://elsewhere.example/auth"'}
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return challenge
+
+    async with reader(handler) as r:
+        with pytest.raises(OciError, match="is not on quay.io"):
+            await r.image(IMAGE)
+    assert not any("elsewhere" in url for url in seen)
