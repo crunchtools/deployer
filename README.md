@@ -18,7 +18,9 @@ holds no credential that can write, and the job that writes runs no model.
 `deployer` can pull, inspect, tag, untag, remove and list images, read a
 container's logs, and restart or start a unit named in its registry. It
 **cannot create, start, run or exec a container**, and a test asserts the
-absence.
+absence. The one thing it may start besides a registry unit is an instance of a
+row's `pre_deploy` template, a host unit installed by hand (see
+Configuration).
 
 That is the load-bearing part. A process that cannot start a container cannot
 mount a live volume, and therefore cannot relabel one — which is precisely the
@@ -154,8 +156,32 @@ probe and what it should return, how long the service may take to come up
 (`ready`, default 60s) and how long it must then stay up (`settle`, default
 60s), how long to wait for a build, whether rollback is automatic, and who may
 file tickets for it. A service with database migrations is
-`rollback = "manual"`: old code against a new schema is worse than a failed
-deploy with the downtime still open.
+`rollback = "manual"` unless every migration keeps the previous release
+working (expand and contract): old code against a schema it cannot read is
+worse than a failed deploy with the downtime still open. Rollback swaps the
+image and never the database, so that discipline is what makes it safe.
+
+A row may name a step that must succeed before the restart:
+
+```toml
+pre_deploy = { kind = "pg_dump", unit = "rootsofthevalley.org-pg-dump@.service", timeout = 300 }
+```
+
+`pg_dump` is the one kind. The deployer starts an instance of that **template**
+unit named for the outgoing release's rollback tag suffix
+(`...-pg-dump@<suffix>.service`), waits up to `timeout` seconds (default 300)
+for it to finish, and requires a `pg_dump -Fc` archive at
+`$DEPLOYER_STATE/dumps/<service>/<suffix>.dump`, written during this run. It
+keeps the newest two, like rollback tags, and the ticket says where the dump
+is whether the deploy holds or rolls back. Anything less is a refusal: the
+ticket is handed back, and the old release keeps running with RT, Nagios and
+`:latest` untouched.
+
+The unit does the dump, not the deployer, which still cannot exec into a
+container. It is static config a person installs, like the hold drop-in, and
+`deploy/systemd/rootsofthevalley.org-pg-dump@.service` is the reference one.
+`run` may start an instance of a template the registry names and nothing else;
+`restart` and `start` refuse instances.
 
 An unknown key is a load error rather than a value that is ignored.
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import importlib
 import pkgutil
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -30,12 +31,13 @@ from deployer.cli import (
     STATE_ENV,
     Hands,
     _rollback,
+    _units,
     build_parser,
     main,
 )
 from deployer.lock import only_one
 from deployer.podman import ImageRef
-from deployer.registry import load_registry
+from deployer.registry import PreDeploy, Probe, Registry, Service, load_registry
 from deployer.systemd import UnitState
 
 FORBIDDEN = ("container_create", "container_start", "container_run", "container_exec")
@@ -275,6 +277,10 @@ class RollbackSystemd:
         self.restarts.append(unit)
         self.podman.running = "sha256:old"
 
+    async def run(self, instance: str, timeout: float) -> None:
+        # A rollback by hand puts the old image back; it takes no dump.
+        raise AssertionError(f"a rollback started {instance}")
+
     async def state(self, unit: str) -> UnitState:
         return UnitState(name=unit, active_state="active", sub_state="running", result="success")
 
@@ -498,3 +504,21 @@ def test_a_half_configured_unit_could_not_run_and_says_so_to_nagios(
     assert "outcome=could-not-run" in status
     # Written whole, or a reader cannot tell it from a truncated file.
     assert status.rstrip().endswith("end=1")
+
+
+def test_the_scope_is_the_registry_units_plus_their_pre_deploy_templates() -> None:
+    app = Service(
+        name="rootsofthevalley.org",
+        repo="crunchtools/rotv",
+        image="quay.io/crunchtools/rotv",
+        unit="rootsofthevalley.org.service",
+        probe=Probe(kind="http", url="http://127.0.0.1:8082/api/health"),
+        nagios_host="ctr-rootsofthevalley.org",
+        requestors=("scott",),
+    )
+    images = replace(app, name="images.rootsofthevalley.org", unit="images.rootsofthevalley.org.service")
+    plain = Registry({app.name: app, images.name: images})
+    dump = PreDeploy(kind="pg_dump", unit="rootsofthevalley.org-pg-dump@.service")
+    dumping = Registry({app.name: replace(app, pre_deploy=dump), images.name: images})
+    assert _units(plain) == {app.unit, images.unit}
+    assert _units(dumping) == {app.unit, images.unit, dump.unit}

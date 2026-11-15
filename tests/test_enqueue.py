@@ -30,8 +30,13 @@ TID = 42  # an existing ticket's id, in tests that assert which ticket was touch
 
 def finding(**over: str) -> Finding:
     base = {
-        "cve": "CVE-1", "pkg": "libx", "type": "deb", "installed": "1.0.0",
-        "fix": "1.2.0", "net": "1", "path": "/p",
+        "cve": "CVE-1",
+        "pkg": "libx",
+        "type": "deb",
+        "installed": "1.0.0",
+        "fix": "1.2.0",
+        "net": "1",
+        "path": "/p",
     }
     return Finding(**{**base, **over})
 

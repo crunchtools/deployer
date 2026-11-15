@@ -15,6 +15,7 @@ import trustme
 
 from deployer.registry import (
     DEFAULT_BUILD_DEADLINE_SECONDS,
+    DEFAULT_PRE_DEPLOY_TIMEOUT_SECONDS,
     DEFAULT_READY_SECONDS,
     DEFAULT_SETTLE_SECONDS,
     FOLLOWER,
@@ -382,3 +383,42 @@ def test_the_shipped_registry_follows_exactly_the_pr1_rows() -> None:
     for name in listed:
         assert name not in NEVER_FOLLOWED
         assert rows[name].get("rollback", "auto") == "auto"
+
+
+ROTV_DUMP = "rootsofthevalley.org-pg-dump@.service"
+
+
+def with_pre_deploy(value: str) -> str:
+    return GOOD.replace(
+        'probe = { kind = "mcp", url = "http://127.0.0.1:8021/mcp" }',
+        f'probe = {{ kind = "mcp", url = "http://127.0.0.1:8021/mcp" }}\npre_deploy = {value}',
+    )
+
+
+def test_a_row_without_pre_deploy_has_none(tmp_path: Path) -> None:
+    assert load_registry(write(tmp_path, GOOD)).get("mcp-pcloud.crunchtools.com").pre_deploy is None
+
+
+def test_a_pg_dump_pre_deploy_loads_with_its_default_timeout(tmp_path: Path) -> None:
+    text = with_pre_deploy(f'{{ kind = "pg_dump", unit = "{ROTV_DUMP}" }}')
+    step = load_registry(write(tmp_path, text)).get("mcp-pcloud.crunchtools.com").pre_deploy
+    assert step is not None
+    assert (step.kind, step.unit, step.timeout) == ("pg_dump", ROTV_DUMP, DEFAULT_PRE_DEPLOY_TIMEOUT_SECONDS)
+    assert step.instance("0123456789ab") == "rootsofthevalley.org-pg-dump@0123456789ab.service"
+
+
+@pytest.mark.parametrize(
+    ("value", "fragment"),
+    [
+        ('{ kind = "mysqldump", unit = "x@.service" }', "kind"),
+        ('{ kind = "pg_dump" }', "unit"),
+        ('{ kind = "pg_dump", unit = "x.service" }', "must be a template unit"),
+        ('{ kind = "pg_dump", unit = "@.service" }', "must be a template unit"),
+        ('{ kind = "pg_dump", unit = "x@.service", timeout = 0 }', "timeout"),
+        ('{ kind = "pg_dump", unit = "x@.service", command = "rm -rf /" }', "command"),
+        ('"pg_dump"', "pre_deploy"),
+    ],
+)
+def test_a_bad_pre_deploy_is_refused(tmp_path: Path, value: str, fragment: str) -> None:
+    with pytest.raises(RegistryError, match=fragment):
+        load_registry(write(tmp_path, with_pre_deploy(value)))

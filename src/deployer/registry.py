@@ -24,7 +24,7 @@ from typing import Any, Final, Literal
 from . import validate
 from .validate import ValidationError
 
-__all__ = ["FOLLOWER", "NEVER_FOLLOWED", "Probe", "RegistryError", "Service", "load_registry"]
+__all__ = ["FOLLOWER", "NEVER_FOLLOWED", "PreDeploy", "Probe", "RegistryError", "Service", "load_registry"]
 
 ProbeKind = Literal["http", "mcp", "log"]
 RollbackMode = Literal["auto", "manual"]
@@ -32,6 +32,7 @@ RollbackMode = Literal["auto", "manual"]
 DEFAULT_SETTLE_SECONDS: Final = 60
 DEFAULT_BUILD_DEADLINE_SECONDS: Final = 30 * 60
 DEFAULT_READY_SECONDS: Final = 60
+DEFAULT_PRE_DEPLOY_TIMEOUT_SECONDS: Final = 300
 
 #: The RT user ``release-follow`` files as. A row opts in to being followed by
 #: listing it in ``requestors`` -- which is also what lets the runner accept the
@@ -55,6 +56,7 @@ _SERVICE_KEYS: Final = frozenset(
         "rollback",
         "nagios_host",
         "requestors",
+        "pre_deploy",
     }
 )
 _REQUIRED_SERVICE_KEYS: Final = frozenset({"repo", "image", "unit", "probe", "nagios_host", "requestors"})
@@ -72,6 +74,8 @@ _LOG_ONLY_PROBE_KEYS: Final = frozenset({"expect"})
 #: refused on a URL that is not ``https``.
 _TLS_PROBE_KEYS: Final = frozenset({"server_name", "ca_file"})
 _HTTPS_PREFIX: Final = "https://"
+_PRE_DEPLOY_KEYS: Final = frozenset({"kind", "unit", "timeout"})
+_TEMPLATE_SUFFIX: Final = "@.service"
 
 # Named so the error message can say why a key is refused rather than only that
 # it is unknown. Being told "not in 0.1.0" is actionable; "unknown key" invites
@@ -155,6 +159,33 @@ class Probe:
 
 
 @dataclass(frozen=True, slots=True)
+class PreDeploy:
+    """A step that must succeed before the restart, or the deploy does not happen.
+
+    ``pg_dump`` is the one kind: a database dump taken while the outgoing
+    release is still running, so a deploy whose migrations go wrong has a copy
+    of the data from just before them. The rollback here swaps images and
+    never the database, so this is the disaster-recovery net under it rather
+    than part of it.
+
+    The dump is taken by ``unit``, a host template unit reviewed as static
+    config, started as ``<template>@<rollback suffix>.service``. Not by this
+    program: it cannot exec into a container, and reaching the database over
+    the network would mean opening a database that listens only on its own
+    container's loopback. Starting a unit is a capability this deployer already
+    holds, and what the unit runs is fixed by a file a person installed.
+    """
+
+    kind: Literal["pg_dump"]
+    unit: str
+    timeout: int = DEFAULT_PRE_DEPLOY_TIMEOUT_SECONDS
+
+    def instance(self, suffix: str) -> str:
+        """The template's instance for one deploy, named like its rollback tag."""
+        return self.unit.removesuffix(_TEMPLATE_SUFFIX) + f"@{suffix}.service"
+
+
+@dataclass(frozen=True, slots=True)
 class Service:
     """One row of the registry."""
 
@@ -174,6 +205,7 @@ class Service:
     settle: int = DEFAULT_SETTLE_SECONDS
     build_deadline: int = DEFAULT_BUILD_DEADLINE_SECONDS
     rollback: RollbackMode = "auto"
+    pre_deploy: PreDeploy | None = None
 
     @property
     def container(self) -> str:
@@ -314,6 +346,22 @@ def _parse_probe(raw: Any, where: str) -> Probe:
     )
 
 
+def _parse_pre_deploy(raw: Any, where: str) -> PreDeploy:
+    table = validate.mapping(raw, f"{where}.pre_deploy")
+    validate.known_keys(table, _PRE_DEPLOY_KEYS, f"{where}.pre_deploy")
+    validate.one_of(table.get("kind"), ("pg_dump",), f"{where}.pre_deploy.kind")
+    unit = validate.non_empty_str(table.get("unit"), f"{where}.pre_deploy.unit")
+    if not unit.endswith(_TEMPLATE_SUFFIX) or unit == _TEMPLATE_SUFFIX:
+        raise ValidationError(
+            f"{where}.pre_deploy.unit {unit!r} must be a template unit, `<name>@.service`: "
+            "each deploy starts its own instance, named for the rollback tag it sits beside"
+        )
+    timeout = validate.positive_int(
+        table.get("timeout", DEFAULT_PRE_DEPLOY_TIMEOUT_SECONDS), f"{where}.pre_deploy.timeout"
+    )
+    return PreDeploy(kind="pg_dump", unit=unit, timeout=timeout)
+
+
 def _check_follower(name: str, requestors: tuple[str, ...], rollback: RollbackMode, where: str) -> None:
     """Refuse ``follower`` on a row that must never deploy unattended.
 
@@ -364,6 +412,7 @@ def _parse_service(name: str, raw: Any) -> Service:
             table.get("build_deadline", DEFAULT_BUILD_DEADLINE_SECONDS), f"{where}.build_deadline"
         ),
         rollback=rollback,
+        pre_deploy=_parse_pre_deploy(table["pre_deploy"], where) if "pre_deploy" in table else None,
     )
 
 

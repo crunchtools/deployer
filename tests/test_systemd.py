@@ -128,7 +128,11 @@ class FakeBus:
             "SubState": "running",
             "Result": "success",
             "ActiveEnterTimestamp": 1_000_000,
+            "InactiveEnterTimestamp": 1_000_000,
         }
+        #: How a oneshot template instance ends when `run` starts it.
+        self.run_ends = ("inactive", "success")
+        self.run_stuck_at = "activating"
 
     async def call(self, message: Any) -> Any:
         self.calls.append((message.member, list(message.body)))
@@ -145,7 +149,9 @@ class FakeBus:
             _interface, name = message.body
             body = [self.properties.get(name, self._reply)]
         else:
-            if message.member == "RestartUnit" and self.comes_back:
+            if message.member == "StartUnit" and "@" in message.body[0]:
+                self._oneshot_ran()
+            elif message.member == "RestartUnit" and self.comes_back:
                 # What systemd does once the job has actually run.
                 self.properties["ActiveState"] = self.ends
                 self.properties["ActiveEnterTimestamp"] += 5_000_000
@@ -158,6 +164,17 @@ class FakeBus:
                 self.properties["ActiveState"] = self.stuck_at
             body = [self._reply]
         return SimpleNamespace(message_type=MessageType.METHOD_RETURN, body=body)
+
+    def _oneshot_ran(self) -> None:
+        """A oneshot instance runs, exits, and goes inactive or failed.
+
+        Nothing moves if the job never ran.
+        """
+        if self.comes_back:
+            self.properties["ActiveState"], self.properties["Result"] = self.run_ends
+            self.properties["InactiveEnterTimestamp"] += 5_000_000
+        else:
+            self.properties["ActiveState"] = self.run_stuck_at
 
     def disconnect(self) -> None:
         return None
@@ -255,3 +272,61 @@ async def test_a_failed_property_read_raises_rather_than_answering_none() -> Non
 async def test_hold_guard_reads_the_exec_condition() -> None:
     assert await connected(FakeBus(reply=["/usr/bin/test"])).hold_guard_installed() is True
     assert await connected(FakeBus(reply=[])).hold_guard_installed() is False
+
+
+TEMPLATE = "rootsofthevalley.org-pg-dump@.service"
+INSTANCE = "rootsofthevalley.org-pg-dump@0123456789ab.service"
+
+
+async def test_run_starts_an_instance_and_waits_for_it_to_succeed() -> None:
+    bus = FakeBus()
+    await connected(bus, {IN_SCOPE, TEMPLATE}).run(INSTANCE, timeout=60)
+    members = [member for member, _body in bus.calls]
+    assert ("StartUnit", [INSTANCE, "replace"]) in bus.calls
+    assert "Get" in members[members.index("StartUnit") + 1 :]
+
+
+async def test_run_refuses_an_instance_of_a_template_the_registry_does_not_name() -> None:
+    with pytest.raises(SystemdError, match="not an instance of a template unit"):
+        await connected(FakeBus(), {IN_SCOPE}).run(INSTANCE, timeout=60)
+
+
+async def test_run_refuses_a_plain_unit_even_one_in_the_registry() -> None:
+    # `run` starts template instances and nothing else: a registry unit is
+    # restarted, never run, and naming the template itself starts nothing.
+    for unit in (IN_SCOPE, TEMPLATE):
+        with pytest.raises(SystemdError, match="not an instance"):
+            await connected(FakeBus(), {IN_SCOPE, TEMPLATE}).run(unit, timeout=60)
+
+
+async def test_restart_and_start_refuse_a_template_instance() -> None:
+    client = connected(FakeBus(), {IN_SCOPE, TEMPLATE})
+    with pytest.raises(SystemdError, match="registry names"):
+        await client.restart(INSTANCE)
+    with pytest.raises(SystemdError, match="registry names"):
+        await client.start(INSTANCE)
+
+
+async def test_a_run_that_fails_raises() -> None:
+    bus = FakeBus()
+    bus.run_ends = ("failed", "exit-code")
+    with pytest.raises(SystemdError, match="failed: failed, result 'exit-code'"):
+        await connected(bus, {TEMPLATE}).run(INSTANCE, timeout=60)
+
+
+async def test_a_run_that_never_finishes_raises() -> None:
+    bus = FakeBus()
+    bus.comes_back = False
+    with pytest.raises(SystemdError, match="still activating 60s after"):
+        await connected(bus, {TEMPLATE}).run(INSTANCE, timeout=60)
+
+
+async def test_an_earlier_failed_run_is_not_read_as_this_one() -> None:
+    # The instance failed on an earlier ticket and has not run again yet:
+    # `failed`, but with the old timestamp, so it is still this run's start.
+    bus = FakeBus()
+    bus.comes_back = False
+    bus.run_stuck_at = "failed"
+    bus.properties["Result"] = "exit-code"
+    with pytest.raises(SystemdError, match="was still failed 60s after"):
+        await connected(bus, {TEMPLATE}).run(INSTANCE, timeout=60)
