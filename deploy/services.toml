@@ -119,7 +119,7 @@ repo = "crunchtools/rotv"
 image = "quay.io/crunchtools/images-rotv"
 unit = "images.rootsofthevalley.org.service"
 nagios_host = "ctr-images.rootsofthevalley.org"
-requestors = ["scott"]
+requestors = ["scott", "follower"]
 # Measured 200 before onboarding. /health is 404 on this one -- the route is
 # under /api.
 probe = { kind = "http", url = "http://127.0.0.1:8094/api/health", expect_status = 200 }
@@ -167,7 +167,7 @@ repo = "crunchtools/postiz"
 image = "quay.io/crunchtools/postiz"
 unit = "postiz.crunchtools.com.service"
 nagios_host = "ctr-postiz.crunchtools.com"
-requestors = ["scott"]
+requestors = ["scott", "follower"]
 # Measured before onboarding. NOT "/" -- that is a 307 to /auth, which proves
 # only that something is routing. NOT /api/health -- 404 here. /p/health is a
 # real health route and answers 200.
@@ -184,7 +184,7 @@ repo = "crunchtools/proxy"
 image = "quay.io/crunchtools/proxy"
 unit = "proxy.crunchtools.com.service"
 nagios_host = "ctr-proxy.crunchtools.com"
-requestors = ["scott"]
+requestors = ["scott", "follower"]
 # THIS PROBE CHECKS THE CERTIFICATE, NOT JUST A STATUS CODE, and that is the
 # whole reason this service could not be onboarded until 0.4.0.
 #

@@ -373,12 +373,20 @@ def test_a_never_followed_row_without_the_follower_loads(tmp_path: Path, name: s
     assert load_registry(write(tmp_path, followed(name=name, who="developer1"))).get(name)
 
 
-def test_the_shipped_registry_follows_exactly_the_pr1_rows() -> None:
+def test_the_shipped_registry_follows_exactly_the_reviewed_rows() -> None:
     """The rollout is a reviewed list, not whatever a row happens to say."""
     shipped = Path(__file__).resolve().parent.parent / "deploy" / "services.toml"
     rows = tomllib.loads(shipped.read_text(encoding="utf-8"))["service"]
     listed = {name for name, row in rows.items() if FOLLOWER in row["requestors"]}
-    assert listed == {"acquacotta.crunchtools.com", "mcp-pcloud", "mcp-nagios", "mcp-cloudflare"}
+    assert listed == {
+        "acquacotta.crunchtools.com",
+        "mcp-pcloud",
+        "mcp-nagios",
+        "mcp-cloudflare",
+        "images.rootsofthevalley.org",
+        "postiz.crunchtools.com",
+        "proxy.crunchtools.com",
+    }
     for name in listed:
         assert name not in NEVER_FOLLOWED
         assert rows[name].get("rollback", "auto") == "auto"
