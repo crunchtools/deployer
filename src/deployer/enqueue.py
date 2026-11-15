@@ -217,7 +217,7 @@ def _parse_subject(subject: str) -> tuple[str, str]:
     """(ref, digest) from a subject this program wrote, or ("","")."""
     if not subject.startswith(_SUBJECT_PREFIX):
         return "", ""
-    rest = subject[len(_SUBJECT_PREFIX):].strip()
+    rest = subject[len(_SUBJECT_PREFIX) :].strip()
     match = re.match(r"(\S+)\s+\[([0-9a-f]+)\]\s*$", rest)
     return (match.group(1), match.group(2)) if match else (rest.split(" ")[0], "")
 
@@ -251,7 +251,7 @@ class Plan:
     create: tuple[tuple[str, str], ...]  # (ref, subject)
     update: tuple[tuple[int, str], ...]  # (ticket_id, new subject)
     resolve: tuple[int, ...]
-    unchanged: tuple[str, ...]           # refs already in sync
+    unchanged: tuple[str, ...]  # refs already in sync
 
 
 async def plan_run(client: RtClient, queue: str, states: Mapping[str, ImageState]) -> Plan:
@@ -286,9 +286,7 @@ async def plan_run(client: RtClient, queue: str, states: Mapping[str, ImageState
     return Plan(tuple(create), tuple(update), tuple(resolve), tuple(unchanged))
 
 
-async def apply_plan(
-    client: RtClient, queue: str, states: Mapping[str, ImageState], plan: Plan
-) -> None:
+async def apply_plan(client: RtClient, queue: str, states: Mapping[str, ImageState], plan: Plan) -> None:
     """Carry out a plan: create, comment+resubject, resolve."""
     for ref, subject in plan.create:
         await client.create_ticket(queue, subject, body_for(ref, states[ref].findings))
