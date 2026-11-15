@@ -6,6 +6,21 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-11-15
+
+### Fixed
+- The pre-deploy wait never saw a successful dump finish, so every rotv deploy was
+  refused (RT #1633). A oneshot without `RemainAfterExit` goes inactive on success
+  and systemd garbage-collects it at once, so `run` found a fresh unit with every
+  timestamp 0 and waited out its timeout. The reference unit now has
+  `RemainAfterExit=yes`. `run` calls success `active` with a newer
+  `ActiveEnterTimestamp`, and failure `failed` or `inactive` with a newer
+  `InactiveEnterTimestamp`. It then stops the instance, and resets it if it failed,
+  so per-run instances do not pile up; a cleanup error never refuses a good dump. A
+  unit still lacking `RemainAfterExit` times out with that named as the likely cause.
+  The test fake now models garbage collection, which is how review missed this.
+- The deployer and release-follow reference units pin `deployer:0.10.1`.
+
 ## [0.10.0] - 2026-11-15
 
 ### Added

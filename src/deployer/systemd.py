@@ -241,33 +241,70 @@ class SystemdUnits:
         """Start an instance of a registry template, and WAIT for it to finish.
 
         For a oneshot that does a job and exits, such as a pre-deploy database
-        dump. ``StartUnit`` returns once the job is queued, so this waits the
-        same way ``restart`` does and for the same reason: on a timestamp, not
-        on a state. ``InactiveEnterTimestamp`` moves when the run ends, whether
-        it ended well or not, so a value newer than the one read before the
-        start proves THIS run finished -- an instance that failed on an earlier
-        ticket is already ``failed`` before it is started again.
+        dump, and which has ``RemainAfterExit=yes``. That is not optional: a
+        oneshot without it goes inactive the moment it succeeds, and systemd
+        garbage-collects an inactive unit at once, so the next ``LoadUnit``
+        returns a fresh unit with every timestamp 0 -- a success that looks
+        exactly like never having run. That was RT #1633: the dump finished in
+        five seconds and this waited 300 for a timestamp that never came.
 
-        Raises unless it finished with result ``success`` within ``timeout``.
-        A step that cannot be told to have succeeded has not.
+        ``StartUnit`` returns once the job is queued, so this waits on
+        timestamps read before the start, never on a state alone:
+
+        * success is ``active`` with a newer ``ActiveEnterTimestamp``. A oneshot
+          reaches active only once ExecStart has exited 0;
+        * failure is ``failed`` (systemd keeps a failed unit loaded) or
+          ``inactive``, either with a newer ``InactiveEnterTimestamp``. An
+          instance that failed on an earlier ticket is ``failed`` before it is
+          started again, and must not be read as this run.
+
+        Either way the instance is then stopped, and reset if it failed, so
+        per-run instances do not pile up. A cleanup error never changes the
+        verdict. Raises unless the run succeeded within ``timeout``.
         """
         self._require_template_in_scope(instance)
-        before = await self._inactive_enter(instance)
+        active_before = await self._active_enter(instance)
+        inactive_before = await self._inactive_enter(instance)
         await self._call("StartUnit", "ss", [instance, "replace"])
 
         waited = 0.0
         while True:
             state = await self.state(instance)
-            if state.active_state in ("inactive", "failed") and await self._inactive_enter(instance) > before:
-                if state.result != "success" or state.active_state == "failed":
-                    raise SystemdError(f"{instance} failed: {state.active_state}, result {state.result!r}")
+            if state.active_state == "active" and await self._active_enter(instance) > active_before:
+                await self._discard(instance, failed=False)
                 return
+            ended = state.active_state in ("failed", "inactive")
+            if ended and await self._inactive_enter(instance) > inactive_before:
+                await self._discard(instance, failed=True)
+                if state.active_state == "failed":
+                    raise SystemdError(f"{instance} failed: failed, result {state.result!r}")
+                raise SystemdError(
+                    f"{instance} ended inactive and did not stay active, result {state.result!r}: "
+                    "a pre-deploy unit needs RemainAfterExit=yes"
+                )
             if waited >= timeout:
                 raise SystemdError(
-                    f"{instance} was still {state.active_state} {timeout:.0f}s after it was started"
+                    f"{instance} was still {state.active_state} {timeout:.0f}s after it was started. "
+                    "If it ran and succeeded, it lacks RemainAfterExit=yes: systemd collected it, "
+                    "and a collected unit cannot be told from one that never ran"
                 )
             await self._sleep(RESTART_POLL_SECONDS)
             waited += RESTART_POLL_SECONDS
+
+    async def _discard(self, instance: str, failed: bool) -> None:
+        """Stop a finished instance, and reset it if it failed. Never raises.
+
+        Housekeeping only: the verdict is already decided, and a good dump
+        must not become a refusal because systemd would not stop a unit.
+        """
+        members = [("StopUnit", "ss", [instance, "replace"])]
+        if failed:
+            members.append(("ResetFailedUnit", "s", [instance]))
+        for member, signature, body in members:
+            try:
+                await self._call(member, signature, body)
+            except SystemdError:
+                continue
 
     async def _inactive_enter(self, unit: str) -> int:
         """``InactiveEnterTimestamp`` in microseconds, or 0 for a unit never stopped."""

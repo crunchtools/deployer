@@ -49,6 +49,13 @@ After=rootsofthevalley.org.service
 
 [Service]
 Type=oneshot
+# REMAINAFTEREXIT IS LOAD-BEARING. Without it a successful run goes inactive
+# and systemd garbage-collects the instance at once, so the deployer's next
+# look finds a fresh unit with no timestamps: a success indistinguishable from
+# never having run. That refused every rotv deploy in v0.10.0 (RT #1633). With
+# it a good run stays active (exited) until the deployer has seen it and
+# stopped the instance; a failed one stays `failed` either way.
+RemainAfterExit=yes
 UMask=0077
 # Well past the ~10s a 91 MB dump takes, and equal to the registry's floor for
 # pre_deploy.timeout (240s). The deployer refuses to run this unit if this
