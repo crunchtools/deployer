@@ -164,22 +164,32 @@ image and never the database, so that discipline is what makes it safe.
 A row may name a step that must succeed before the restart:
 
 ```toml
-pre_deploy = { kind = "pg_dump", unit = "rootsofthevalley.org-pg-dump@.service", timeout = 300 }
+pre_deploy = { kind = "pg_dump", unit = "rootsofthevalley.org-pg_dump@.service", timeout = 300 }
 ```
 
-`pg_dump` is the one kind. The deployer starts an instance of that **template**
-unit named for the outgoing release's rollback tag suffix
-(`...-pg-dump@<suffix>.service`), waits up to `timeout` seconds (default 300)
-for it to finish, and requires a `pg_dump -Fc` archive at
-`$DEPLOYER_STATE/dumps/<service>/<suffix>.dump`, written during this run. It
-keeps the newest two, like rollback tags, and the ticket says where the dump
-is whether the deploy holds or rolls back. Anything less is a refusal: the
-ticket is handed back, and the old release keeps running with RT, Nagios and
+`pg_dump` is the one kind, and a new one needs a constitution amendment. The
+unit must be exactly `<row>-<kind>@.service`. The deployer starts an instance
+of it named `<rollback suffix>t<ticket>`, waits up to `timeout` seconds
+(default 300, never below 240, and never below the installed unit's own
+`TimeoutStartSec`), and requires a `pg_dump -Fc` archive at
+`$DEPLOYER_STATE/dumps/<service>/<name>.dump`, written during this run. Every
+run has its own file, so a retry after a rollback never overwrites the dump
+taken before the first attempt's migrations. The ticket says where the dump is
+whether the deploy holds or rolls back. Anything less is a refusal: the ticket
+is handed back, and the old release keeps running with RT, Nagios and
 `:latest` untouched.
+
+Rotation happens only after a deploy holds, never on a refusal or a rollback.
+It keeps every dump of the newest two outgoing releases, like rollback tags.
+
+No dump, no deploy, including for a service that is down: the reference unit
+is `Requisite=` on the service, so it fails rather than starting it. A
+crash-looping service gets a person, not an unattended deploy with no safety
+net under it.
 
 The unit does the dump, not the deployer, which still cannot exec into a
 container. It is static config a person installs, like the hold drop-in, and
-`deploy/systemd/rootsofthevalley.org-pg-dump@.service` is the reference one.
+`deploy/systemd/rootsofthevalley.org-pg_dump@.service` is the reference one.
 `run` may start an instance of a template the registry names and nothing else;
 `restart` and `start` refuse instances.
 

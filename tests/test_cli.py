@@ -518,7 +518,7 @@ def test_the_scope_is_the_registry_units_plus_their_pre_deploy_templates() -> No
     )
     images = replace(app, name="images.rootsofthevalley.org", unit="images.rootsofthevalley.org.service")
     plain = Registry({app.name: app, images.name: images})
-    dump = PreDeploy(kind="pg_dump", unit="rootsofthevalley.org-pg-dump@.service")
+    dump = PreDeploy(kind="pg_dump", unit="rootsofthevalley.org-pg_dump@.service")
     dumping = Registry({app.name: replace(app, pre_deploy=dump), images.name: images})
     assert _units(plain) == {app.unit, images.unit}
     assert _units(dumping) == {app.unit, images.unit, dump.unit}

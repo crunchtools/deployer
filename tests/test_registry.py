@@ -20,6 +20,7 @@ from deployer.registry import (
     DEFAULT_SETTLE_SECONDS,
     FOLLOWER,
     NEVER_FOLLOWED,
+    PRE_DEPLOY_TIMEOUT_FLOOR_SECONDS,
     RegistryError,
     load_registry,
 )
@@ -385,7 +386,8 @@ def test_the_shipped_registry_follows_exactly_the_pr1_rows() -> None:
         assert rows[name].get("rollback", "auto") == "auto"
 
 
-ROTV_DUMP = "rootsofthevalley.org-pg-dump@.service"
+ROW = "mcp-pcloud.crunchtools.com"
+ROW_DUMP = f"{ROW}-pg_dump@.service"
 
 
 def with_pre_deploy(value: str) -> str:
@@ -396,26 +398,42 @@ def with_pre_deploy(value: str) -> str:
 
 
 def test_a_row_without_pre_deploy_has_none(tmp_path: Path) -> None:
-    assert load_registry(write(tmp_path, GOOD)).get("mcp-pcloud.crunchtools.com").pre_deploy is None
+    assert load_registry(write(tmp_path, GOOD)).get(ROW).pre_deploy is None
 
 
 def test_a_pg_dump_pre_deploy_loads_with_its_default_timeout(tmp_path: Path) -> None:
-    text = with_pre_deploy(f'{{ kind = "pg_dump", unit = "{ROTV_DUMP}" }}')
-    step = load_registry(write(tmp_path, text)).get("mcp-pcloud.crunchtools.com").pre_deploy
+    text = with_pre_deploy(f'{{ kind = "pg_dump", unit = "{ROW_DUMP}" }}')
+    step = load_registry(write(tmp_path, text)).get(ROW).pre_deploy
     assert step is not None
-    assert (step.kind, step.unit, step.timeout) == ("pg_dump", ROTV_DUMP, DEFAULT_PRE_DEPLOY_TIMEOUT_SECONDS)
-    assert step.instance("0123456789ab") == "rootsofthevalley.org-pg-dump@0123456789ab.service"
+    assert (step.kind, step.unit, step.timeout) == ("pg_dump", ROW_DUMP, DEFAULT_PRE_DEPLOY_TIMEOUT_SECONDS)
+    assert step.instance("0123456789abt1601") == f"{ROW}-pg_dump@0123456789abt1601.service"
+
+
+def test_the_timeout_may_sit_exactly_on_the_floor(tmp_path: Path) -> None:
+    text = with_pre_deploy(
+        f'{{ kind = "pg_dump", unit = "{ROW_DUMP}", timeout = {PRE_DEPLOY_TIMEOUT_FLOOR_SECONDS} }}'
+    )
+    step = load_registry(write(tmp_path, text)).get(ROW).pre_deploy
+    assert step is not None
+    assert step.timeout == PRE_DEPLOY_TIMEOUT_FLOOR_SECONDS
 
 
 @pytest.mark.parametrize(
     ("value", "fragment"),
     [
-        ('{ kind = "mysqldump", unit = "x@.service" }', "kind"),
+        # A kind outside the closed set: a new kind needs an amendment.
+        (f'{{ kind = "mysqldump", unit = "{ROW}-mysqldump@.service" }}', "kind"),
         ('{ kind = "pg_dump" }', "unit"),
-        ('{ kind = "pg_dump", unit = "x.service" }', "must be a template unit"),
-        ('{ kind = "pg_dump", unit = "@.service" }', "must be a template unit"),
-        ('{ kind = "pg_dump", unit = "x@.service", timeout = 0 }', "timeout"),
-        ('{ kind = "pg_dump", unit = "x@.service", command = "rm -rf /" }', "command"),
+        # The unit is fixed by the row and the kind (constitution 0.5.0).
+        ('{ kind = "pg_dump", unit = "rootsofthevalley.org-pg_dump@.service" }', "must be"),
+        (f'{{ kind = "pg_dump", unit = "{ROW}-pg-dump@.service" }}', "must be"),
+        (f'{{ kind = "pg_dump", unit = "{ROW}-pg_dump.service" }}', "must be"),
+        (f'{{ kind = "pg_dump", unit = "{ROW_DUMP}", timeout = 0 }}', "timeout"),
+        (
+            f'{{ kind = "pg_dump", unit = "{ROW_DUMP}", timeout = {PRE_DEPLOY_TIMEOUT_FLOOR_SECONDS - 1} }}',
+            "may not be below",
+        ),
+        (f'{{ kind = "pg_dump", unit = "{ROW_DUMP}", command = "rm -rf /" }}', "command"),
         ('"pg_dump"', "pre_deploy"),
     ],
 )

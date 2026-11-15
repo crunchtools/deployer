@@ -17,7 +17,7 @@ check doing its job.
 | `systemd/50-deployer-hold.conf` | `/etc/systemd/system/podman-auto-update.service.d/` |
 | `services.toml` | `/srv/deployer.crunchtools.com/config/` |
 | `systemd/release-follow.crunchtools.com.service`, `.timer` | `/etc/systemd/system/`, with the `/srv/release-follow.crunchtools.com/config` copy |
-| `systemd/rootsofthevalley.org-pg-dump@.service` | `/etc/systemd/system/`, with the `/srv/deployer.crunchtools.com/config` copy, once the rotv row names it in `pre_deploy` |
+| `systemd/rootsofthevalley.org-pg_dump@.service` | `/etc/systemd/system/`, with the `/srv/deployer.crunchtools.com/config` copy, once the rotv row names it in `pre_deploy` |
 | `deployer.env.example` | nothing — the real `deployer.env` is 0600 and holds passwords |
 | `release-follow.env.example` | nothing — the real one is 0600 and holds the `follower` RT password |
 

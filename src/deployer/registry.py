@@ -33,6 +33,14 @@ DEFAULT_SETTLE_SECONDS: Final = 60
 DEFAULT_BUILD_DEADLINE_SECONDS: Final = 30 * 60
 DEFAULT_READY_SECONDS: Final = 60
 DEFAULT_PRE_DEPLOY_TIMEOUT_SECONDS: Final = 300
+#: The least a ``pre_deploy.timeout`` may be: the reference dump unit's own
+#: ``TimeoutStartSec``. The deployer must outwait the unit, so systemd ends a
+#: hung dump rather than the deployer walking away from one still running.
+#: Checked again at run time against the installed unit's real value.
+PRE_DEPLOY_TIMEOUT_FLOOR_SECONDS: Final = 240
+#: The pre-deploy kinds. A closed set: a new kind needs a new amendment to the
+#: repo constitution, not only a new string here.
+PRE_DEPLOY_KINDS: Final = ("pg_dump",)
 
 #: The RT user ``release-follow`` files as. A row opts in to being followed by
 #: listing it in ``requestors`` -- which is also what lets the runner accept the
@@ -180,9 +188,9 @@ class PreDeploy:
     unit: str
     timeout: int = DEFAULT_PRE_DEPLOY_TIMEOUT_SECONDS
 
-    def instance(self, suffix: str) -> str:
-        """The template's instance for one deploy, named like its rollback tag."""
-        return self.unit.removesuffix(_TEMPLATE_SUFFIX) + f"@{suffix}.service"
+    def instance(self, name: str) -> str:
+        """The template's instance for one run, ``<rollback suffix>t<ticket>``."""
+        return self.unit.removesuffix(_TEMPLATE_SUFFIX) + f"@{name}.service"
 
 
 @dataclass(frozen=True, slots=True)
@@ -346,19 +354,32 @@ def _parse_probe(raw: Any, where: str) -> Probe:
     )
 
 
-def _parse_pre_deploy(raw: Any, where: str) -> PreDeploy:
+def _parse_pre_deploy(name: str, raw: Any, where: str) -> PreDeploy:
+    """The ``pre_deploy`` table, held to constitution 0.5.0.
+
+    The unit is not a free choice: it must be ``<row>-<kind>@.service``, so a
+    row can only ever start its own step, and a reviewer reading the registry
+    knows which installed file it runs without looking anything up.
+    """
     table = validate.mapping(raw, f"{where}.pre_deploy")
     validate.known_keys(table, _PRE_DEPLOY_KEYS, f"{where}.pre_deploy")
-    validate.one_of(table.get("kind"), ("pg_dump",), f"{where}.pre_deploy.kind")
+    kind = validate.one_of(table.get("kind"), PRE_DEPLOY_KINDS, f"{where}.pre_deploy.kind")
     unit = validate.non_empty_str(table.get("unit"), f"{where}.pre_deploy.unit")
-    if not unit.endswith(_TEMPLATE_SUFFIX) or unit == _TEMPLATE_SUFFIX:
+    expected = f"{name}-{kind}{_TEMPLATE_SUFFIX}"
+    if unit != expected:
         raise ValidationError(
-            f"{where}.pre_deploy.unit {unit!r} must be a template unit, `<name>@.service`: "
-            "each deploy starts its own instance, named for the rollback tag it sits beside"
+            f"{where}.pre_deploy.unit is {unit!r} but must be {expected!r}: a row runs only its own "
+            "pre-deploy template, named for the row and the kind"
         )
     timeout = validate.positive_int(
         table.get("timeout", DEFAULT_PRE_DEPLOY_TIMEOUT_SECONDS), f"{where}.pre_deploy.timeout"
     )
+    if timeout < PRE_DEPLOY_TIMEOUT_FLOOR_SECONDS:
+        raise ValidationError(
+            f"{where}.pre_deploy.timeout is {timeout} but may not be below "
+            f"{PRE_DEPLOY_TIMEOUT_FLOOR_SECONDS}, the dump unit's TimeoutStartSec: the deployer "
+            "must outwait the unit, or it walks away from a dump that is still running"
+        )
     return PreDeploy(kind="pg_dump", unit=unit, timeout=timeout)
 
 
@@ -412,7 +433,7 @@ def _parse_service(name: str, raw: Any) -> Service:
             table.get("build_deadline", DEFAULT_BUILD_DEADLINE_SECONDS), f"{where}.build_deadline"
         ),
         rollback=rollback,
-        pre_deploy=_parse_pre_deploy(table["pre_deploy"], where) if "pre_deploy" in table else None,
+        pre_deploy=_parse_pre_deploy(name, table["pre_deploy"], where) if "pre_deploy" in table else None,
     )
 
 

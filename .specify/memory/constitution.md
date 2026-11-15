@@ -84,6 +84,13 @@ client itself refuses unless it is alphanumeric (a rollback tag suffix);
 pre-deploy step needs an argument beyond the instance name, it needs a new
 amendment.
 
+Two more conditions, enforced when the registry loads. The template a row may
+name is exactly `<row>-<kind>@.service` (`rootsofthevalley.org-pg_dump@.service`),
+so a row can start only its own step and a reviewer knows which installed file
+it runs. And `kind` is a closed set, today only `pg_dump`: a new kind is a new
+thing for the robot to trigger, and it needs a new amendment here, not only a
+new string in `registry.py`.
+
 ## No Model In The Deploy Path
 
 No language model runs in this process, and it holds no model credential. It is

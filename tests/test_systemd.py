@@ -274,8 +274,8 @@ async def test_hold_guard_reads_the_exec_condition() -> None:
     assert await connected(FakeBus(reply=[])).hold_guard_installed() is False
 
 
-TEMPLATE = "rootsofthevalley.org-pg-dump@.service"
-INSTANCE = "rootsofthevalley.org-pg-dump@0123456789ab.service"
+TEMPLATE = "rootsofthevalley.org-pg_dump@.service"
+INSTANCE = "rootsofthevalley.org-pg_dump@0123456789ab.service"
 
 
 async def test_run_starts_an_instance_and_waits_for_it_to_succeed() -> None:
@@ -338,5 +338,5 @@ async def test_run_refuses_an_instance_name_that_is_not_alphanumeric(named: str)
     # keeps it to a rollback tag suffix.
     with pytest.raises(SystemdError, match="not an instance"):
         await connected(FakeBus(), {TEMPLATE}).run(
-            f"rootsofthevalley.org-pg-dump@{named}.service", timeout=60
+            f"rootsofthevalley.org-pg_dump@{named}.service", timeout=60
         )

@@ -49,7 +49,7 @@ from .attempts import ROLLBACK_LIMIT, AttemptLog
 from .hold import Hold, HoldStore, require_guard
 from .nagios import NagiosError
 from .podman import ImageRef, PodmanError
-from .predeploy import PreDeployError, pre_deploy
+from .predeploy import PreDeployError, pre_deploy, rotate_dumps
 from .registry import Registry, RegistryError, Service
 from .rollback import Restored, RollbackError, roll_back, rotate_rollback_tags
 from .rt import RtError, Ticket, TicketSaid
@@ -557,9 +557,11 @@ class Runner:
         nobody is told about.
         """
         if service.pre_deploy is not None:
-            suffix = staged.rollback_tag.rpartition(":rollback-")[2]
+            # Per run: a retry after a rollback has the same outgoing release,
+            # and must not overwrite the dump taken before the first attempt.
+            name = f"{staged.rollback_tag.rpartition(':rollback-')[2]}t{ticket.id}"
             try:
-                dump = await pre_deploy(self.clients.systemd, service, self.state_dir, suffix, self.now())
+                dump = await pre_deploy(self.clients.systemd, service, self.state_dir, name, self.now())
             except PreDeployError as exc:
                 why = f"{service.name} was not deployed because its pre-deploy step failed: {exc}"
                 await self._untag_candidate(staged)
@@ -596,6 +598,10 @@ class Runner:
         window = await self._close_window(service)
         untagged = await self._untag_candidate(staged)
         rotated, rotation = await self._rotate(service)
+        # Only here, once the deploy has held: a refusal or a rollback leaves
+        # every dump, so the one from before a failed attempt's migrations is
+        # still there for the retry and for a person.
+        dumps_removed = rotate_dumps(self.state_dir, service) if service.pre_deploy else 0
 
         cleared = self.holds.clear(service.unit)
         built = staged.candidate_revision or "no revision label"
@@ -609,6 +615,7 @@ class Runner:
             f"active, the container is running that exact image, and {_proof_phrase(service)}.\n"
             f"Rollback image kept as {staged.rollback_tag}."
             + _dump_line(staged)
+            + (f" Removed {dumps_removed} dump file(s) from older releases." if dumps_removed else "")
             + (f"\nRemoved {len(rotated)} older rollback tag(s)." if rotated else "")
             + ("\nThe hold on this service is cleared; auto-update is no longer skipped." if cleared else "")
             + _as_notes((window, untagged, rotation)),
