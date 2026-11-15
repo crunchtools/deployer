@@ -96,7 +96,14 @@ async def pre_deploy(systemd: Runs, service: Service, state_dir: Path, suffix: s
     # partials failed runs left: after a run that succeeded none is worth
     # anything. A file that will not go is not worth failing a deploy over;
     # the Nagios disk check notices accumulation.
-    dumps = sorted(directory.glob("*.dump"), key=lambda p: p.stat().st_mtime, reverse=True)
-    for old in [*dumps[DUMPS_KEPT:], *directory.glob(".*.partial")]:
-        old.unlink(missing_ok=True)
+    try:
+        dumps = sorted(directory.glob("*.dump"), key=lambda p: p.stat().st_mtime, reverse=True)
+        stale = [*dumps[DUMPS_KEPT:], *directory.glob(".*.partial")]
+    except OSError:
+        return path
+    for old in stale:
+        try:
+            old.unlink(missing_ok=True)
+        except OSError:
+            continue
     return path

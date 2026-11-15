@@ -1,8 +1,8 @@
 # deployer Constitution
 
-> **Version:** 0.4.0
+> **Version:** 0.5.0
 > **Ratified:** 2026-11-07
-> **Amended:** 2026-11-12
+> **Amended:** 2026-11-15
 > **Status:** Active
 > **Inherits:** [crunchtools/constitution](https://github.com/crunchtools/constitution) v1.41.0
 > **Profile:** CLI Tool
@@ -67,6 +67,22 @@ is static config installed beside its unit and reviewed as config. Where such a
 file is load-bearing — the `podman auto-update` hold guard — `deployer` checks
 it is present and **refuses to run at all** if it is not, because a hold that
 nothing honours is worse than no hold.
+
+Amended at 0.5.0 (crunchtools/rotv#897): `deployer` may also **run an instance
+of a template unit a registry row names as its `pre_deploy`**, and wait for it
+to finish. That unit may itself `podman exec` (the reference one runs
+`pg_dump` inside rotv's container), which is the same shape as every registry
+unit whose `ExecStart` is `podman run`: what a container runs or mounts is
+fixed by a file a person installed and reviewed, and `deployer` can only
+trigger it. The boundary is about `deployer` never *choosing* a command, a
+mount or a flag, and it still cannot. It holds only while all of these hold:
+the template is static config installed by hand, never written by `deployer`;
+the only input `deployer` supplies is the instance name, which the systemd
+client itself refuses unless it is alphanumeric (a rollback tag suffix);
+`restart` and `start` refuse instances, and `run` refuses anything else; and
+`deployer` gains no create, start, run or exec verb of its own. The day a
+pre-deploy step needs an argument beyond the instance name, it needs a new
+amendment.
 
 ## No Model In The Deploy Path
 

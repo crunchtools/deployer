@@ -15,7 +15,8 @@ All notable changes to this project are documented here. The format follows
   rolls back. A failed step refuses the ticket before RT, Nagios or `:latest` are
   touched. The systemd client gains `run`, which starts only instances of templates
   the registry names; `restart` and `start` refuse them. Reference unit:
-  `deploy/systemd/rootsofthevalley.org-pg-dump@.service` (crunchtools/rotv#897).
+  `deploy/systemd/rootsofthevalley.org-pg-dump@.service`. The repo constitution is
+  amended to 0.5.0 to admit this and the conditions it holds under (crunchtools/rotv#897).
 
 ## [0.9.1] - 2026-11-12
 

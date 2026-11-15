@@ -113,3 +113,17 @@ async def test_dumps_rotate_like_rollback_tags_and_partials_are_swept(tmp_path: 
     assert len(kept) == DUMPS_KEPT
     assert kept == sorted([path.name, old[0].name])
     assert not partial.exists()
+
+
+async def test_a_dump_that_will_not_rotate_does_not_fail_the_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(self: Path, missing_ok: bool = False) -> None:
+        raise PermissionError(f"cannot remove {self}")
+
+    directory = dump_dir(tmp_path, SERVICE)
+    directory.mkdir(parents=True)
+    (directory / ".old.partial").write_bytes(b"PGD")
+    monkeypatch.setattr(Path, "unlink", refuse)
+    path = await pre_deploy(FakeUnit(tmp_path), SERVICE, tmp_path, SUFFIX, NOW)
+    assert path.exists()

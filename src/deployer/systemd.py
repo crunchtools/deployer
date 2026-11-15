@@ -158,7 +158,9 @@ class SystemdUnits:
         """Refuse an instance of a template the registry does not name."""
         prefix, at, rest = instance.partition("@")
         named = rest.removesuffix(".service")
-        if not at or named in ("", rest) or f"{prefix}@.service" not in self._allowed:
+        # Alphanumeric only: the instance name is the one input this program
+        # passes to a unit a person wrote, and `%i` lands in its command line.
+        if not at or not named.isalnum() or not named.isascii() or f"{prefix}@.service" not in self._allowed:
             raise SystemdError(
                 f"refusing to run {instance!r}: it is not an instance of a template unit "
                 "this deployer's registry names"

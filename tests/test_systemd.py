@@ -330,3 +330,13 @@ async def test_an_earlier_failed_run_is_not_read_as_this_one() -> None:
     bus.properties["Result"] = "exit-code"
     with pytest.raises(SystemdError, match="was still failed 60s after"):
         await connected(bus, {TEMPLATE}).run(INSTANCE, timeout=60)
+
+
+@pytest.mark.parametrize("named", ["", "abc-def", "a b", "x;rm", "\u00e9t\u00e9"])
+async def test_run_refuses_an_instance_name_that_is_not_alphanumeric(named: str) -> None:
+    # %i lands in the template's command line; the client, not the caller,
+    # keeps it to a rollback tag suffix.
+    with pytest.raises(SystemdError, match="not an instance"):
+        await connected(FakeBus(), {TEMPLATE}).run(
+            f"rootsofthevalley.org-pg-dump@{named}.service", timeout=60
+        )
