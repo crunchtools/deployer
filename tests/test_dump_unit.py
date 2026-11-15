@@ -42,6 +42,13 @@ def test_systemd_ends_a_hung_dump_before_the_deployer_stops_waiting() -> None:
     assert int(service["timeoutstartsec"]) <= PRE_DEPLOY_TIMEOUT_FLOOR_SECONDS
 
 
+def test_a_good_run_stays_loaded_for_the_deployer_to_see() -> None:
+    # Without it a successful oneshot goes inactive and is garbage-collected
+    # at once, and the deployer cannot tell that from never having run
+    # (RT #1633).
+    assert directives()["Service"]["remainafterexit"] == "yes"
+
+
 def test_it_dumps_as_the_app_owner() -> None:
     command = directives()["Service"]["execstart"]
     assert "pg_dump -Fc -U rotv -d rotv" in command

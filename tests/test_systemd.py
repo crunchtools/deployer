@@ -130,8 +130,10 @@ class FakeBus:
             "ActiveEnterTimestamp": 1_000_000,
             "InactiveEnterTimestamp": 1_000_000,
         }
-        #: How a oneshot template instance ends when `run` starts it.
-        self.run_ends = ("inactive", "success")
+        #: How a oneshot template instance behaves when `run` starts it: whether
+        #: ExecStart exits 0, and whether the unit has RemainAfterExit=yes.
+        self.run_succeeds = True
+        self.remain_after_exit = True
         self.run_stuck_at = "activating"
 
     async def call(self, message: Any) -> Any:
@@ -151,6 +153,10 @@ class FakeBus:
         else:
             if message.member == "StartUnit" and "@" in message.body[0]:
                 self._oneshot_ran()
+            elif message.member in ("StopUnit", "ResetFailedUnit") and "@" in message.body[0]:
+                # Stopped or reset, the instance is inactive and systemd
+                # collects it at once.
+                self._collected()
             elif message.member == "RestartUnit" and self.comes_back:
                 # What systemd does once the job has actually run.
                 self.properties["ActiveState"] = self.ends
@@ -166,15 +172,35 @@ class FakeBus:
         return SimpleNamespace(message_type=MessageType.METHOD_RETURN, body=body)
 
     def _oneshot_ran(self) -> None:
-        """A oneshot instance runs, exits, and goes inactive or failed.
+        """A oneshot instance runs and exits, the way systemd really handles it.
 
+        Exit 0 with RemainAfterExit=yes: active (exited), ActiveEnterTimestamp
+        moves. Exit 0 without it: inactive, and an inactive oneshot with the
+        default CollectMode is garbage-collected at once, so the next LoadUnit
+        returns a fresh unit with every timestamp 0 (crunchtools/rotv#897,
+        RT #1633). A non-zero exit: failed, which systemd keeps loaded.
         Nothing moves if the job never ran.
         """
-        if self.comes_back:
-            self.properties["ActiveState"], self.properties["Result"] = self.run_ends
-            self.properties["InactiveEnterTimestamp"] += 5_000_000
-        else:
+        if not self.comes_back:
             self.properties["ActiveState"] = self.run_stuck_at
+        elif not self.run_succeeds:
+            self.properties.update(ActiveState="failed", Result="exit-code")
+            self.properties["InactiveEnterTimestamp"] += 5_000_000
+        elif self.remain_after_exit:
+            self.properties.update(ActiveState="active", SubState="exited", Result="success")
+            self.properties["ActiveEnterTimestamp"] += 5_000_000
+        else:
+            self._collected()
+
+    def _collected(self) -> None:
+        """What LoadUnit returns for an instance systemd has garbage-collected."""
+        self.properties.update(
+            ActiveState="inactive",
+            SubState="dead",
+            Result="success",
+            ActiveEnterTimestamp=0,
+            InactiveEnterTimestamp=0,
+        )
 
     def disconnect(self) -> None:
         return None
@@ -307,11 +333,13 @@ async def test_restart_and_start_refuse_a_template_instance() -> None:
         await client.start(INSTANCE)
 
 
-async def test_a_run_that_fails_raises() -> None:
-    bus = FakeBus()
-    bus.run_ends = ("failed", "exit-code")
+async def test_a_run_that_fails_raises_and_resets_the_instance() -> None:
+    bus = fresh_instance()
+    bus.run_succeeds = False
     with pytest.raises(SystemdError, match="failed: failed, result 'exit-code'"):
         await connected(bus, {TEMPLATE}).run(INSTANCE, timeout=60)
+    assert ("StopUnit", [INSTANCE, "replace"]) in bus.calls
+    assert ("ResetFailedUnit", [INSTANCE]) in bus.calls
 
 
 async def test_a_run_that_never_finishes_raises() -> None:
@@ -340,3 +368,54 @@ async def test_run_refuses_an_instance_name_that_is_not_alphanumeric(named: str)
         await connected(FakeBus(), {TEMPLATE}).run(
             f"rootsofthevalley.org-pg_dump@{named}.service", timeout=60
         )
+
+
+def fresh_instance() -> FakeBus:
+    """A bus whose instance was never started: not loaded, every timestamp 0."""
+    bus = FakeBus()
+    bus._collected()
+    return bus
+
+
+async def test_a_dump_that_succeeds_is_seen_though_systemd_collects_finished_oneshots() -> None:
+    # Regression, RT #1633: the dump finished in 5s, the instance was
+    # collected, and `run` waited 300s for a timestamp that a fresh unit never
+    # has. With RemainAfterExit=yes a good run stays active (exited), and
+    # success is a newer ActiveEnterTimestamp.
+    bus = fresh_instance()
+    await connected(bus, {TEMPLATE}).run(INSTANCE, timeout=60)
+    # Stopped afterwards, so per-run instances do not pile up.
+    assert ("StopUnit", [INSTANCE, "replace"]) in bus.calls
+    assert ("ResetFailedUnit", [INSTANCE]) not in bus.calls
+
+
+async def test_a_good_dump_is_not_refused_because_it_could_not_be_stopped() -> None:
+    bus = fresh_instance()
+    bus.error_on = "StopUnit"
+    await connected(bus, {TEMPLATE}).run(INSTANCE, timeout=60)
+
+
+async def test_a_unit_without_remain_after_exit_times_out_and_says_why() -> None:
+    # The unit as v0.10.0 shipped it. Its success is indistinguishable from
+    # never having started, so it must time out, never pass, and the reason
+    # has to point at the fix.
+    bus = fresh_instance()
+    bus.remain_after_exit = False
+    with pytest.raises(SystemdError, match="RemainAfterExit=yes"):
+        await connected(bus, {TEMPLATE}).run(INSTANCE, timeout=60)
+
+
+async def test_an_instance_that_ends_inactive_and_stays_loaded_is_a_failure() -> None:
+    # Inactive with a newer InactiveEnterTimestamp: it ran and did not stay
+    # active, so whatever it did, it is not a run this program can call good.
+    bus = fresh_instance()
+    bus.comes_back = False
+    bus.run_stuck_at = "inactive"
+    bus.properties["InactiveEnterTimestamp"] = 0
+
+    async def ran(_seconds: float) -> None:
+        bus.properties["InactiveEnterTimestamp"] = 9_000_000
+
+    client = SystemdUnits(allowed_units={TEMPLATE}, bus=bus, sleep=ran)
+    with pytest.raises(SystemdError, match="did not stay active"):
+        await client.run(INSTANCE, timeout=60)
