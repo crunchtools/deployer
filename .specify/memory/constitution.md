@@ -78,7 +78,7 @@ trigger it. The boundary is about `deployer` never *choosing* a command, a
 mount or a flag, and it still cannot. It holds only while all of these hold:
 the template is static config installed by hand, never written by `deployer`;
 the only input `deployer` supplies is the instance name, which the systemd
-client itself refuses unless it is alphanumeric (a rollback tag suffix);
+client itself refuses unless it is alphanumeric (`<rollback tag suffix>t<ticket>`);
 `restart` and `start` refuse instances, and `run` refuses anything else; and
 `deployer` gains no create, start, run or exec verb of its own. The day a
 pre-deploy step needs an argument beyond the instance name, it needs a new

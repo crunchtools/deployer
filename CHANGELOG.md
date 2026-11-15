@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-15
+
 ### Added
 - `pre_deploy = { kind = "pg_dump", unit = "<row>-pg_dump@.service", timeout = 300 }`
   on a registry row: before the restart, the deployer starts the template instance
@@ -15,11 +17,16 @@ All notable changes to this project are documented here. The format follows
   installed unit's `TimeoutStartSec`. Dumps are per run and rotate only after a deploy
   holds, keeping every dump of the newest two releases; the ticket names the dump
   whether the deploy holds or rolls back. A failed step refuses the ticket before RT,
-  Nagios or `:latest` are touched. The systemd client gains `run`, which starts only instances of templates
-  the registry names; `restart` and `start` refuse them. Reference unit:
+  Nagios or `:latest` are touched. The systemd client gains `run`, which starts only
+  instances of templates the registry names; `restart` and `start` refuse them. Reference unit:
   `deploy/systemd/rootsofthevalley.org-pg_dump@.service` (dumps as `rotv`, checks the
   archive with `pg_restore -l`, `Requisite=` on the service). The repo constitution is
   amended to 0.5.0 to admit this and the conditions it holds under (crunchtools/rotv#897).
+
+### Changed
+- The deployer and release-follow reference units pin `deployer:0.10.0`. Both read the
+  registry, and a 0.9.x one refuses the whole registry once a row carries `pre_deploy`,
+  so both must run 0.10.0 before any row gains the key.
 
 ## [0.9.1] - 2026-11-12
 
