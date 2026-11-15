@@ -139,7 +139,7 @@ repo = "crunchtools/rotv"
 image = "quay.io/crunchtools/rotv"
 unit = "rootsofthevalley.org.service"
 nagios_host = "ctr-rootsofthevalley.org"
-requestors = ["scott"]
+requestors = ["scott", "follower"]
 probe = { kind = "http", url = "http://127.0.0.1:8082/api/health", expect_status = 200 }
 settle = 60
 # A RESTART HERE BOOTS POSTGRESQL AND RUNS EVERY MIGRATION BEFORE THE BACKEND
@@ -150,17 +150,19 @@ settle = 60
 # deploy. That is bug 5 of this program, and this is the service most likely
 # to repeat it.
 ready = 600
-# MANUAL, not auto, and this row had it wrong until 2026-11-08. The README's
-# own rule is that a service with database migrations is `rollback = "manual"`,
-# because old code against a new schema is worse than a failed deploy with the
-# downtime still open -- and the comment directly above says a restart here
-# runs every migration. ROTV's migrations are numbered and forward-only, so an
-# automatic rollback to the previous image would put the old backend on a
-# schema it has never seen, on the public site, unattended. A failure now
-# leaves the new code running and hands it to a person: `deployer rollback
-# rootsofthevalley.org` is the one command, and the rollback image stays on the
-# host.
-rollback = "manual"
+# AUTO since 2026-11-15 (crunchtools/rotv#897), and it was MANUAL until then
+# for a real reason: a restart runs every migration, and an image-only rollback
+# would have put the old backend on a schema it had never seen. Two things now
+# make that rollback safe. rotv's CI refuses a migration that the previous
+# release can't run against (backward-compatible migrations, expand and
+# contract; scripts/check-migrations.mjs, rotv#898). And `pre_deploy` below
+# takes a verified pg_dump before every restart, kept per run, so the database
+# from before a failed release's migrations is always on the host. A rollback is
+# therefore old code on a schema it can read, with the dump as the
+# disaster-recovery net. `deployer rollback rootsofthevalley.org` remains the
+# manual command. Dumps live in $DEPLOYER_STATE/dumps/rootsofthevalley.org.
+pre_deploy = { kind = "pg_dump", unit = "rootsofthevalley.org-pg_dump@.service" }
+rollback = "auto"
 
 [service."postiz.crunchtools.com"]
 repo = "crunchtools/postiz"

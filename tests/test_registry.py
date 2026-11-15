@@ -386,6 +386,7 @@ def test_the_shipped_registry_follows_exactly_the_reviewed_rows() -> None:
         "mcp-nagios",
         "mcp-cloudflare",
         "images.rootsofthevalley.org",
+        "rootsofthevalley.org",
         "postiz.crunchtools.com",
         "proxy.crunchtools.com",
     }
