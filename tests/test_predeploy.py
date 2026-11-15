@@ -174,3 +174,31 @@ def test_rotation_that_cannot_remove_a_file_does_not_raise(
 
 def test_rotation_with_no_dump_directory_does_nothing(tmp_path: Path) -> None:
     assert rotate_dumps(tmp_path, SERVICE) == 0
+
+
+async def test_a_unit_timeout_equal_to_the_wait_is_accepted(tmp_path: Path) -> None:
+    unit = FakeUnit(tmp_path, limit=TIMEOUT * 1_000_000)
+    await pre_deploy(unit, SERVICE, tmp_path, NAME, NOW)
+    assert len(unit.runs) == 1
+
+
+async def test_a_unit_whose_timeout_cannot_be_read_is_not_run(tmp_path: Path) -> None:
+    class Unreadable(FakeUnit):
+        async def property(self, unit: str, name: str, interface: str = "") -> Any:
+            raise SystemdError("reading TimeoutStartUSec failed")
+
+    unit = Unreadable(tmp_path)
+    with pytest.raises(PreDeployError, match="cannot read .*TimeoutStartSec"):
+        await pre_deploy(unit, SERVICE, tmp_path, NAME, NOW)
+    assert unit.runs == []
+
+
+def test_rotation_that_cannot_list_the_directory_does_not_raise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(self: Path, pattern: str) -> Any:
+        raise PermissionError(f"cannot list {self}")
+
+    dump_dir(tmp_path, SERVICE).mkdir(parents=True)
+    monkeypatch.setattr(Path, "glob", refuse)
+    assert rotate_dumps(tmp_path, SERVICE) == 0
