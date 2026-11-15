@@ -53,6 +53,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Any, Final, Protocol
 
 from .podman import ImageRef, PodmanError
@@ -167,6 +168,9 @@ class Staged:
     #: candidate is the registry's ``:latest`` (the fallback path). Without
     #: it a matching revision label is not enough to deploy.
     candidate_promoted: bool = False
+    #: The database dump taken just before the restart, when the registry row
+    #: has a ``pre_deploy`` step. A person rolling back by hand needs it.
+    dump: Path | None = None
 
     @property
     def proof(self) -> Proof:

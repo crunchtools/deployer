@@ -15,10 +15,13 @@ This is the one that puts them in order, and the order is the design:
    leaves two local tags and puts ``:latest`` back where it found it, so a
    ticket can still be refused afterwards without anything having changed about
    what a unit would start.
-4. **RT and Nagios are told before the restart.** If either is unreachable the
+4. **A pre-deploy step, where the registry names one, runs before anyone is
+   told anything.** A database dump that fails stops the deploy as a refusal,
+   with the old release still running and nothing else changed.
+5. **RT and Nagios are told before the restart.** If either is unreachable the
    run stops with the host untouched. After the restart their failures are
    reported but never undo a good deploy.
-5. **One rollback, then a person.** A rollback that does not come back cancels
+6. **One rollback, then a person.** A rollback that does not come back cancels
    its own maintenance window, because at that point Nagios saying so out loud
    is the only remaining fix path.
 
@@ -35,7 +38,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from math import ceil
 from pathlib import Path
 from typing import Any, Final, Protocol
@@ -46,6 +49,7 @@ from .attempts import ROLLBACK_LIMIT, AttemptLog
 from .hold import Hold, HoldStore, require_guard
 from .nagios import NagiosError
 from .podman import ImageRef, PodmanError
+from .predeploy import PreDeployError, pre_deploy, rotate_dumps
 from .registry import Registry, RegistryError, Service
 from .rollback import Restored, RollbackError, roll_back, rotate_rollback_tags
 from .rt import RtError, Ticket, TicketSaid
@@ -249,6 +253,11 @@ class UnitHost(Protocol):
     async def restart(self, unit: str) -> None:
         """Restart a unit and wait for the job. Raises if the unit is not one
         the client was told it may touch, or if systemd refuses the job."""
+        ...
+
+    async def run(self, instance: str, timeout: float) -> None:
+        """Start an instance of a registry template and wait for it to finish.
+        Raises unless it finished with result ``success`` within ``timeout``."""
         ...
 
     async def state(self, unit: str) -> UnitState:
@@ -469,9 +478,10 @@ class Runner:
             await unit_shape_ok(self.clients.systemd, service, running)
         except (StageError, SystemdError, PodmanError) as exc:
             return TicketResult(OUTCOME_REFUSED, f"t{ticket.id} would be refused: {exc}")
+        dump = f" after starting {service.pre_deploy.unit} for a dump" if service.pre_deploy else ""
         return TicketResult(
             OUTCOME_OK,
-            f"t{ticket.id} would deploy {service.name} {request.short_commit} to {service.unit}",
+            f"t{ticket.id} would deploy {service.name} {request.short_commit} to {service.unit}{dump}",
         )
 
     async def _already_live(
@@ -546,6 +556,18 @@ class Runner:
         ticket still queued, which is a much better outcome than a deploy
         nobody is told about.
         """
+        if service.pre_deploy is not None:
+            # Per run: a retry after a rollback has the same outgoing release,
+            # and must not overwrite the dump taken before the first attempt.
+            name = f"{staged.rollback_tag.rpartition(':rollback-')[2]}t{ticket.id}"
+            try:
+                dump = await pre_deploy(self.clients.systemd, service, self.state_dir, name, self.now())
+            except PreDeployError as exc:
+                why = f"{service.name} was not deployed because its pre-deploy step failed: {exc}"
+                await self._untag_candidate(staged)
+                return await self._refuse(ticket, why)
+            staged = replace(staged, dump=dump)
+
         minutes = _window_minutes(service)
         try:
             await self.clients.rt.set_fields(ticket.id, status="open")
@@ -576,6 +598,10 @@ class Runner:
         window = await self._close_window(service)
         untagged = await self._untag_candidate(staged)
         rotated, rotation = await self._rotate(service)
+        # Only here, once the deploy has held: a refusal or a rollback leaves
+        # every dump, so the one from before a failed attempt's migrations is
+        # still there for the retry and for a person.
+        dumps_removed = rotate_dumps(self.state_dir, service) if service.pre_deploy else 0
 
         cleared = self.holds.clear(service.unit)
         built = staged.candidate_revision or "no revision label"
@@ -588,6 +614,8 @@ class Runner:
             f"image {staged.candidate_image_id[:19]}), verified for {service.settle}s: the unit is "
             f"active, the container is running that exact image, and {_proof_phrase(service)}.\n"
             f"Rollback image kept as {staged.rollback_tag}."
+            + _dump_line(staged)
+            + (f" Removed {dumps_removed} dump file(s) from older releases." if dumps_removed else "")
             + (f"\nRemoved {len(rotated)} older rollback tag(s)." if rotated else "")
             + ("\nThe hold on this service is cleared; auto-update is no longer skipped." if cleared else "")
             + _as_notes((window, untagged, rotation)),
@@ -663,6 +691,7 @@ class Runner:
                     logs=logs,
                 )
             )
+            + _dump_line(staged)
             + _as_notes((window, untagged)),
         )
         await self._hand_back(ticket)
@@ -923,6 +952,11 @@ def _not_deployable_why(
         "carried). Only promoted images are deployed: file a ticket for the merge "
         "commit, or for the released commit, instead."
     )
+
+
+def _dump_line(staged: Staged) -> str:
+    """Where the pre-deploy dump is, for a ticket comment. Empty when none was taken."""
+    return f"\nDatabase dump from before the deploy kept at {staged.dump}." if staged.dump else ""
 
 
 def _as_notes(reasons: Iterable[str]) -> str:

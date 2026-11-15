@@ -1,0 +1,58 @@
+# rootsofthevalley.org-pg_dump@.service — the pre-deploy database dump.
+#
+# Named `<row>-<kind>@.service` because the registry requires exactly that
+# (constitution 0.5.0): a row can only start its own step.
+#
+# Started by the deployer, never by hand and never at boot: the registry row's
+#   pre_deploy = { kind = "pg_dump", unit = "rootsofthevalley.org-pg_dump@.service" }
+# makes it start `rootsofthevalley.org-pg_dump@<name>.service` before every
+# restart of rootsofthevalley.org and wait for it. <name> is the outgoing
+# release's rollback tag suffix, `t`, and the ticket number, so every run has
+# its own file and a retry after a rollback never overwrites the dump taken
+# before the first attempt's migrations. A failure here refuses the deploy with
+# the old release still running.
+#
+# THE CONTRACT is one path. The instance leaves a `pg_dump -Fc` archive at
+# /var/lib/deployer/dumps/rootsofthevalley.org/%i.dump. It is written to a
+# partial name, read back with `pg_restore -l` (so a truncated or header-only
+# archive fails here rather than passing the deployer's header check), and only
+# then renamed. The deployer checks the PGDMP header and a modification time
+# from this run, and rotates dumps only after a deploy holds.
+#
+# Dumped as `rotv`, the role that owns the application's objects, against
+# database `rotv`, both named rather than taken from the container's defaults.
+#
+# REQUISITE, NOT REQUIRES, AND ON PURPOSE. If rootsofthevalley.org is not
+# running, this unit fails at once instead of starting it. "No dump, no
+# deploy" applies to a service that is down: a crash-looping rotv gets a
+# person, not an unattended deploy with no safety net under it.
+#
+# WHY A HOST UNIT. The deployer cannot exec into a container, by design, and
+# PostgreSQL in this container listens only on its own loopback, so a network
+# dump would mean opening the database. This unit runs as root on the host,
+# where `podman exec` is ordinary, and what it runs is this reviewed file; the
+# only input from the deployer is %i, which its systemd client refuses unless it
+# is alphanumeric. pg_dump and pg_restore are the container's own, so they
+# match the server's major version. /usr/pgsql-17/bin because the image puts
+# neither on PATH.
+#
+# /var/lib/deployer/dumps inherits container_file_t from the state directory's
+# static fcontext, so the deployer container can read and rotate what this
+# writes. Root-only: UMask 0077 and a 0700 directory, because a dump is the
+# whole database, users and sessions included.
+
+[Unit]
+Description=Pre-deploy pg_dump of rootsofthevalley.org (%i)
+Documentation=https://github.com/crunchtools/deployer
+Requisite=rootsofthevalley.org.service
+After=rootsofthevalley.org.service
+
+[Service]
+Type=oneshot
+UMask=0077
+# Well past the ~10s a 91 MB dump takes, and equal to the registry's floor for
+# pre_deploy.timeout (240s). The deployer refuses to run this unit if this
+# exceeds the row's timeout, so systemd always ends a hung dump first.
+TimeoutStartSec=240
+ExecStartPre=/usr/bin/mkdir -p -m 0700 /var/lib/deployer/dumps/rootsofthevalley.org
+ExecStart=/bin/sh -c 'set -e; d=/var/lib/deployer/dumps/rootsofthevalley.org; p="$d/.%i.partial"; /usr/bin/podman exec rootsofthevalley.org /usr/pgsql-17/bin/pg_dump -Fc -U rotv -d rotv > "$p"; /usr/bin/podman exec -i rootsofthevalley.org /usr/pgsql-17/bin/pg_restore -l < "$p" > /dev/null; mv "$p" "$d/%i.dump"'

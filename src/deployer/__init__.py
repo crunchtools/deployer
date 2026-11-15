@@ -8,7 +8,8 @@ config.
 The capability boundary is the point of the design, so it is stated here as
 well as enforced in :mod:`deployer.podman`: this package can pull, inspect,
 tag, untag, remove and list images, and it can restart or start a unit named in
-the registry. It cannot create, start, run or exec a *container*. A process
+the registry, or run an instance of a registry row's pre-deploy template. It
+cannot create, start, run or exec a *container*. A process
 that cannot start a container cannot mount a live volume, and therefore cannot
 relabel one -- which is the class of mistake a deploy robot must not be able to
 make.

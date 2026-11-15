@@ -6,6 +6,21 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- `pre_deploy = { kind = "pg_dump", unit = "<row>-pg_dump@.service", timeout = 300 }`
+  on a registry row: before the restart, the deployer starts the template instance
+  `<rollback suffix>t<ticket>`, waits for it, and requires a fresh `pg_dump -Fc`
+  archive at `<state>/dumps/<service>/<name>.dump`. The unit name is fixed by the row
+  and the kind, `kind` is a closed set, and `timeout` may not be below 240s or the
+  installed unit's `TimeoutStartSec`. Dumps are per run and rotate only after a deploy
+  holds, keeping every dump of the newest two releases; the ticket names the dump
+  whether the deploy holds or rolls back. A failed step refuses the ticket before RT,
+  Nagios or `:latest` are touched. The systemd client gains `run`, which starts only instances of templates
+  the registry names; `restart` and `start` refuse them. Reference unit:
+  `deploy/systemd/rootsofthevalley.org-pg_dump@.service` (dumps as `rotv`, checks the
+  archive with `pg_restore -l`, `Requisite=` on the service). The repo constitution is
+  amended to 0.5.0 to admit this and the conditions it holds under (crunchtools/rotv#897).
+
 ## [0.9.1] - 2026-11-12
 
 ### Fixed

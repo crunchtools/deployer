@@ -20,6 +20,7 @@ to pass.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -33,7 +34,8 @@ from deployer.cli import EXIT_ERROR, EXIT_FOR_OUTCOME, EXIT_OK, EXIT_COULD_NOT_R
 from deployer.hold import Hold, HoldStore, MissingGuardError
 from deployer.nagios import NagiosError
 from deployer.podman import PodmanError, ImageRef
-from deployer.registry import Probe, Registry, Service
+from deployer.predeploy import PG_DUMP_MAGIC, dump_dir
+from deployer.registry import PreDeploy, Probe, Registry, Service
 from deployer.rollback import ROLLBACK_TAGS_KEPT
 from deployer.rt import RtError, Ticket
 from deployer.systemd import SystemdError
@@ -301,8 +303,17 @@ class FakeSystemd:
         #: that needs the world to change mid-deploy -- a container whose logs
         #: differ after the rollback, or a systemd that goes away during one.
         self.on_restart: Callable[[], None] = lambda: None
+        #: Where a pre-deploy unit writes, and whether it fails. Set by World.
+        self.state_dir: Path | None = None
+        self.runs: list[str] = []
+        self.run_fails = False
+        self.schema = "X"
+        #: What the restart saw had already happened, so a test can assert order.
+        self.events: list[str] = []
 
     async def property(self, unit: str, name: str, interface: str = "") -> Any:
+        if name == "TimeoutStartUSec":
+            return 240_000_000
         if name == "ExecStart":
             return [("/usr/bin/podman", ["podman", "run", "--name", "acquacotta", f"{IMAGE}:latest"], False)]
         if name == "ExecStartPre":
@@ -316,7 +327,23 @@ class FakeSystemd:
 
         return UnitState(name=unit, active_state=self.active, sub_state="running", result=self.result)
 
+    async def run(self, instance: str, timeout: float) -> None:
+        """The host's dump unit: writes a pg_dump archive where the deployer looks."""
+        self.runs.append(instance)
+        self.events.append("dump")
+        if self.run_fails:
+            raise SystemdError(f"{instance} failed: failed, result 'exit-code'")
+        assert self.state_dir is not None
+        directory = dump_dir(self.state_dir, SERVICE)
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{instance.split('@')[1].removesuffix('.service')}.dump"
+        # What the database held when this run dumped it, so a test can tell
+        # one run's dump from another's.
+        path.write_bytes(PG_DUMP_MAGIC + self.schema.encode())
+        os.utime(path, (NOW, NOW))
+
     async def restart(self, unit: str) -> None:
+        self.events.append("restart")
         self.restarts.append(unit)
         self.podman.running = self.podman.latest_points_at()
         # After the world has moved, so a hook can say what the restart really
@@ -333,11 +360,14 @@ class FakeNagios:
         self.cancelled: list[str] = []
         self.fail_open = False
         self.fail_cancel = False
+        #: Shared with FakeSystemd by World, so the order across both shows.
+        self.events: list[str] = []
 
     async def open_downtime(self, host: str, minutes: int, comment: str, service: str | None = None) -> None:
         if self.fail_open:
             raise NagiosError("cannot reach Nagios")
         self.opened.append((host, minutes, comment))
+        self.events.append("window")
 
     async def cancel_downtime(self, host: str, service: str | None = None) -> None:
         if self.fail_cancel:
@@ -352,7 +382,9 @@ class World:
         self.rt = FakeRt(*tickets)
         self.podman = FakePodman()
         self.systemd = FakeSystemd(self.podman)
+        self.systemd.state_dir = state
         self.nagios = FakeNagios()
+        self.nagios.events = self.systemd.events
         self.state = state
         self.holds = HoldStore(state)
         self.attempts = AttemptLog(state)
@@ -1400,3 +1432,115 @@ async def test_without_a_gated_tag_a_label_mismatch_still_waits(tmp_path: Path) 
     world.podman.candidate_revision = OTHER
     await world.drain()
     assert not world.systemd.restarts
+
+
+# ------------------------------------------------------------ pre-deploy dump
+
+DUMP_UNIT = "acquacotta-pg_dump@.service"
+DUMPING_REGISTRY = Registry(
+    {"acquacotta": replace(SERVICE, pre_deploy=PreDeploy(kind="pg_dump", unit=DUMP_UNIT))}
+)
+
+
+async def test_a_row_without_pre_deploy_runs_nothing(tmp_path: Path) -> None:
+    world = World(tmp_path, ticket())
+    await world.drain()
+    assert world.systemd.runs == []
+
+
+async def test_the_dump_is_taken_before_the_window_opens_and_named_like_the_rollback_tag(
+    tmp_path: Path,
+) -> None:
+    world = World(tmp_path, ticket(), registry=DUMPING_REGISTRY)
+    report = await world.drain()
+
+    assert report.outcome == OUTCOME_OK
+    assert world.systemd.events == ["dump", "window", "restart"]
+    rollback = next(ref for _, ref in world.podman.tagged if ":rollback-" in ref)
+    suffix = rollback.rpartition(":rollback-")[2]
+    assert world.systemd.runs == [f"acquacotta-pg_dump@{suffix}t1601.service"]
+    assert world.rt.said(
+        f"Database dump from before the deploy kept at {tmp_path}/dumps/acquacotta/{suffix}t1601.dump"
+    )
+
+
+async def test_a_failed_dump_refuses_the_deploy_and_touches_nothing_else(tmp_path: Path) -> None:
+    world = World(tmp_path, ticket(), registry=DUMPING_REGISTRY)
+    world.systemd.run_fails = True
+    report = await world.drain()
+
+    assert report.outcome == OUTCOME_REFUSED
+    assert world.systemd.restarts == []
+    assert world.nagios.opened == []
+    assert world.podman.latest_points_at() == OUTGOING_ID
+    assert "open" not in world.rt.status()
+    assert world.rt.said("pre-deploy step failed")
+    assert world.rt.said("exit-code")
+    # The candidate tag is dropped, and the refusal is not an attempt.
+    assert any(":candidate-" in ref for _, ref in world.podman.untagged)
+    assert not world.attempts.was_rolled_back("acquacotta", WANTED)
+
+
+async def test_a_rolled_back_deploy_says_where_the_dump_is(tmp_path: Path) -> None:
+    world = World(tmp_path, ticket(), registry=DUMPING_REGISTRY)
+    world.broken.add(CANDIDATE_ID)
+    report = await world.drain()
+    assert report.outcome == OUTCOME_ROLLED_BACK
+    assert world.rt.said("Database dump from before the deploy kept at")
+
+
+FIX = "ffffffff11112222333344445555666677778888"
+
+
+async def test_a_retry_after_a_rollback_keeps_the_pre_migration_dump(tmp_path: Path) -> None:
+    # X is live. A's deploy dumps X's data, migrates, fails and is rolled back:
+    # X's code now runs on A's schema. The retry, carrying the fix, has the same
+    # outgoing release, so its dump must not overwrite the first one, and
+    # neither the rollback nor the retry may rotate it away. The first dump is
+    # the only copy of the data from before A's migrations.
+    world = World(tmp_path, ticket(), registry=DUMPING_REGISTRY)
+    world.broken.add(CANDIDATE_ID)
+    assert (await world.drain()).outcome == OUTCOME_ROLLED_BACK
+    first = next(dump_dir(tmp_path, SERVICE).glob("*t1601.dump"))
+    assert first.read_bytes() == PG_DUMP_MAGIC + b"X"
+
+    # A's migrations ran; the retry is a new ticket for the fix.
+    world.systemd.schema = "X-on-A-schema"
+    world.broken.clear()
+    world.podman.candidate_revision = FIX
+    world.rt.tickets = {1602: ticket(ticket_id=1602, text=body(commit=FIX))}
+    assert (await world.drain()).outcome == OUTCOME_OK, world.rt.comments[-1]
+
+    second = next(dump_dir(tmp_path, SERVICE).glob("*t1602.dump"))
+    assert first.read_bytes() == PG_DUMP_MAGIC + b"X"
+    assert second.read_bytes() == PG_DUMP_MAGIC + b"X-on-A-schema"
+    assert first.name.partition("t")[0] == second.name.partition("t")[0]
+
+
+async def test_a_rollback_rotates_no_dumps(tmp_path: Path) -> None:
+    directory = dump_dir(tmp_path, SERVICE)
+    directory.mkdir(parents=True)
+    old = [directory / f"{release}t1.dump" for release in ("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc")]
+    for path in old:
+        path.write_bytes(PG_DUMP_MAGIC)
+        os.utime(path, (NOW - 3600, NOW - 3600))
+    world = World(tmp_path, ticket(), registry=DUMPING_REGISTRY)
+    world.broken.add(CANDIDATE_ID)
+    assert (await world.drain()).outcome == OUTCOME_ROLLED_BACK
+    assert all(path.exists() for path in old)
+
+
+async def test_a_deploy_that_holds_rotates_dumps_of_older_releases(tmp_path: Path) -> None:
+    directory = dump_dir(tmp_path, SERVICE)
+    directory.mkdir(parents=True)
+    old = [directory / f"{release}t1.dump" for release in ("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc")]
+    for age, path in enumerate(old, start=1):
+        path.write_bytes(PG_DUMP_MAGIC)
+        os.utime(path, (NOW - age * 3600, NOW - age * 3600))
+    world = World(tmp_path, ticket(), registry=DUMPING_REGISTRY)
+    assert (await world.drain()).outcome == OUTCOME_OK
+    # This run's dump and the newest older release survive.
+    assert old[0].exists()
+    assert not old[1].exists()
+    assert not old[2].exists()
+    assert world.rt.said("Removed 2 dump file(s) from older releases.")

@@ -452,8 +452,16 @@ async def _drain(
 
 
 def _units(registry: Registry) -> frozenset[str]:
-    """The units this process is allowed to touch: the registry's, and no others."""
-    return frozenset(registry.get(name).unit for name in registry.names)
+    """The units this process is allowed to touch: the registry's, and no others.
+
+    That includes each row's pre-deploy template, which ``run`` alone may start
+    an instance of.
+    """
+    services = [registry.get(name) for name in registry.names]
+    return frozenset(
+        [service.unit for service in services]
+        + [service.pre_deploy.unit for service in services if service.pre_deploy]
+    )
 
 
 @dataclass(frozen=True, slots=True)

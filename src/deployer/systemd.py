@@ -1,7 +1,8 @@
 """The systemd surface, scoped to the units this deployer is allowed to touch.
 
-Four operations: restart a unit, start a unit, read a unit's state, and read
-one property of a unit. Everything goes over D-Bus; there is no ``systemctl``
+Five operations: restart a unit, start a unit, run an instance of a
+template unit to completion, read a unit's state, and read one property of
+a unit. Everything goes over D-Bus; there is no ``systemctl``
 in the image.
 
 Two things are deliberately absent:
@@ -53,7 +54,7 @@ RESTART_POLL_SECONDS: Final = 1.0
 
 #: The whole surface. Checked by ``tests/test_systemd.py``.
 ALLOWED_OPERATIONS: Final = frozenset(
-    {"restart", "start", "state", "property", "hold_guard_installed", "close", "connect"}
+    {"restart", "start", "run", "state", "property", "hold_guard_installed", "close", "connect"}
 )
 
 
@@ -102,7 +103,8 @@ class SystemdUnits:
     ) -> None:
         """``allowed_units`` is the set ``restart`` and ``start`` will act on.
 
-        Anything outside it is refused. The registry supplies this, so the
+        Anything outside it is refused. A template in it (``name@.service``)
+        is what ``run`` may start an instance of, and only ``run``. The registry supplies this, so the
         client cannot widen its own scope; reads are not restricted, because
         reading tells this program nothing it should not know and the
         auto-update unit has to be readable for the hold guard check.
@@ -150,6 +152,18 @@ class SystemdUnits:
         if unit not in self._allowed:
             raise SystemdError(
                 f"refusing to {operation} {unit!r}: it is not a unit this deployer's registry names"
+            )
+
+    def _require_template_in_scope(self, instance: str) -> None:
+        """Refuse an instance of a template the registry does not name."""
+        prefix, at, rest = instance.partition("@")
+        named = rest.removesuffix(".service")
+        # Alphanumeric only: the instance name is the one input this program
+        # passes to a unit a person wrote, and `%i` lands in its command line.
+        if not at or not named.isalnum() or not named.isascii() or f"{prefix}@.service" not in self._allowed:
+            raise SystemdError(
+                f"refusing to run {instance!r}: it is not an instance of a template unit "
+                "this deployer's registry names"
             )
 
     def _connected_bus(self) -> Bus:
@@ -222,6 +236,43 @@ class SystemdUnits:
         """Start a unit named in the registry."""
         self._require_in_scope(unit, "start")
         await self._call("StartUnit", "ss", [unit, "replace"])
+
+    async def run(self, instance: str, timeout: float) -> None:
+        """Start an instance of a registry template, and WAIT for it to finish.
+
+        For a oneshot that does a job and exits, such as a pre-deploy database
+        dump. ``StartUnit`` returns once the job is queued, so this waits the
+        same way ``restart`` does and for the same reason: on a timestamp, not
+        on a state. ``InactiveEnterTimestamp`` moves when the run ends, whether
+        it ended well or not, so a value newer than the one read before the
+        start proves THIS run finished -- an instance that failed on an earlier
+        ticket is already ``failed`` before it is started again.
+
+        Raises unless it finished with result ``success`` within ``timeout``.
+        A step that cannot be told to have succeeded has not.
+        """
+        self._require_template_in_scope(instance)
+        before = await self._inactive_enter(instance)
+        await self._call("StartUnit", "ss", [instance, "replace"])
+
+        waited = 0.0
+        while True:
+            state = await self.state(instance)
+            if state.active_state in ("inactive", "failed") and await self._inactive_enter(instance) > before:
+                if state.result != "success" or state.active_state == "failed":
+                    raise SystemdError(f"{instance} failed: {state.active_state}, result {state.result!r}")
+                return
+            if waited >= timeout:
+                raise SystemdError(
+                    f"{instance} was still {state.active_state} {timeout:.0f}s after it was started"
+                )
+            await self._sleep(RESTART_POLL_SECONDS)
+            waited += RESTART_POLL_SECONDS
+
+    async def _inactive_enter(self, unit: str) -> int:
+        """``InactiveEnterTimestamp`` in microseconds, or 0 for a unit never stopped."""
+        value = await self.property(unit, "InactiveEnterTimestamp", UNIT_IFACE)
+        return int(value) if isinstance(value, int) else 0
 
     async def state(self, unit: str) -> UnitState:
         """Read a unit's active state, sub state and last result.
