@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-11-16
+
 ### Fixed
 - A `pre_deploy` unit whose start job ends without running (e.g. `result=dependency` when a
   `Requisite=` unit is down) now refuses at once, naming the job result, instead of waiting out
