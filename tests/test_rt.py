@@ -219,6 +219,18 @@ async def test_set_fields_capitalises_the_names_rt_expects() -> None:
     assert "Owner: developer1" in seen[0]
 
 
+async def test_set_fields_treats_an_empty_reply_as_a_no_op() -> None:
+    # An edit that changes nothing (already open, owned by someone else).
+    async with client(lambda request: httpx.Response(200, text="")) as rt:
+        await rt.set_fields(TICKET_ID, status="open")
+
+
+async def test_an_empty_reply_to_a_read_names_the_call() -> None:
+    async with client(lambda request: httpx.Response(200, text="")) as rt:
+        with pytest.raises(RtError, match=f"ticket/{TICKET_ID}"):
+            await rt.comment(TICKET_ID, "hello")
+
+
 # --- what has already been said ---
 
 

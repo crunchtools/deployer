@@ -255,6 +255,13 @@ round again two minutes later, and without this would restart a healthy service
 to arrive exactly where it already was. It also covers the case where something
 else — an auto-update, a person — put that image live first.
 
+## Retrying a refused ticket
+
+A refused ticket is stalled and owned by its filer. To retry it, set the owner
+to `Nobody` and the status to `new`; the next run picks it up as a fresh
+ticket. `release-follow` never refiles a commit it already filed, so reopening
+is the only route.
+
 ## Following releases
 
 Ashigaru cuts releases on its own, and nothing it runs may hold an RT

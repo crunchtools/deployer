@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- An RT edit that changes nothing (ticket already open, owned by someone else) no longer fails the run with an empty-reply error; an empty reply elsewhere now names the call.
+
+### Documented
+
+- README: how to retry a refused ticket (owner `Nobody`, status `new`).
+
 ## [0.10.1] - 2026-11-15
 
 ### Fixed

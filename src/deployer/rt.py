@@ -177,12 +177,13 @@ def _said_path(root: Path, ticket: int) -> Path:
     return root / "tickets" / safe_component(str(ticket), "ticket id")
 
 
-def _parse_status(text: str) -> None:
+def _parse_status(text: str, path: str = "") -> None:
     """Raise unless RT's status line says the call succeeded."""
     first = text.splitlines()[0] if text else ""
     match = _STATUS_RE.match(first)
     if not match:
-        raise RtError(f"RT did not answer with a status line: {first[:120]!r}")
+        where = f" to {path}" if path else ""
+        raise RtError(f"RT did not answer{where} with a status line: {first[:120]!r}")
     code = int(match.group(1))
     if code >= httpx.codes.BAD_REQUEST:
         raise RtError(f"RT returned {code}: {match.group(2) or first}")
@@ -238,7 +239,7 @@ class RtClient:
     async def close(self) -> None:
         await self._client.aclose()
 
-    async def _post(self, path: str, data: dict[str, str] | None = None) -> str:
+    async def _post(self, path: str, data: dict[str, str] | None = None, *, allow_empty: bool = False) -> str:
         form = dict(self._credentials)
         form.update(data or {})
         try:
@@ -247,7 +248,9 @@ class RtClient:
             raise RtError(f"cannot reach RT at {self._base}: {exc}") from None
         if response.status_code >= httpx.codes.BAD_REQUEST:
             raise RtError(f"RT returned HTTP {response.status_code} for {path}")
-        _parse_status(response.text)
+        if allow_empty and not response.text.strip():
+            return ""
+        _parse_status(response.text, path)
         return response.text
 
     async def _search(self, query: str) -> tuple[int, ...]:
@@ -359,7 +362,9 @@ class RtClient:
     async def set_fields(self, ticket_id: int, **fields: str) -> None:
         """Set ticket fields, e.g. ``status="resolved"`` or ``owner="developer1"``."""
         lines = "\n".join(f"{name.capitalize()}: {value}" for name, value in fields.items())
-        await self._post(f"ticket/{ticket_id}/edit", {"content": f"{lines}\n"})
+        # RT answers an edit that changes nothing (already open, same owner)
+        # with an empty body. That is success: the ticket is in the state asked.
+        await self._post(f"ticket/{ticket_id}/edit", {"content": f"{lines}\n"}, allow_empty=True)
 
 
 def _parse_created(value: str, zone: ZoneInfo, ticket_id: int) -> float:
