@@ -37,7 +37,7 @@ from deployer.podman import PodmanError, ImageRef
 from deployer.predeploy import PG_DUMP_MAGIC, dump_dir
 from deployer.registry import PreDeploy, Probe, Registry, Service
 from deployer.rollback import ROLLBACK_TAGS_KEPT
-from deployer.rt import RtError, Ticket
+from deployer.rt import RtClient, RtCredentials, RtError, Ticket
 from deployer.systemd import SystemdError
 from deployer.runner import (
     OUTCOMES,
@@ -154,6 +154,40 @@ class FakeRt:
 
     def status(self) -> list[str]:
         return [fields["status"] for _, fields in self.fields if "status" in fields]
+
+
+class RestEditsRt(FakeRt):
+    """FakeRt whose edits go through the real RtClient, to an RT edit form.
+
+    The transport answers the way RT's REST 1.0 does: a field already at the
+    value asked is skipped, and an edit that skips every field gets HTTP 200
+    with no body at all -- no status line (#57).
+    """
+
+    def __init__(self, *tickets: Ticket) -> None:
+        super().__init__(*tickets)
+        self.current = {item.id: {"status": item.status, "owner": item.owner} for item in tickets}
+        self.silent_edits = 0
+        creds = RtCredentials(base_url="http://rt.example", username="d", password="p", timezone="UTC")
+        self.client = RtClient(creds, client=httpx.AsyncClient(transport=httpx.MockTransport(self._edit)))
+
+    def _edit(self, request: httpx.Request) -> httpx.Response:
+        ticket_id = int(request.url.path.split("/")[-2])
+        content = httpx.QueryParams(request.content.decode())["content"]
+        changed = False
+        for line in content.splitlines():
+            name, _, value = line.partition(": ")
+            if self.current[ticket_id].get(name.lower()) != value:
+                self.current[ticket_id][name.lower()] = value
+                changed = True
+        if not changed:
+            self.silent_edits += 1
+            return httpx.Response(200, text="")
+        return httpx.Response(200, text=f"RT/6.0.2 200 Ok\n\n# Ticket {ticket_id} updated.\n")
+
+    async def set_fields(self, ticket_id: int, **fields: str) -> None:
+        await self.client.set_fields(ticket_id, **fields)
+        self.fields.append((ticket_id, dict(fields)))
 
 
 class FakePodman:
@@ -780,6 +814,22 @@ async def test_an_unreachable_rt_before_the_restart_leaves_the_host_alone(tmp_pa
     assert world.systemd.restarts == []
     assert world.podman.latest_points_at() == OUTGOING_ID
     assert not world.holds.held(UNIT)
+
+
+async def test_a_retried_ticket_already_open_and_owned_still_deploys(tmp_path: Path) -> None:
+    # #57: a person retried a refused ticket by setting it back to `open`, with
+    # the owner still theirs. Opening it for the deploy then changes nothing,
+    # RT answers that with an empty body, and the run must go on, not end as
+    # "could not run".
+    retried = replace(ticket(), status="open", owner="developer1")
+    world = World(tmp_path, retried)
+    world.rt = RestEditsRt(retried)
+    world.runner.clients = replace(world.runner.clients, rt=world.rt)
+    report = await world.drain()
+    assert report.outcome == OUTCOME_OK
+    assert world.rt.silent_edits == 1
+    assert world.systemd.restarts == [UNIT]
+    assert world.rt.status() == ["open", "resolved"]
 
 
 async def test_an_unreachable_nagios_before_the_restart_leaves_the_host_alone(tmp_path: Path) -> None:
