@@ -235,6 +235,16 @@ async def test_an_edit_rt_refuses_still_raises() -> None:
             await rt.set_fields(TICKET_ID, owner="nobody-real")
 
 
+async def test_silence_is_only_success_with_a_200() -> None:
+    # An empty redirect that was not followed is not RT saying "nothing to do".
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(304, text="")
+
+    async with client(handler) as rt:
+        with pytest.raises(RtError, match="status line"):
+            await rt.set_fields(TICKET_ID, status="open")
+
+
 async def test_silence_is_only_success_for_an_edit() -> None:
     # A `show` that comes back empty is RT being wrong, not RT agreeing.
     async with client(answering("")) as rt:

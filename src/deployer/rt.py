@@ -255,7 +255,9 @@ class RtClient:
             raise RtError(f"cannot reach RT at {self._base}: {exc}") from None
         if response.status_code >= httpx.codes.BAD_REQUEST:
             raise RtError(f"RT returned HTTP {response.status_code} for {path}")
-        if silence_ok and not response.text.strip():
+        # Exactly 200: that is the status RT's silence stands for, and an empty
+        # redirect or 204 is something else answering, not RT agreeing.
+        if silence_ok and response.status_code == httpx.codes.OK and not response.text.strip():
             return ""
         _parse_status(response.text)
         return response.text
