@@ -10,6 +10,10 @@ All notable changes to this project are documented here. The format follows
 - A `pre_deploy` unit whose start job ends without running (e.g. `result=dependency` when a
   `Requisite=` unit is down) now refuses at once, naming the job result, instead of waiting out
   the timeout; the timeout message no longer blames only a missing `RemainAfterExit=yes`.
+- Retrying a refused ticket by setting it back to `open` no longer fails the run as
+  "RT did not answer with a status line" (#57). RT answers an edit that changes
+  nothing with HTTP 200 and an empty body; `set_fields` now takes that as success.
+  Other calls still require the status line. The README documents the retry.
 - `--dry-run` now loads a row's `pre_deploy` unit and applies the real run's
   `TimeoutStartSec` check, reporting a missing, over-long or infinite unit as a refusal.
 

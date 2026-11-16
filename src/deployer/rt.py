@@ -238,7 +238,15 @@ class RtClient:
     async def close(self) -> None:
         await self._client.aclose()
 
-    async def _post(self, path: str, data: dict[str, str] | None = None) -> str:
+    async def _post(self, path: str, data: dict[str, str] | None = None, *, silence_ok: bool = False) -> str:
+        """POST to REST 1.0 and check RT's status line.
+
+        ``silence_ok`` accepts an empty body as success. RT writes no status
+        line at all when a call succeeds with nothing to say (``dhandler``:
+        ``$m->out(...) if ($output || $status !~ /^200/)``), and an edit that
+        changes nothing is exactly that. Only edits pass it: a ``show`` or a
+        search that comes back empty is RT being wrong, not RT agreeing.
+        """
         form = dict(self._credentials)
         form.update(data or {})
         try:
@@ -247,6 +255,8 @@ class RtClient:
             raise RtError(f"cannot reach RT at {self._base}: {exc}") from None
         if response.status_code >= httpx.codes.BAD_REQUEST:
             raise RtError(f"RT returned HTTP {response.status_code} for {path}")
+        if silence_ok and not response.text.strip():
+            return ""
         _parse_status(response.text)
         return response.text
 
@@ -357,9 +367,17 @@ class RtClient:
         await self._post(f"ticket/{ticket_id}/comment", {"content": body})
 
     async def set_fields(self, ticket_id: int, **fields: str) -> None:
-        """Set ticket fields, e.g. ``status="resolved"`` or ``owner="developer1"``."""
+        """Set ticket fields, e.g. ``status="resolved"`` or ``owner="developer1"``.
+
+        Setting a field to the value it already has is success. RT skips such a
+        field and, when every field was skipped, answers 200 with an empty body
+        rather than a status line. A person retrying a refused ticket by setting
+        it back to ``open`` gets exactly that when the deploy opens it, and it
+        must not read as RT being unreachable (#57). A field RT refuses still
+        raises: that answer carries a status line and a 4xx code.
+        """
         lines = "\n".join(f"{name.capitalize()}: {value}" for name, value in fields.items())
-        await self._post(f"ticket/{ticket_id}/edit", {"content": f"{lines}\n"})
+        await self._post(f"ticket/{ticket_id}/edit", {"content": f"{lines}\n"}, silence_ok=True)
 
 
 def _parse_created(value: str, zone: ZoneInfo, ticket_id: int) -> float:

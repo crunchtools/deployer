@@ -219,6 +219,29 @@ async def test_set_fields_capitalises_the_names_rt_expects() -> None:
     assert "Owner: developer1" in seen[0]
 
 
+async def test_an_edit_that_changes_nothing_is_success() -> None:
+    # RT skips a field already at that value and, with nothing left to say,
+    # answers 200 with no body at all -- no status line. Retrying a refused
+    # ticket by setting it back to `open` hits this when the deploy opens it,
+    # and RT #1633's retry failed the run as "RT did not answer" (#57).
+    async with client(answering("")) as rt:
+        await rt.set_fields(TICKET_ID, status="open")
+
+
+async def test_an_edit_rt_refuses_still_raises() -> None:
+    refused = "RT/6.0.2 409 Syntax Error\n\n# owner: That user does not exist\n"
+    async with client(answering(refused)) as rt:
+        with pytest.raises(RtError, match="409"):
+            await rt.set_fields(TICKET_ID, owner="nobody-real")
+
+
+async def test_silence_is_only_success_for_an_edit() -> None:
+    # A `show` that comes back empty is RT being wrong, not RT agreeing.
+    async with client(answering("")) as rt:
+        with pytest.raises(RtError, match="status line"):
+            await rt.ticket(TICKET_ID)
+
+
 # --- what has already been said ---
 
 

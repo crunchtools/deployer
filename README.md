@@ -244,6 +244,29 @@ exiting 0 with a service held would report success for a state nobody has dealt
 with. The wake-up that costs is one per failure, not one per idle minute, which
 is the shape the whole design is built around.
 
+## Retrying a refused ticket
+
+A refusal stalls the ticket, and the queue only reads `new` and `open`, so a
+refused ticket waits for a person. When the cause was outside the ticket — a
+pre-deploy dump that failed, a unit fixed since, an image promoted after the
+build deadline — retry the same ticket:
+
+1. Fix the cause first. A refusal is not an attempt, so nothing counts against
+   the revision, but a retry into the same fault is refused the same way.
+2. Set the ticket's `Status` to `new` and its `Owner` to `Nobody`. `open` works
+   too; the deployer does not read the owner, `Nobody` just says nobody is on it.
+3. The next run, within two minutes, takes it as if it had just been filed.
+
+What a retry cannot change is the request. The body is read from the ticket's
+first attachment, so editing it or commenting does nothing: a wrong `service`,
+`repo` or `commit` needs a new ticket. Neither can a retry bring back a revision
+that was rolled back on that service; it is refused again, and the fix is a new
+commit on a new ticket.
+
+Refused again for the *same* reason, the ticket stalls without a second
+comment — what has been said is not said twice. Read the existing comment, not
+the absence of a new one.
+
 ## Deploying twice is not deploying twice
 
 If the container is already running the commit the ticket names, nothing is
