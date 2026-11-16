@@ -39,6 +39,12 @@ __all__ = ["AUTO_UPDATE_UNIT", "Bus", "SystemdError", "SystemdUnits", "UnitState
 SYSTEMD_BUS: Final = "org.freedesktop.systemd1"
 SYSTEMD_PATH: Final = "/org/freedesktop/systemd1"
 MANAGER_IFACE: Final = "org.freedesktop.systemd1.Manager"
+DBUS_DAEMON: Final = "org.freedesktop.DBus"
+#: The one signal ``run`` listens for: the end of a job, with its result.
+JOB_REMOVED_MATCH: Final = (
+    f"type='signal',sender='{SYSTEMD_BUS}',path='{SYSTEMD_PATH}',"
+    f"interface='{MANAGER_IFACE}',member='JobRemoved'"
+)
 UNIT_IFACE: Final = "org.freedesktop.systemd1.Unit"
 SERVICE_IFACE: Final = "org.freedesktop.systemd1.Service"
 PROPS_IFACE: Final = "org.freedesktop.DBus.Properties"
@@ -51,6 +57,9 @@ AUTO_UPDATE_UNIT: Final = "podman-auto-update.service"
 #: unit's own TimeoutStartSec is usually longer than this.
 RESTART_TIMEOUT_SECONDS: Final = 120.0
 RESTART_POLL_SECONDS: Final = 1.0
+
+#: JobRemoved's body: id, job path, unit, result.
+JOB_REMOVED_FIELDS: Final = 4
 
 #: The whole surface. Checked by ``tests/test_systemd.py``.
 ALLOWED_OPERATIONS: Final = frozenset(
@@ -67,6 +76,8 @@ class Bus(Protocol):
     """
 
     async def call(self, msg: Any) -> Any: ...
+    def add_message_handler(self, handler: Callable[[Any], Any]) -> None: ...
+    def remove_message_handler(self, handler: Callable[[Any], Any]) -> None: ...
     def disconnect(self) -> None: ...
 
 
@@ -256,7 +267,11 @@ class SystemdUnits:
         * failure is ``failed`` (systemd keeps a failed unit loaded) or
           ``inactive``, either with a newer ``InactiveEnterTimestamp``. An
           instance that failed on an earlier ticket is ``failed`` before it is
-          started again, and must not be read as this run.
+          started again, and must not be read as this run;
+        * failure, at once, is a start job that systemd's ``JobRemoved``
+          signal reports ended with anything but ``done``. A Requisite= unit
+          that is down ends the job ``dependency`` and leaves the instance
+          untouched, so only the job knows (#56).
 
         Either way the instance is then stopped, and reset if it failed, so
         per-run instances do not pile up. A cleanup error never changes the
@@ -265,16 +280,56 @@ class SystemdUnits:
         self._require_template_in_scope(instance)
         active_before = await self._active_enter(instance)
         inactive_before = await self._inactive_enter(instance)
-        await self._call("StartUnit", "ss", [instance, "replace"])
 
+        # Job path -> result, from JobRemoved. The handler returns None: a
+        # handler that answered truthy would claim the signal from the bus.
+        ended: dict[str, str] = {}
+
+        def job_removed(message: Any) -> None:
+            body = getattr(message, "body", None)
+            if (
+                message.message_type == MessageType.SIGNAL
+                and message.interface == MANAGER_IFACE
+                and message.member == "JobRemoved"
+                and isinstance(body, list)
+                and len(body) == JOB_REMOVED_FIELDS
+                and body[2] == instance
+            ):
+                ended[str(body[1])] = str(body[3])
+
+        await self._watch_jobs(job_removed)
+        try:
+            reply = await self._call("StartUnit", "ss", [instance, "replace"])
+            job = str(reply.body[0]) if reply.body else ""
+            await self._await_finish(instance, job, ended, (active_before, inactive_before), timeout)
+        finally:
+            await self._unwatch_jobs(job_removed)
+
+    async def _await_finish(
+        self, instance: str, job: str, ended: dict[str, str], before: tuple[int, int], timeout: float
+    ) -> None:
+        """Poll until the run is decided; see :meth:`run` for what decides it.
+
+        A start job that ends with anything but ``done`` is a failure at once,
+        named by its result. ``dependency`` is the one that matters: a
+        Requisite= unit that is down fails the job without the instance ever
+        changing state, so no timestamp can say so (#56). ``done`` proves only
+        that the job ran; success is still the unit's own active timestamp.
+        """
+        active_before, inactive_before = before
         waited = 0.0
         while True:
+            result = ended.get(job)
+            if result is not None and result != "done":
+                await self._discard(instance, failed=True)
+                why = ": a unit it is Requisite= on is not running" if result == "dependency" else ""
+                raise SystemdError(f"{instance}'s start job ended {result!r}{why}")
             state = await self.state(instance)
             if state.active_state == "active" and await self._active_enter(instance) > active_before:
                 await self._discard(instance, failed=False)
                 return
-            ended = state.active_state in ("failed", "inactive")
-            if ended and await self._inactive_enter(instance) > inactive_before:
+            finished = state.active_state in ("failed", "inactive")
+            if finished and await self._inactive_enter(instance) > inactive_before:
                 await self._discard(instance, failed=True)
                 if state.active_state == "failed":
                     raise SystemdError(f"{instance} failed: failed, result {state.result!r}")
@@ -284,12 +339,53 @@ class SystemdUnits:
                 )
             if waited >= timeout:
                 raise SystemdError(
-                    f"{instance} was still {state.active_state} {timeout:.0f}s after it was started. "
-                    "If it ran and succeeded, it lacks RemainAfterExit=yes: systemd collected it, "
-                    "and a collected unit cannot be told from one that never ran"
+                    f"{instance} was still {state.active_state} {timeout:.0f}s after it was started, "
+                    "and no job result arrived to say why. Either its start job never ran (a "
+                    "Requisite= unit that is down, say), or it ran and succeeded and lacks "
+                    "RemainAfterExit=yes, so systemd collected it: a collected unit cannot be told "
+                    "from one that never ran"
                 )
             await self._sleep(RESTART_POLL_SECONDS)
             waited += RESTART_POLL_SECONDS
+
+    async def _watch_jobs(self, handler: Callable[[Any], Any]) -> None:
+        """Listen for JobRemoved. Best-effort: without it, a failure is slower.
+
+        The match rule tells the bus daemon to route the signal here, and
+        ``Subscribe`` tells systemd to emit it at all. Either can fail --
+        systemd answers a second ``Subscribe`` on one connection with an
+        error -- and none of that may stop a run: success is proved by the
+        unit's timestamps, not by the signal.
+        """
+        await self.connect()
+        self._connected_bus().add_message_handler(handler)
+        await self._daemon("AddMatch", JOB_REMOVED_MATCH)
+        try:
+            await self._call("Subscribe")
+        except SystemdError:
+            return
+
+    async def _unwatch_jobs(self, handler: Callable[[Any], Any]) -> None:
+        if self._bus is None:
+            return
+        self._bus.remove_message_handler(handler)
+        await self._daemon("RemoveMatch", JOB_REMOVED_MATCH)
+
+    async def _daemon(self, member: str, rule: str) -> None:
+        """Add or remove a match rule on the bus daemon. Never raises."""
+        try:
+            await self._connected_bus().call(
+                Message(
+                    destination=DBUS_DAEMON,
+                    path="/org/freedesktop/DBus",
+                    interface=DBUS_DAEMON,
+                    member=member,
+                    signature="s",
+                    body=[rule],
+                )
+            )
+        except (SystemdError, OSError):
+            return
 
     async def _discard(self, instance: str, failed: bool) -> None:
         """Stop a finished instance, and reset it if it failed. Never raises.

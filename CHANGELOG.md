@@ -7,6 +7,15 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- A pre-deploy unit whose start job fails before the unit changes state (a
+  `Requisite=` unit that is down ends it `dependency`) is refused within one poll,
+  naming the job result, instead of after the whole timeout with advice to add
+  `RemainAfterExit=yes`. `run` listens for systemd's `JobRemoved` signal for its own
+  start job and fails on any result but `done`; success is still proved by the
+  unit's own timestamps, and a bus that delivers no signal falls back to them. The
+  timeout message names both causes (#56).
+
+### Fixed
 - `--dry-run` now loads a row's `pre_deploy` unit and applies the real run's
   `TimeoutStartSec` check, reporting a missing, over-long or infinite unit as a refusal.
 

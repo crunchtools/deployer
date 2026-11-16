@@ -135,6 +135,16 @@ class FakeBus:
         self.run_succeeds = True
         self.remain_after_exit = True
         self.run_stuck_at = "activating"
+        #: The start job's result, as systemd's JobRemoved signal reports it.
+        #: `dependency` is a Requisite= unit that is down: the job ends at once
+        #: and the instance itself never changes state. None sends no signal at
+        #: all, the way a bus that refused the match rule would behave.
+        self.job_result: str | None = "done"
+        self.handlers: list[Any] = []
+        #: The match rules added and removed on the bus daemon, in order.
+        self.matches: list[tuple[str, str]] = []
+        #: JobRemoved signals for other units and jobs, sent before ours.
+        self.noise: list[Any] = []
 
     async def call(self, message: Any) -> Any:
         self.calls.append((message.member, list(message.body)))
@@ -142,28 +152,33 @@ class FakeBus:
             return None
         if self._error or message.member == self.error_on:
             return SimpleNamespace(message_type=MessageType.ERROR, body=["boom"])
-        # LoadUnit must answer with a valid object path: dbus-fast validates it
-        # when the next Message is built, so a stub value fails there instead
-        # of in the code under test.
-        if message.member == "LoadUnit":
-            body: list[Any] = ["/org/freedesktop/systemd1/unit/stub"]
-        elif message.member == "Get":
-            _interface, name = message.body
-            body = [self.properties.get(name, self._reply)]
+        member, args = message.member, list(message.body)
+        if member in ("AddMatch", "RemoveMatch", "Subscribe"):
+            self.matches += [(member, args[0])] if args else []
+            body: list[Any] = []
+        elif member == "StartUnit" and "@" in args[0]:
+            self._start_job(args[0])
+            body = [JOB]
+        elif member == "LoadUnit":
+            # A valid object path: dbus-fast validates it when the next
+            # Message is built, so a stub value fails there instead of in the
+            # code under test.
+            body = ["/org/freedesktop/systemd1/unit/stub"]
+        elif member == "Get":
+            body = [self.properties.get(args[1], self._reply)]
         else:
-            if message.member == "StartUnit" and "@" in message.body[0]:
-                self._oneshot_ran()
-            elif message.member in ("StopUnit", "ResetFailedUnit") and "@" in message.body[0]:
+            if member in ("StopUnit", "ResetFailedUnit") and "@" in args[0]:
                 # Stopped or reset, the instance is inactive and systemd
                 # collects it at once.
                 self._collected()
-            elif message.member == "RestartUnit" and self.comes_back:
+            elif member == "RestartUnit" and self.comes_back:
                 # What systemd does once the job has actually run.
                 self.properties["ActiveState"] = self.ends
                 self.properties["ActiveEnterTimestamp"] += 5_000_000
-                if self.ends == "failed":
-                    self.properties["Result"] = "exit-code"
-            elif message.member == "RestartUnit":
+                self.properties["Result"] = (
+                    "exit-code" if self.ends == "failed" else self.properties["Result"]
+                )
+            elif member == "RestartUnit":
                 # The job was queued and nothing has happened yet. By default
                 # the old instance is stopping, which is the state a real
                 # deploy read and called a failure.
@@ -191,6 +206,35 @@ class FakeBus:
             self.properties["ActiveEnterTimestamp"] += 5_000_000
         else:
             self._collected()
+
+    def _start_job(self, unit: str) -> None:
+        """Run the start job, then announce its end to whoever is listening.
+
+        A job that ends `done` runs the unit; any other result -- `dependency`
+        for a Requisite= unit that is down -- leaves the unit exactly as it was,
+        and only the signal says so.
+        """
+        if self.job_result in ("done", None):
+            self._oneshot_ran()
+        if self.job_result is None:
+            return
+        signal = SimpleNamespace(
+            message_type=MessageType.SIGNAL,
+            path="/org/freedesktop/systemd1",
+            interface="org.freedesktop.systemd1.Manager",
+            member="JobRemoved",
+            body=[42, JOB, unit, self.job_result],
+        )
+        for message in [*self.noise, signal]:
+            for handler in list(self.handlers):
+                # A handler that claimed a signal would hide it from the bus.
+                assert not handler(message)
+
+    def add_message_handler(self, handler: Any) -> None:
+        self.handlers.append(handler)
+
+    def remove_message_handler(self, handler: Any) -> None:
+        self.handlers.remove(handler)
 
     def _collected(self) -> None:
         """What LoadUnit returns for an instance systemd has garbage-collected."""
@@ -301,6 +345,7 @@ async def test_hold_guard_reads_the_exec_condition() -> None:
 
 
 TEMPLATE = "rootsofthevalley.org-pg_dump@.service"
+JOB = "/org/freedesktop/systemd1/job/42"
 INSTANCE = "rootsofthevalley.org-pg_dump@0123456789ab.service"
 
 
@@ -419,3 +464,82 @@ async def test_an_instance_that_ends_inactive_and_stays_loaded_is_a_failure() ->
     client = SystemdUnits(allowed_units={TEMPLATE}, bus=bus, sleep=ran)
     with pytest.raises(SystemdError, match="did not stay active"):
         await client.run(INSTANCE, timeout=60)
+
+
+class CountingSleep:
+    """A sleep that does not, and counts how often it was asked to."""
+
+    def __init__(self) -> None:
+        self.polls = 0
+
+    async def __call__(self, _seconds: float) -> None:
+        self.polls += 1
+
+
+async def test_a_start_job_that_ends_dependency_fails_fast_and_names_it() -> None:
+    # crunchtools/deployer#56. Requisite=rootsofthevalley.org.service with
+    # rotv down: the start job ends `dependency` and the instance never
+    # changes state, so its timestamps can never answer. Only the job's
+    # result knows, and waiting the whole timeout to then blame
+    # RemainAfterExit sends a person after the wrong fix.
+    bus = fresh_instance()
+    bus.job_result = "dependency"
+    sleep = CountingSleep()
+    client = SystemdUnits(allowed_units={TEMPLATE}, bus=bus, sleep=sleep)
+    with pytest.raises(SystemdError, match="start job ended 'dependency'"):
+        await client.run(INSTANCE, timeout=300)
+    assert sleep.polls <= 1
+
+
+@pytest.mark.parametrize("result", ["failed", "canceled", "timeout", "skipped"])
+async def test_any_start_job_result_but_done_is_a_failure(result: str) -> None:
+    bus = fresh_instance()
+    bus.job_result = result
+    with pytest.raises(SystemdError, match=f"start job ended {result!r}"):
+        await connected(bus, {TEMPLATE}).run(INSTANCE, timeout=60)
+
+
+async def test_the_job_watch_is_taken_down_after_the_run() -> None:
+    bus = fresh_instance()
+    await connected(bus, {TEMPLATE}).run(INSTANCE, timeout=60)
+    assert bus.handlers == []
+    assert [member for member, _rule in bus.matches] == ["AddMatch", "RemoveMatch"]
+    assert "member='JobRemoved'" in bus.matches[0][1]
+
+
+async def test_a_bus_that_sends_no_signal_still_sees_a_good_run() -> None:
+    # The signal makes failure fast; it is not what proves success. A bus
+    # that delivers nothing falls back to the unit's own timestamps.
+    bus = fresh_instance()
+    bus.job_result = None
+    await connected(bus, {TEMPLATE}).run(INSTANCE, timeout=60)
+
+
+async def test_a_signal_for_another_unit_or_job_is_ignored() -> None:
+    bus = fresh_instance()
+    bus.noise = [
+        SimpleNamespace(
+            message_type=MessageType.SIGNAL,
+            path="/org/freedesktop/systemd1",
+            interface="org.freedesktop.systemd1.Manager",
+            member="JobRemoved",
+            body=[7, "/org/freedesktop/systemd1/job/7", "other@x.service", "dependency"],
+        ),
+        # Ours by unit, but an older job: its result is not this run's.
+        SimpleNamespace(
+            message_type=MessageType.SIGNAL,
+            path="/org/freedesktop/systemd1",
+            interface="org.freedesktop.systemd1.Manager",
+            member="JobRemoved",
+            body=[8, "/org/freedesktop/systemd1/job/8", INSTANCE, "dependency"],
+        ),
+    ]
+    await connected(bus, {TEMPLATE}).run(INSTANCE, timeout=60)
+
+
+async def test_the_timeout_names_both_reasons_a_unit_can_go_unseen() -> None:
+    bus = fresh_instance()
+    bus.remain_after_exit = False
+    bus.job_result = None
+    with pytest.raises(SystemdError, match="start job never ran.*Requisite=.*RemainAfterExit=yes"):
+        await connected(bus, {TEMPLATE}).run(INSTANCE, timeout=60)
