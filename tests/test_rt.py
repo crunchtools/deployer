@@ -111,7 +111,7 @@ async def test_an_rt_error_status_is_an_rt_error() -> None:
 async def test_an_answer_with_no_status_line_is_refused() -> None:
     # RT behind a misconfigured proxy answers 200 with an HTML login page.
     async with client(answering("<html>please log in</html>")) as rt:
-        with pytest.raises(RtError, match="did not answer with a status line"):
+        with pytest.raises(RtError, match="did not answer.*with a status line"):
             await rt.ticket(TICKET_ID)
 
 
@@ -243,6 +243,12 @@ async def test_silence_is_only_success_with_a_200() -> None:
     async with client(handler) as rt:
         with pytest.raises(RtError, match="status line"):
             await rt.set_fields(TICKET_ID, status="open")
+
+
+async def test_an_empty_reply_to_a_read_names_the_call() -> None:
+    async with client(lambda request: httpx.Response(200, text="")) as rt:
+        with pytest.raises(RtError, match=f"ticket/{TICKET_ID}"):
+            await rt.comment(TICKET_ID, "hello")
 
 
 async def test_silence_is_only_success_for_an_edit() -> None:

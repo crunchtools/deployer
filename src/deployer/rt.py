@@ -177,12 +177,17 @@ def _said_path(root: Path, ticket: int) -> Path:
     return root / "tickets" / safe_component(str(ticket), "ticket id")
 
 
-def _parse_status(text: str) -> None:
-    """Raise unless RT's status line says the call succeeded."""
+def _parse_status(text: str, path: str = "") -> None:
+    """Raise unless RT's status line says the call succeeded.
+
+    ``path`` names the call in the message: "did not answer" alone left #57's
+    run log silent on which of a ticket's several calls RT had not answered.
+    """
     first = text.splitlines()[0] if text else ""
     match = _STATUS_RE.match(first)
     if not match:
-        raise RtError(f"RT did not answer with a status line: {first[:120]!r}")
+        where = f" to {path}" if path else ""
+        raise RtError(f"RT did not answer{where} with a status line: {first[:120]!r}")
     code = int(match.group(1))
     if code >= httpx.codes.BAD_REQUEST:
         raise RtError(f"RT returned {code}: {match.group(2) or first}")
@@ -259,7 +264,7 @@ class RtClient:
         # redirect or 204 is something else answering, not RT agreeing.
         if silence_ok and response.status_code == httpx.codes.OK and not response.text.strip():
             return ""
-        _parse_status(response.text)
+        _parse_status(response.text, path)
         return response.text
 
     async def _search(self, query: str) -> tuple[int, ...]:
