@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- `--dry-run` now loads a row's `pre_deploy` unit and applies the real run's
+  `TimeoutStartSec` check, reporting a missing, over-long or infinite unit as a refusal.
+
 ## [0.10.1] - 2026-11-15
 
 ### Fixed
