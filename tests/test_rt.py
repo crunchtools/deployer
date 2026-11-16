@@ -111,7 +111,7 @@ async def test_an_rt_error_status_is_an_rt_error() -> None:
 async def test_an_answer_with_no_status_line_is_refused() -> None:
     # RT behind a misconfigured proxy answers 200 with an HTML login page.
     async with client(answering("<html>please log in</html>")) as rt:
-        with pytest.raises(RtError, match="did not answer with a status line"):
+        with pytest.raises(RtError, match="did not answer.*with a status line"):
             await rt.ticket(TICKET_ID)
 
 
