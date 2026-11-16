@@ -51,6 +51,8 @@ AUTO_UPDATE_UNIT: Final = "podman-auto-update.service"
 #: unit's own TimeoutStartSec is usually longer than this.
 RESTART_TIMEOUT_SECONDS: Final = 120.0
 RESTART_POLL_SECONDS: Final = 1.0
+#: Position of the result string in a ``JobRemoved`` signal body (id, job, unit, result).
+JOB_REMOVED_RESULT_INDEX: Final = 3
 
 #: The whole surface. Checked by ``tests/test_systemd.py``.
 ALLOWED_OPERATIONS: Final = frozenset(
@@ -265,8 +267,54 @@ class SystemdUnits:
         self._require_template_in_scope(instance)
         active_before = await self._active_enter(instance)
         inactive_before = await self._inactive_enter(instance)
-        await self._call("StartUnit", "ss", [instance, "replace"])
+        removed: dict[str, str] = {}
+        handler = await self._watch_job_removed(removed)
+        try:
+            reply = await self._call("StartUnit", "ss", [instance, "replace"])
+            job = str(reply.body[0]) if reply.body else ""
+            await self._wait_for_run(
+                instance, timeout, (active_before, inactive_before), lambda: removed.get(job)
+            )
+        finally:
+            self._connected_bus().remove_message_handler(handler)
 
+    async def _watch_job_removed(self, removed: dict[str, str]) -> Any:
+        """Record ``JobRemoved`` results (job path -> result) into ``removed``.
+
+        Best effort: if the subscription fails the wait still works from unit
+        timestamps alone, it just cannot fail fast on a job that never ran.
+        """
+        bus = self._connected_bus()
+
+        def handler(message: Message) -> None:
+            if message.member == "JobRemoved" and len(message.body) > JOB_REMOVED_RESULT_INDEX:
+                removed[str(message.body[1])] = str(message.body[JOB_REMOVED_RESULT_INDEX])
+
+        bus.add_message_handler(handler)
+        await self._call("Subscribe")
+        await bus.call(
+            Message(
+                destination="org.freedesktop.DBus",
+                path="/org/freedesktop/DBus",
+                interface="org.freedesktop.DBus",
+                member="AddMatch",
+                signature="s",
+                body=[
+                    f"type='signal',sender='{SYSTEMD_BUS}',interface='{MANAGER_IFACE}',member='JobRemoved'"
+                ],
+            )
+        )
+        return handler
+
+    async def _wait_for_run(
+        self,
+        instance: str,
+        timeout: float,
+        before: tuple[int, int],
+        job_result: Callable[[], str | None],
+    ) -> None:
+        """Wait for ``run``'s verdict; ``before`` is the (active, inactive) enter timestamps."""
+        active_before, inactive_before = before
         waited = 0.0
         while True:
             state = await self.state(instance)
@@ -282,11 +330,18 @@ class SystemdUnits:
                     f"{instance} ended inactive and did not stay active, result {state.result!r}: "
                     "a pre-deploy unit needs RemainAfterExit=yes"
                 )
+            result = job_result()
+            if result is not None and result != "done":
+                # The start job ended without the unit changing state, e.g.
+                # result=dependency when a Requisite= unit is down.
+                await self._discard(instance, failed=True)
+                raise SystemdError(f"{instance} did not run: its start job ended with result={result}")
             if waited >= timeout:
                 raise SystemdError(
                     f"{instance} was still {state.active_state} {timeout:.0f}s after it was started. "
                     "If it ran and succeeded, it lacks RemainAfterExit=yes: systemd collected it, "
-                    "and a collected unit cannot be told from one that never ran"
+                    "and a collected unit cannot be told from one that never ran. "
+                    "Or its start job never ran (e.g. a Requisite= dependency is down)"
                 )
             await self._sleep(RESTART_POLL_SECONDS)
             waited += RESTART_POLL_SECONDS

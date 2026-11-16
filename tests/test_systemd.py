@@ -135,6 +135,16 @@ class FakeBus:
         self.run_succeeds = True
         self.remain_after_exit = True
         self.run_stuck_at = "activating"
+        #: When set, the start job of an instance ends with this result
+        #: (e.g. "dependency") and the unit never changes state.
+        self.job_result: str | None = None
+        self.handlers: list[Any] = []
+
+    def add_message_handler(self, handler: Any) -> None:
+        self.handlers.append(handler)
+
+    def remove_message_handler(self, handler: Any) -> None:
+        self.handlers.remove(handler)
 
     async def call(self, message: Any) -> Any:
         self.calls.append((message.member, list(message.body)))
@@ -152,7 +162,7 @@ class FakeBus:
             body = [self.properties.get(name, self._reply)]
         else:
             if message.member == "StartUnit" and "@" in message.body[0]:
-                self._oneshot_ran()
+                self._start_instance(message.body[0])
             elif message.member in ("StopUnit", "ResetFailedUnit") and "@" in message.body[0]:
                 # Stopped or reset, the instance is inactive and systemd
                 # collects it at once.
@@ -170,6 +180,16 @@ class FakeBus:
                 self.properties["ActiveState"] = self.stuck_at
             body = [self._reply]
         return SimpleNamespace(message_type=MessageType.METHOD_RETURN, body=body)
+
+    def _start_instance(self, instance: str) -> None:
+        """StartUnit on an instance: its job ends with `job_result` if set, else it runs."""
+        if self.job_result is None:
+            self._oneshot_ran()
+            return
+        self.properties["ActiveState"] = self.run_stuck_at
+        signal = SimpleNamespace(member="JobRemoved", body=[1, self._reply, instance, self.job_result])
+        for handler in list(self.handlers):
+            handler(signal)
 
     def _oneshot_ran(self) -> None:
         """A oneshot instance runs and exits, the way systemd really handles it.
@@ -347,6 +367,23 @@ async def test_a_run_that_never_finishes_raises() -> None:
     bus.comes_back = False
     with pytest.raises(SystemdError, match="still activating 60s after"):
         await connected(bus, {TEMPLATE}).run(INSTANCE, timeout=60)
+
+
+async def test_a_start_job_that_ends_dependency_refuses_at_once_naming_the_result() -> None:
+    # Requisite= unit down: the job ends result=dependency and the unit never
+    # changes state. That must not wait out the timeout.
+    sleeps: list[float] = []
+
+    async def counting_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    bus = FakeBus()
+    bus.job_result = "dependency"
+    client = SystemdUnits(allowed_units={TEMPLATE}, bus=bus, sleep=counting_sleep)
+    with pytest.raises(SystemdError, match="result=dependency"):
+        await client.run(INSTANCE, timeout=60)
+    assert sleeps == []
+    assert bus.handlers == []
 
 
 async def test_an_earlier_failed_run_is_not_read_as_this_one() -> None:
