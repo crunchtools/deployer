@@ -28,7 +28,7 @@ import re
 from pathlib import Path
 from typing import Any, Final, Protocol
 
-from .registry import Service
+from .registry import PreDeploy, Service
 from .rollback import ROLLBACK_TAGS_KEPT
 from .statefile import safe_component
 from .systemd import SERVICE_IFACE, SystemdError
@@ -38,6 +38,7 @@ __all__ = [
     "DUMPS_KEPT",
     "PG_DUMP_MAGIC",
     "PreDeployError",
+    "check_timeout",
     "dump_dir",
     "pre_deploy",
     "rotate_dumps",
@@ -73,6 +74,19 @@ def dump_dir(state_dir: Path, service: Service) -> Path:
     return Path(state_dir) / DUMPS_DIR / safe_component(service.name, "service name")
 
 
+async def check_timeout(systemd: Runs, step: PreDeploy, instance: str) -> None:
+    """Refuse a unit whose TimeoutStartSec is unreadable, infinite or over the step's timeout."""
+    try:
+        limit = await systemd.property(instance, "TimeoutStartUSec", SERVICE_IFACE)
+    except SystemdError as exc:
+        raise PreDeployError(f"cannot read {instance}'s TimeoutStartSec: {exc}") from None
+    if not isinstance(limit, int) or limit > step.timeout * _USEC_PER_SECOND:
+        raise PreDeployError(
+            f"{instance} may run for {limit!r}us but the registry waits {step.timeout}s: the unit's "
+            "TimeoutStartSec must not exceed pre_deploy.timeout, so systemd ends a hung dump first"
+        )
+
+
 async def pre_deploy(systemd: Runs, service: Service, state_dir: Path, name: str, started: float) -> Path:
     """Run the service's pre-deploy step. Returns the dump it left.
 
@@ -97,15 +111,7 @@ async def pre_deploy(systemd: Runs, service: Service, state_dir: Path, name: str
     if not _NAME.fullmatch(name):
         raise PreDeployError(f"{name!r} cannot name a unit instance")
     instance = step.instance(name)
-    try:
-        limit = await systemd.property(instance, "TimeoutStartUSec", SERVICE_IFACE)
-    except SystemdError as exc:
-        raise PreDeployError(f"cannot read {instance}'s TimeoutStartSec: {exc}") from None
-    if not isinstance(limit, int) or limit > step.timeout * _USEC_PER_SECOND:
-        raise PreDeployError(
-            f"{instance} may run for {limit!r}us but the registry waits {step.timeout}s: the unit's "
-            "TimeoutStartSec must not exceed pre_deploy.timeout, so systemd ends a hung dump first"
-        )
+    await check_timeout(systemd, step, instance)
     try:
         await systemd.run(instance, step.timeout)
     except SystemdError as exc:

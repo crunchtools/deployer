@@ -49,7 +49,7 @@ from .attempts import ROLLBACK_LIMIT, AttemptLog
 from .hold import Hold, HoldStore, require_guard
 from .nagios import NagiosError
 from .podman import ImageRef, PodmanError
-from .predeploy import PreDeployError, pre_deploy, rotate_dumps
+from .predeploy import PreDeployError, check_timeout, pre_deploy, rotate_dumps
 from .registry import Registry, RegistryError, Service
 from .rollback import Restored, RollbackError, roll_back, rotate_rollback_tags
 from .rt import RtError, Ticket, TicketSaid
@@ -476,7 +476,11 @@ class Runner:
         try:
             running = await self.clients.podman.inspect_container(service.container)
             await unit_shape_ok(self.clients.systemd, service, running)
-        except (StageError, SystemdError, PodmanError) as exc:
+            if service.pre_deploy is not None:
+                # No instance exists yet; any instance name reads the template's timeout.
+                step = service.pre_deploy
+                await check_timeout(self.clients.systemd, step, step.instance(f"dryrunt{ticket.id}"))
+        except (StageError, SystemdError, PodmanError, PreDeployError) as exc:
             return TicketResult(OUTCOME_REFUSED, f"t{ticket.id} would be refused: {exc}")
         dump = f" after starting {service.pre_deploy.unit} for a dump" if service.pre_deploy else ""
         return TicketResult(

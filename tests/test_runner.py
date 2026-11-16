@@ -307,13 +307,17 @@ class FakeSystemd:
         self.state_dir: Path | None = None
         self.runs: list[str] = []
         self.run_fails = False
+        self.timeout_usec = 240_000_000
+        self.timeout_error = False
         self.schema = "X"
         #: What the restart saw had already happened, so a test can assert order.
         self.events: list[str] = []
 
     async def property(self, unit: str, name: str, interface: str = "") -> Any:
         if name == "TimeoutStartUSec":
-            return 240_000_000
+            if self.timeout_error:
+                raise SystemdError(f"{unit} not found")
+            return self.timeout_usec
         if name == "ExecStart":
             return [("/usr/bin/podman", ["podman", "run", "--name", "acquacotta", f"{IMAGE}:latest"], False)]
         if name == "ExecStartPre":
@@ -849,6 +853,27 @@ async def test_a_dry_run_still_reports_a_unit_it_would_refuse(tmp_path: Path) ->
     report = await world.drain()
     assert report.outcome == OUTCOME_REFUSED
     assert "pulls on start" in report.detail
+
+
+@pytest.mark.parametrize(
+    ("usec", "missing", "fragment"),
+    [
+        (240_000_000, True, "cannot read"),
+        (900_000_000, False, "must not exceed"),
+        (2**64 - 1, False, "must not exceed"),
+    ],
+)
+async def test_a_dry_run_reports_a_pre_deploy_unit_a_real_run_would_refuse(
+    tmp_path: Path, usec: int, missing: bool, fragment: str
+) -> None:
+    world = World(tmp_path, ticket(), registry=DUMPING_REGISTRY)
+    world.runner.dry_run = True
+    world.systemd.timeout_usec = usec
+    world.systemd.timeout_error = missing
+    report = await world.drain()
+    assert report.outcome == OUTCOME_REFUSED
+    assert fragment in report.detail
+    assert world.systemd.runs == []
 
 
 # ------------------------------------------------- already running the commit
