@@ -70,6 +70,8 @@ class Bus(Protocol):
 
     async def call(self, msg: Any) -> Any: ...
     def disconnect(self) -> None: ...
+    def add_message_handler(self, handler: Callable[[Message], Any]) -> None: ...
+    def remove_message_handler(self, handler: Callable[[Message], Any]) -> None: ...
 
 
 class SystemdError(Exception):
@@ -268,7 +270,7 @@ class SystemdUnits:
         active_before = await self._active_enter(instance)
         inactive_before = await self._inactive_enter(instance)
         removed: dict[str, str] = {}
-        handler = await self._watch_job_removed(removed)
+        handler = await self._watch_job_results(removed)
         try:
             reply = await self._call("StartUnit", "ss", [instance, "replace"])
             job = str(reply.body[0]) if reply.body else ""
@@ -278,7 +280,7 @@ class SystemdUnits:
         finally:
             self._connected_bus().remove_message_handler(handler)
 
-    async def _watch_job_removed(self, removed: dict[str, str]) -> Any:
+    async def _watch_job_results(self, removed: dict[str, str]) -> Any:
         """Record ``JobRemoved`` results (job path -> result) into ``removed``.
 
         Best effort: if the subscription fails the wait still works from unit
