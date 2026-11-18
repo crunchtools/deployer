@@ -58,6 +58,13 @@ pattern = "parse_status"
 justification = "parse_status parses grype's key=value cve.status format; rt._parse_fields parses RT's key: value show format with continuation lines -- different wire formats for different systems; the shared shape is a line loop, and merging would couple the scanner's format to RT's"
 classification = "gourmand_bug"
 
+[[exceptions]]
+check = "copy_paste_detection"
+path = "src/deployer/enqueue.py"
+item = "_build_parser"
+justification = "enqueue._build_parser and follow._build_parser build the argparse parsers of two different programs (cve-enqueue, release-follow) with different flags; the matching statements are argparse's construct/add_argument/return shape, and a shared builder would couple two CLIs that change independently"
+classification = "by_design"
+
 # An environment file's values ARE paths. The two the rule objects to are
 # `DEPLOYER_STATE` and `PODMAN_SOCKET`, and their values are the deployment
 # facts the example exists to show someone setting up a second one. Naming them

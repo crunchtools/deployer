@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- A narrow `copy_paste_detection` exception for `enqueue._build_parser`, which
+  duplicates `follow._build_parser` in shape only. The `parse_status` entry
+  covered it only because Gourmand ignored `pattern` and suppressed the whole
+  file; Gourmand is about to honour `pattern` (crunchtools/gourmand#43).
+
 ## [0.10.2] - 2026-11-16
 
 ### Fixed
