@@ -14,7 +14,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from deployer.rt import RtClient, RtCredentials, RtError, Ticket, TicketSaid
+from deployer.rt import CONNECT_RETRY_DELAYS, RtClient, RtCredentials, RtError, Ticket, TicketSaid
 
 OK = "RT/6.0.2 200 Ok\n\n"
 TICKET_ID = 1234
@@ -124,45 +124,52 @@ async def test_an_http_error_names_the_status() -> None:
             await rt.ticket(TICKET_ID)
 
 
-#: Three retries, so four attempts in all before a refused connection is given up on.
-NO_WAIT = (0.0, 0.0, 0.0)
+@pytest.fixture
+def waits(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Every delay the client waits, recorded instead of slept."""
+    recorded: list[float] = []
+
+    async def record(delay: float) -> None:
+        recorded.append(delay)
+
+    monkeypatch.setattr("deployer.rt.asyncio.sleep", record)
+    return recorded
+
+
 REFUSED_BEFORE_ANSWER = 2
 
 
-@pytest.fixture
-def no_retry_wait(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("deployer.rt.CONNECT_RETRY_DELAYS", NO_WAIT)
-
-
-@pytest.mark.usefixtures("no_retry_wait")
-async def test_an_unreachable_rt_names_the_base_url() -> None:
+async def test_an_unreachable_rt_names_the_base_url(waits: list[float]) -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("connection refused")
 
     async with client(handler) as rt:
         with pytest.raises(RtError, match="rt.example"):
             await rt.ticket(TICKET_ID)
+    assert waits == list(CONNECT_RETRY_DELAYS)
 
 
-@pytest.mark.usefixtures("no_retry_wait")
-async def test_an_rt_still_starting_is_waited_for_not_could_not_run() -> None:
-    """2026-11-19: podman auto-update restarted RT and a run began one second
-    later, before RT listened, and exited could-not-run on connection refused."""
+@pytest.mark.parametrize("failure", [httpx.ConnectError, httpx.ConnectTimeout])
+async def test_an_rt_still_starting_is_waited_for_not_could_not_run(
+    waits: list[float], failure: type[httpx.TransportError]
+) -> None:
+    """podman auto-update restarted RT and a run began one second later, before
+    RT listened, and exited could-not-run on a refused connection."""
     attempts: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         attempts.append(request)
         if len(attempts) <= REFUSED_BEFORE_ANSWER:
-            raise httpx.ConnectError("connection refused")
+            raise failure("not listening yet")
         return httpx.Response(200, text=OK + "ticket/12: deploy acquacotta\n")
 
     async with client(handler) as rt:
         assert await rt.open_tickets("Deploy") == (12,)
     assert len(attempts) == REFUSED_BEFORE_ANSWER + 1
+    assert waits == list(CONNECT_RETRY_DELAYS[:REFUSED_BEFORE_ANSWER])
 
 
-@pytest.mark.usefixtures("no_retry_wait")
-async def test_a_refused_connection_is_given_up_on_after_the_last_delay() -> None:
+async def test_a_refused_connection_is_given_up_on_after_the_last_delay(waits: list[float]) -> None:
     attempts: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -172,11 +179,11 @@ async def test_a_refused_connection_is_given_up_on_after_the_last_delay() -> Non
     async with client(handler) as rt:
         with pytest.raises(RtError, match="cannot reach RT"):
             await rt.open_tickets("Deploy")
-    assert len(attempts) == len(NO_WAIT) + 1
+    assert len(attempts) == len(CONNECT_RETRY_DELAYS) + 1
+    assert waits == list(CONNECT_RETRY_DELAYS)
 
 
-@pytest.mark.usefixtures("no_retry_wait")
-async def test_a_request_that_was_sent_is_never_repeated() -> None:
+async def test_a_request_that_was_sent_is_never_repeated(waits: list[float]) -> None:
     """A read timeout means RT may have acted: repeating a create could double it."""
     attempts: list[httpx.Request] = []
 
@@ -188,6 +195,7 @@ async def test_a_request_that_was_sent_is_never_repeated() -> None:
         with pytest.raises(RtError, match="cannot reach RT"):
             await rt.create_ticket("Rebuild", "subject", "body")
     assert len(attempts) == 1
+    assert waits == []
 
 
 # --- reading ---
