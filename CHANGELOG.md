@@ -17,6 +17,11 @@ All notable changes to this project are documented here. The format follows
   version strings.
 
 ### Fixed
+- RT refusing the connection is retried for about a minute before a run gives
+  up as could-not-run. podman auto-update restarts RT, and systemd reports it
+  started seconds before it listens; on 2026-11-19 a run that began in that gap
+  exited could-not-run, and with an empty queue nothing ran again to clear the
+  status. Only a failure to connect is retried, so nothing sent is ever repeated.
 - A narrow `copy_paste_detection` exception for `enqueue._build_parser`, which
   duplicates `follow._build_parser` in shape only. The `parse_status` entry
   covered it only because Gourmand ignored `pattern` and suppressed the whole

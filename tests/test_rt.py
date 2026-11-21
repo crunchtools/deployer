@@ -124,6 +124,17 @@ async def test_an_http_error_names_the_status() -> None:
             await rt.ticket(TICKET_ID)
 
 
+#: Three retries, so four attempts in all before a refused connection is given up on.
+NO_WAIT = (0.0, 0.0, 0.0)
+REFUSED_BEFORE_ANSWER = 2
+
+
+@pytest.fixture
+def no_retry_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("deployer.rt.CONNECT_RETRY_DELAYS", NO_WAIT)
+
+
+@pytest.mark.usefixtures("no_retry_wait")
 async def test_an_unreachable_rt_names_the_base_url() -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("connection refused")
@@ -131,6 +142,52 @@ async def test_an_unreachable_rt_names_the_base_url() -> None:
     async with client(handler) as rt:
         with pytest.raises(RtError, match="rt.example"):
             await rt.ticket(TICKET_ID)
+
+
+@pytest.mark.usefixtures("no_retry_wait")
+async def test_an_rt_still_starting_is_waited_for_not_could_not_run() -> None:
+    """2026-11-19: podman auto-update restarted RT and a run began one second
+    later, before RT listened, and exited could-not-run on connection refused."""
+    attempts: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(request)
+        if len(attempts) <= REFUSED_BEFORE_ANSWER:
+            raise httpx.ConnectError("connection refused")
+        return httpx.Response(200, text=OK + "ticket/12: deploy acquacotta\n")
+
+    async with client(handler) as rt:
+        assert await rt.open_tickets("Deploy") == (12,)
+    assert len(attempts) == REFUSED_BEFORE_ANSWER + 1
+
+
+@pytest.mark.usefixtures("no_retry_wait")
+async def test_a_refused_connection_is_given_up_on_after_the_last_delay() -> None:
+    attempts: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(request)
+        raise httpx.ConnectError("connection refused")
+
+    async with client(handler) as rt:
+        with pytest.raises(RtError, match="cannot reach RT"):
+            await rt.open_tickets("Deploy")
+    assert len(attempts) == len(NO_WAIT) + 1
+
+
+@pytest.mark.usefixtures("no_retry_wait")
+async def test_a_request_that_was_sent_is_never_repeated() -> None:
+    """A read timeout means RT may have acted: repeating a create could double it."""
+    attempts: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(request)
+        raise httpx.ReadTimeout("no answer")
+
+    async with client(handler) as rt:
+        with pytest.raises(RtError, match="cannot reach RT"):
+            await rt.create_ticket("Rebuild", "subject", "body")
+    assert len(attempts) == 1
 
 
 # --- reading ---
