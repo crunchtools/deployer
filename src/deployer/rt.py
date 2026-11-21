@@ -37,6 +37,8 @@ from pathlib import Path
 from typing import Final, Self
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import asyncio
+
 import httpx
 
 from .statefile import safe_component, write_whole
@@ -44,6 +46,10 @@ from .statefile import safe_component, write_whole
 __all__ = ["RtClient", "RtCredentials", "RtError", "Ticket", "TicketSaid"]
 
 DEFAULT_TIMEOUT_SECONDS: Final = 30.0
+#: Waits between connect attempts. RT is restarted nightly by podman, and systemd
+#: reports it started seconds before it listens. Only a failed CONNECT is
+#: retried: nothing was sent, so a create cannot be doubled.
+CONNECT_RETRY_DELAYS: Final = (1.0, 2.0, 4.0, 8.0, 15.0, 30.0)
 #: RT answers REST 1.0 with a status line before the payload.
 _STATUS_RE: Final = re.compile(r"\ART/\S+\s+(\d{3})\s*(.*)")
 _OPEN_STATES: Final = ("new", "open", "stalled")
@@ -254,8 +260,16 @@ class RtClient:
         """
         form = dict(self._credentials)
         form.update(data or {})
+        url = f"{self._base}/REST/1.0/{path}"
         try:
-            response = await self._client.post(f"{self._base}/REST/1.0/{path}", data=form)
+            for delay in CONNECT_RETRY_DELAYS:
+                try:
+                    response = await self._client.post(url, data=form)
+                    break
+                except (httpx.ConnectError, httpx.ConnectTimeout):
+                    await asyncio.sleep(delay)
+            else:
+                response = await self._client.post(url, data=form)
         except httpx.HTTPError as exc:
             raise RtError(f"cannot reach RT at {self._base}: {exc}") from None
         if response.status_code >= httpx.codes.BAD_REQUEST:
