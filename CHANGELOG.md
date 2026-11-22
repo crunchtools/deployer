@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.10.4] - 2026-11-22
+
+v0.10.3 was tagged at fb1c33c without moving the version strings, so its
+image still reports 0.10.2; 0.10.4 is the release that carries these changes
+under their own number.
+
 ### Changed
 - Gatehouse triage gets `review_result` from the review job, so a pull request
   whose review died before posting anything is held instead of passing.
