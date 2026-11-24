@@ -78,3 +78,9 @@ skip = ["semgrep"]
 
 [tool.sdlc]
 repo-kinds = ["cli-tool"]
+
+[tool.sdlc.image]
+# Written by crunchtools/sdlc's scripts/convert_repo.py: moved from the workflows.
+image = "quay.io/crunchtools/deployer"
+boot = "command"
+boot-command = "set -e\npodman run --rm \"$IMAGE\" --version\npodman run --rm \"$IMAGE\" --help >/dev/null\n"
