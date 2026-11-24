@@ -75,3 +75,6 @@ asyncio_default_fixture_loop_scope = "function"
 # No in-repo Semgrep rules: the check exits 2 when .semgrep is absent rather
 # than scanning nothing and calling it a pass.
 skip = ["semgrep"]
+
+[tool.sdlc]
+repo-kinds = ["cli-tool"]
