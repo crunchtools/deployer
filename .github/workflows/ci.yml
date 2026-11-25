@@ -31,7 +31,7 @@ jobs:
     steps: &event
       - id: e
         run: >-
-          sudo systemctl start podman.socket && sudo chmod 0711 /run/podman && sudo chmod 0666 /run/podman/podman.sock &&
+          sudo systemctl start podman.socket && sudo chmod 0711 /run/podman && sudo chown "$(id -u)" /run/podman/podman.sock &&
           podman --remote --url unix:///run/podman/podman.sock run --rm --user 0 --security-opt label=disable
           -v /run/podman/podman.sock:/var/run/docker.sock
           -v "${RUNNER_WORKSPACE%/*}:${RUNNER_WORKSPACE%/*}" -w "$GITHUB_WORKSPACE"
