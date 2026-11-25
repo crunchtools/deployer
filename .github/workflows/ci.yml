@@ -29,8 +29,8 @@ jobs:
     steps: &event
       - id: e
         run: >-
-          sudo systemctl start podman.socket &&
-          sudo --preserve-env podman run --rm --user 0 --security-opt label=disable
+          sudo systemctl start podman.socket && sudo chmod 0711 /run/podman && sudo chmod 0666 /run/podman/podman.sock &&
+          podman --remote --url unix:///run/podman/podman.sock run --rm --user 0 --security-opt label=disable
           -v /run/podman/podman.sock:/var/run/docker.sock
           -v "${RUNNER_WORKSPACE%/*}:${RUNNER_WORKSPACE%/*}" -w "$GITHUB_WORKSPACE"
           --env 'GITHUB_*' --env 'RUNNER_*' --env 'ACTIONS_*' --env CI --env 'SDLC_*' --env VERSION --env DIGEST
